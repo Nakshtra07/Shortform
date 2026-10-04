@@ -2294,11 +2294,13 @@ async fn render_flat_clip_for_candidate(
         // Runs PySceneDetect once per source; any failure leaves no scene
         // input and the tracker's own cut detection remains the sole source.
         let mut scene_cuts_json: Option<String> = None;
+        let mut scene_cuts_count: usize = 0;
         if scene_intelligence::scene_intelligence_enabled() {
             match scene_intelligence::SceneIntelligenceEngine::new(None) {
                 Ok(scene_engine) => {
                     let doc = scene_engine.process_source(&project.source_path);
                     if !doc.fallback && !doc.scenes.is_empty() {
+                        scene_cuts_count = doc.scenes.len();
                         let scene_tmp = std::env::temp_dir()
                             .join(format!("autoshorts_si_scenes_{}.json", uuid::Uuid::new_v4()));
                         if let Some(content) = serde_json::to_string(&doc)
@@ -2420,6 +2422,7 @@ async fn render_flat_clip_for_candidate(
 
         let mut caption_intel_usable_and_written = false;
         let mut caption_intel_plan = None;
+        let mut t7_boundaries_count: usize = 0;
         if !caption_words.is_empty() {
             let style = project.caption_style.as_deref().unwrap_or("modern-box");
 
@@ -2446,6 +2449,7 @@ async fn render_flat_clip_for_candidate(
                 candidate.end_sec,
                 &caption_words,
             );
+            t7_boundaries_count = t7_boundaries.len();
             let t7_boundaries_slice = if t7_boundaries.is_empty() {
                 None
             } else {
@@ -2527,12 +2531,151 @@ async fn render_flat_clip_for_candidate(
                 // is never silently indistinguishable from a real Adaptive/DualFrame
                 // result in the database (Render QA success ≠ framing success).
                 let framing_fallback = framing_plan.is_emergency_fallback;
+
+                let smart_pacing_stage = if !pacing::smart_pacing_enabled() {
+                    models::StageExecutionRecord::disabled("feature_flag_off")
+                } else if let Some(ref plan) = pacing_plan {
+                    let variant = if pacing::smart_pacing_2_enabled() { "sp2" } else { "sp1" };
+                    models::StageExecutionRecord::executed(
+                        Some(variant.to_string()),
+                        Some(true),
+                        Some(true),
+                        Some(serde_json::json!({
+                            "removedTotalSec": plan.removed_total_sec,
+                            "editsCount": plan.edits.len(),
+                        })),
+                    )
+                } else if transcript_words_for_camera.as_deref().map_or(true, |w| w.is_empty()) {
+                    models::StageExecutionRecord::skipped("no_transcript_words", false)
+                } else {
+                    models::StageExecutionRecord::executed(
+                        Some(if pacing::smart_pacing_2_enabled() { "sp2".into() } else { "sp1".into() }),
+                        Some(false),
+                        Some(false),
+                        Some(serde_json::json!({ "zeroCuts": true })),
+                    )
+                };
+
+                let hook_ending_stage = models::StageExecutionRecord::executed(
+                    None,
+                    Some(hook_ending_applied),
+                    Some(hook_ending_applied),
+                    Some(serde_json::json!({
+                        "startChanged": boundary_opt.start_changed,
+                        "endChanged": boundary_opt.end_changed,
+                    })),
+                );
+
+                let audio_intel_stage = if !audio::audio_intelligence_enabled() {
+                    models::StageExecutionRecord::disabled("feature_flag_off")
+                } else if let Some(ref plan) = audio_plan {
+                    models::StageExecutionRecord::executed(
+                        None,
+                        Some(true),
+                        Some(true),
+                        Some(serde_json::json!({
+                            "filterChain": plan.filter_chain,
+                        })),
+                    )
+                } else {
+                    models::StageExecutionRecord::skipped("no_filtering_needed", false)
+                };
+
+                let caption_intel_stage = if !caption_intel::caption_intelligence_enabled() {
+                    models::StageExecutionRecord::disabled("feature_flag_off")
+                } else if caption_intelligence_applied {
+                    models::StageExecutionRecord::executed(
+                        None,
+                        Some(true),
+                        Some(true),
+                        None,
+                    )
+                } else {
+                    models::StageExecutionRecord::fallback("ass_render_failed_or_skipped", None)
+                };
+
+                let framing_stage = if framing_fallback {
+                    models::StageExecutionRecord::fallback(
+                        framing_plan.fallback_reason.as_deref().unwrap_or("emergency_center_crop"),
+                        Some("single_fallback".to_string()),
+                    )
+                } else {
+                    models::StageExecutionRecord::executed(
+                        Some(framing_plan.framing.clone()),
+                        Some(true),
+                        Some(true),
+                        Some(serde_json::json!({
+                            "segmentsCount": framing_plan.segments.len(),
+                        })),
+                    )
+                };
+
+                let scene_intel_stage = if !scene_intelligence::scene_intelligence_enabled() {
+                    models::StageExecutionRecord::disabled("feature_flag_off")
+                } else if scene_cuts_count > 0 {
+                    models::StageExecutionRecord::executed(
+                        None,
+                        Some(true),
+                        Some(true),
+                        Some(serde_json::json!({
+                            "sceneBoundariesCount": scene_cuts_count,
+                        })),
+                    )
+                } else {
+                    models::StageExecutionRecord::fallback("detector_fallback_or_missing", None)
+                };
+
+                let t7_stage = if !t7_prosody_enabled() {
+                    models::StageExecutionRecord::disabled("feature_flag_off")
+                } else if t7_prosody::find_model_file().is_none() {
+                    models::StageExecutionRecord::blocked("model_missing", true)
+                } else if t7_boundaries_count > 0 {
+                    models::StageExecutionRecord::executed(
+                        Some("t7_prosody_v1".to_string()),
+                        Some(true),
+                        Some(true),
+                        Some(serde_json::json!({
+                            "boundariesCount": t7_boundaries_count,
+                        })),
+                    )
+                } else {
+                    models::StageExecutionRecord::executed(
+                        Some("t7_prosody_v1".to_string()),
+                        Some(false),
+                        Some(false),
+                        None,
+                    )
+                };
+
+                let panns_stage = if !panns_reactions::panns_reactions_enabled() {
+                    models::StageExecutionRecord::disabled("feature_flag_off")
+                } else {
+                    models::StageExecutionRecord::skipped("not_configured_for_render_phase", false)
+                };
+
+                let vlm_stage = if !vlm_scoring::vlm_scoring_enabled() {
+                    models::StageExecutionRecord::disabled("feature_flag_off")
+                } else {
+                    models::StageExecutionRecord::skipped("not_configured_for_render_phase", false)
+                };
+
                 let applied_features_json = serde_json::json!({
                     "smartPacing": smart_pacing_applied,
                     "hookEndingOptimization": hook_ending_applied,
                     "audioIntelligence": audio_intelligence_applied,
                     "captionIntelligence": caption_intelligence_applied,
                     "framingFallback": framing_fallback,
+                    "stages": {
+                        "smartPacing": smart_pacing_stage,
+                        "hookEndingOptimization": hook_ending_stage,
+                        "audioIntelligence": audio_intel_stage,
+                        "captionIntelligence": caption_intel_stage,
+                        "framing": framing_stage,
+                        "sceneIntelligence": scene_intel_stage,
+                        "t7Prosody": t7_stage,
+                        "panns": panns_stage,
+                        "vlm": vlm_stage,
+                    }
                 })
                 .to_string();
 

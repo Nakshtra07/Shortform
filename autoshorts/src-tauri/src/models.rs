@@ -938,6 +938,113 @@ pub struct TrackReIdEmbedding {
     pub updated_at: String,
 }
 
+/// Observational execution status for a pipeline stage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StageStatus {
+    Disabled,
+    Blocked,
+    Skipped,
+    Executed,
+    Fallback,
+    Failed,
+}
+
+/// Truthful observational execution record for a pipeline stage in applied_features.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StageExecutionRecord {
+    pub status: StageStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub fallback_used: bool,
+    pub output_produced: Option<bool>,
+    pub output_consumed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+impl StageExecutionRecord {
+    pub fn executed(
+        variant: Option<String>,
+        output_produced: Option<bool>,
+        output_consumed: Option<bool>,
+        details: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            status: StageStatus::Executed,
+            variant,
+            reason: None,
+            fallback_used: false,
+            output_produced,
+            output_consumed,
+            details,
+        }
+    }
+
+    pub fn disabled(reason: impl Into<String>) -> Self {
+        Self {
+            status: StageStatus::Disabled,
+            variant: None,
+            reason: Some(reason.into()),
+            fallback_used: false,
+            output_produced: None,
+            output_consumed: None,
+            details: None,
+        }
+    }
+
+    pub fn skipped(reason: impl Into<String>, fallback_used: bool) -> Self {
+        Self {
+            status: StageStatus::Skipped,
+            variant: None,
+            reason: Some(reason.into()),
+            fallback_used,
+            output_produced: Some(false),
+            output_consumed: Some(false),
+            details: None,
+        }
+    }
+
+    pub fn blocked(reason: impl Into<String>, fallback_used: bool) -> Self {
+        Self {
+            status: StageStatus::Blocked,
+            variant: None,
+            reason: Some(reason.into()),
+            fallback_used,
+            output_produced: Some(false),
+            output_consumed: Some(false),
+            details: None,
+        }
+    }
+
+    pub fn fallback(reason: impl Into<String>, variant: Option<String>) -> Self {
+        Self {
+            status: StageStatus::Fallback,
+            variant,
+            reason: Some(reason.into()),
+            fallback_used: true,
+            output_produced: Some(true),
+            output_consumed: Some(true),
+            details: None,
+        }
+    }
+
+    pub fn failed(reason: impl Into<String>, fallback_used: bool) -> Self {
+        Self {
+            status: StageStatus::Failed,
+            variant: None,
+            reason: Some(reason.into()),
+            fallback_used,
+            output_produced: Some(false),
+            output_consumed: Some(false),
+            details: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1337,5 +1444,56 @@ mod tests {
         // Existing fields must still be correct
         assert_eq!(config.max_concurrency, 3);
         assert!((config.short_video_threshold_sec - 720.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_applied_features_hybrid_schema_backward_compatibility() {
+        let json_str = r#"{
+            "smartPacing": true,
+            "hookEndingOptimization": false,
+            "audioIntelligence": false,
+            "captionIntelligence": true,
+            "framingFallback": false,
+            "stages": {
+                "smartPacing": {
+                    "status": "executed",
+                    "variant": "sp2",
+                    "fallbackUsed": false,
+                    "outputProduced": true,
+                    "outputConsumed": true
+                },
+                "t7Prosody": {
+                    "status": "blocked",
+                    "reason": "model_missing",
+                    "fallbackUsed": true,
+                    "outputProduced": false,
+                    "outputConsumed": false
+                }
+            }
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert_eq!(v["smartPacing"], true);
+        assert_eq!(v["stages"]["smartPacing"]["status"], "executed");
+        assert_eq!(v["stages"]["t7Prosody"]["status"], "blocked");
+    }
+
+    #[test]
+    fn test_stage_execution_record_serde() {
+        let rec = StageExecutionRecord::executed(
+            Some("dualframe".into()),
+            Some(true),
+            Some(true),
+            None,
+        );
+        let s = serde_json::to_string(&rec).unwrap();
+        assert!(s.contains("\"status\":\"executed\""));
+        assert!(s.contains("\"variant\":\"dualframe\""));
+        assert!(s.contains("\"fallbackUsed\":false"));
+
+        let rec_dis = StageExecutionRecord::disabled("feature_flag_off");
+        let s_dis = serde_json::to_string(&rec_dis).unwrap();
+        assert!(s_dis.contains("\"status\":\"disabled\""));
+        assert!(s_dis.contains("\"outputProduced\":null"));
+        assert!(s_dis.contains("\"outputConsumed\":null"));
     }
 }
