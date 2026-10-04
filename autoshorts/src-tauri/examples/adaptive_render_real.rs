@@ -191,7 +191,7 @@ fn main() {
     // ── MANDATORY Render QA ─────────────────────────────────────────────────
     let t_q = StageTimer::start("RenderQA");
     let out_str = rendered.to_string_lossy().to_string();
-    let qa = autoshorts_lib::render_qa::run_render_qa(
+    let qa_outcome = autoshorts_lib::render_qa::run_render_qa(
         &out_str,
         &source,
         "74604721-d665-48d5-9f87-40e0422ee42d",
@@ -199,8 +199,17 @@ fn main() {
         probe.audio_codec.is_some(),
         true,
         Some(&framing),
-    )
-    .expect("run_render_qa returned None (QA disabled?)");
+    );
+    let qa = match qa_outcome {
+        autoshorts_lib::render_qa::RenderQaOutcome::Pass(r)
+        | autoshorts_lib::render_qa::RenderQaOutcome::Fail(r) => r,
+        autoshorts_lib::render_qa::RenderQaOutcome::Error(e) => {
+            panic!("run_render_qa failed with error: {}", e)
+        }
+        autoshorts_lib::render_qa::RenderQaOutcome::Disabled => {
+            panic!("run_render_qa disabled")
+        }
+    };
 
     println!("[Render QA] {}", qa.summary());
     for c in &qa.checks {

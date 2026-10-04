@@ -2568,7 +2568,7 @@ async fn render_flat_clip_for_candidate(
                 // true when AUTOSHORTS_RENDER_QA is unset). The env var exists
                 // only as an explicit development opt-out.
                 let captions_expected = ass_path.is_some() || drawtext_filters.is_some();
-                let qa_report = render_qa::run_render_qa(
+                let qa_outcome = render_qa::run_render_qa(
                     &path_string,
                     &project.source_path,
                     &candidate_id,
@@ -2592,11 +2592,11 @@ async fn render_flat_clip_for_candidate(
                     Some(&framing_plan),
                 );
 
-                let mut qa_summary_line: Option<String> = None;
-                let qa_rejected = if let Some(ref report) = qa_report {
-                    let s = report.summary();
-                    qa_summary_line = Some(format!("render_qa: {s}"));
-                    if report.has_critical_failures() {
+                let (qa_rejected, qa_summary_line, qa_error_msg) = match qa_outcome {
+                    render_qa::RenderQaOutcome::Pass(ref report) => {
+                        (false, Some(format!("render_qa: {}", report.summary())), None)
+                    }
+                    render_qa::RenderQaOutcome::Fail(ref report) => {
                         let detail = report
                             .checks
                             .iter()
@@ -2608,12 +2608,22 @@ async fn render_flat_clip_for_candidate(
                             .collect::<Vec<_>>()
                             .join("; ");
                         eprintln!("[Render QA] rejecting clip {} — {}", candidate_id, detail);
-                        true
-                    } else {
-                        false
+                        (true, Some(format!("render_qa: {}", report.summary())), Some(detail))
                     }
-                } else {
-                    false
+                    render_qa::RenderQaOutcome::Error(ref err) => {
+                        eprintln!(
+                            "[Render QA] validation error — rejecting clip {}: {}",
+                            candidate_id, err
+                        );
+                        (
+                            true,
+                            Some(format!("render_qa error: {}", err)),
+                            Some(err.clone()),
+                        )
+                    }
+                    render_qa::RenderQaOutcome::Disabled => {
+                        (false, Some("render_qa: disabled by environment".to_string()), None)
+                    }
                 };
 
                 if let Some(line) = qa_summary_line {
@@ -2626,9 +2636,9 @@ async fn render_flat_clip_for_candidate(
                 };
 
                 if qa_rejected {
-                    // The file exists but did not pass QA. Mark it as an error
-                    // rather than a successful clip so the UI never presents an
-                    // invalid artifact as finished work.
+                    // The file exists but did not pass QA or encountered a validation error.
+                    // Mark it as an error rather than a successful clip so the UI never presents an
+                    // invalid artifact as finished work. Fail closed (D3).
                     db.update_clip_for_candidate(
                         &candidate_id,
                         "error",
@@ -2640,7 +2650,9 @@ async fn render_flat_clip_for_candidate(
                     .map_err(to_command_error)?;
                     return Err(format!(
                         "Clip rendering failed Render QA validation: {}",
-                        combined_log.unwrap_or_default()
+                        qa_error_msg
+                            .or(combined_log)
+                            .unwrap_or_else(|| "critical failure".to_string())
                     ));
                 }
 

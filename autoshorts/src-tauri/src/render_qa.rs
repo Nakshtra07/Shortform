@@ -83,7 +83,7 @@ pub struct RenderQaConfig {
 impl Default for RenderQaConfig {
     fn default() -> Self {
         Self {
-            enabled: false, // OFF by default — opt-in
+            enabled: true, // PRODUCTION DEFAULT: ON (N1)
             expected_width: 1080,
             expected_height: 1920,
             max_av_sync_drift_sec: 0.05,
@@ -214,6 +214,40 @@ impl RenderQaReport {
     }
 }
 
+/// Outcome of running Render QA on a rendered clip
+#[derive(Debug, Clone)]
+pub enum RenderQaOutcome {
+    Pass(RenderQaReport),
+    Fail(RenderQaReport),
+    Error(String),
+    Disabled,
+}
+
+impl RenderQaOutcome {
+    pub fn report(&self) -> Option<&RenderQaReport> {
+        match self {
+            RenderQaOutcome::Pass(r) | RenderQaOutcome::Fail(r) => Some(r),
+            RenderQaOutcome::Error(_) | RenderQaOutcome::Disabled => None,
+        }
+    }
+
+    pub fn is_pass(&self) -> bool {
+        matches!(self, RenderQaOutcome::Pass(_))
+    }
+
+    pub fn is_fail(&self) -> bool {
+        matches!(self, RenderQaOutcome::Fail(_))
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self, RenderQaOutcome::Error(_))
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, RenderQaOutcome::Disabled)
+    }
+}
+
 /// Render QA engine
 pub struct RenderQaEngine {
     config: RenderQaConfig,
@@ -290,43 +324,77 @@ impl RenderQaEngine {
         }
 
         // 7. A/V SYNC
-        if path.exists() && expected_has_audio {
-            self.check_av_sync(output_path, &mut report);
-        }
-
-        // 9. LOUDNESS COMPLIANCE
-        if path.exists() && expected_has_audio {
-            self.check_loudness(output_path, &mut report);
-        }
-
-        // 10. FACE CONTAINMENT (if framing plan available)
         if path.exists() {
-            if let Some(plan) = framing_plan {
-                self.check_face_containment(output_path, plan, &mut report);
+            if expected_has_audio {
+                self.check_av_sync(output_path, &mut report);
+            } else {
+                report.add_check(QaCheck {
+                    name: "av_sync".to_string(),
+                    status: QaStatus::Skipped,
+                    details: "No audio expected".to_string(),
+                    severity: QaSeverity::Info,
+                });
             }
         }
 
-        // 11. INVALID CROP
+        // 8. LOUDNESS COMPLIANCE
+        if path.exists() {
+            if expected_has_audio {
+                self.check_loudness(output_path, &mut report);
+            } else {
+                report.add_check(QaCheck {
+                    name: "loudness_compliance".to_string(),
+                    status: QaStatus::Skipped,
+                    details: "No audio expected".to_string(),
+                    severity: QaSeverity::Info,
+                });
+            }
+        }
+
+        // 9. FACE CONTAINMENT (if framing plan available)
+        if path.exists() {
+            if let Some(plan) = framing_plan {
+                self.check_face_containment(output_path, plan, &mut report);
+            } else {
+                report.add_check(QaCheck {
+                    name: "face_containment".to_string(),
+                    status: QaStatus::Skipped,
+                    details: "No framing plan provided".to_string(),
+                    severity: QaSeverity::Info,
+                });
+            }
+        }
+
+        // 10. INVALID CROP
         if path.exists() {
             self.check_crop_validity(output_path, &mut report);
         }
 
-        // 12. EMPTY/CORRUPT FRAMES
+        // 11. EMPTY/CORRUPT FRAMES
         if path.exists() {
             self.check_frame_integrity(output_path, &mut report);
         }
 
-        // 13. CAPTION PRESENCE
+        // 12. CAPTION PRESENCE
         if path.exists() {
             self.check_caption_presence(output_path, captions_expected, &mut report);
         }
 
-        // 14. UNEXPECTED SILENT AUDIO
-        if path.exists() && expected_has_audio {
-            self.check_silent_audio(output_path, &mut report);
+        // 13. UNEXPECTED SILENT AUDIO
+        if path.exists() {
+            if expected_has_audio {
+                self.check_silent_audio(output_path, &mut report);
+            } else {
+                report.add_check(QaCheck {
+                    name: "silent_audio".to_string(),
+                    status: QaStatus::Skipped,
+                    details: "No audio expected".to_string(),
+                    severity: QaSeverity::Info,
+                });
+            }
         }
 
-        // 15. UNEXPECTED BLACK FRAMES
+        // 14. UNEXPECTED BLACK FRAMES
         if path.exists() {
             self.check_black_frames(output_path, &mut report);
         }
@@ -514,6 +582,13 @@ impl RenderQaEngine {
                     }
                 }
             }
+        } else {
+            report.add_check(QaCheck {
+                name: "duration_consistency".to_string(),
+                status: QaStatus::Skipped,
+                details: "No expected duration provided".to_string(),
+                severity: QaSeverity::Info,
+            });
         }
     }
 
@@ -725,38 +800,55 @@ impl RenderQaEngine {
             "QA/loudness",
         );
 
+        let mut check_added = false;
         if let Some(ref out) = out {
             let stderr = out.stderr.clone();
-            // Parse loudnorm JSON from stderr
+            // Parse loudnorm JSON from stderr between last '{' and last '}'
             if let Some(json_start) = stderr.rfind('{') {
-                let json_str = &stderr[json_start..];
-                if let Ok(ln) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    if let Some(input_i) = ln.get("input_i").and_then(|v| v.as_f64()) {
-                        let diff = (input_i - self.config.loudness_target_lufs).abs();
-                        let status = if diff <= self.config.loudness_tolerance_lu {
-                            QaStatus::Pass
-                        } else if diff <= self.config.loudness_tolerance_lu + 2.0 {
-                            QaStatus::Warning
-                        } else {
-                            QaStatus::Fail
-                        };
-                        let severity = if status == QaStatus::Fail {
-                            QaSeverity::Major
-                        } else {
-                            QaSeverity::Info
-                        };
-                        report.add_check(QaCheck {
-                            name: "loudness_compliance".to_string(),
-                            status,
-                            details: format!(
-                                "Measured {:.1} LUFS, target {:.1} LUFS (diff {:.1} LU)",
-                                input_i, self.config.loudness_target_lufs, diff
-                            ),
-                            severity,
+                if let Some(json_end) = stderr[json_start..].rfind('}') {
+                    let json_str = &stderr[json_start..json_start + json_end + 1];
+                    if let Ok(ln) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        let input_i = ln.get("input_i").and_then(|v| {
+                            v.as_f64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
                         });
+                        if let Some(input_i) = input_i {
+                            let diff = (input_i - self.config.loudness_target_lufs).abs();
+                            let status = if diff <= self.config.loudness_tolerance_lu {
+                                QaStatus::Pass
+                            } else if diff <= self.config.loudness_tolerance_lu + 2.0 {
+                                QaStatus::Warning
+                            } else {
+                                QaStatus::Fail
+                            };
+                            let severity = if status == QaStatus::Fail {
+                                QaSeverity::Major
+                            } else {
+                                QaSeverity::Info
+                            };
+                            report.add_check(QaCheck {
+                                name: "loudness_compliance".to_string(),
+                                status,
+                                details: format!(
+                                    "Measured {:.1} LUFS, target {:.1} LUFS (diff {:.1} LU)",
+                                    input_i, self.config.loudness_target_lufs, diff
+                                ),
+                                severity,
+                            });
+                            check_added = true;
+                        }
                     }
                 }
             }
+        }
+
+        if !check_added {
+            report.add_check(QaCheck {
+                name: "loudness_compliance".to_string(),
+                status: QaStatus::Warning,
+                details: "Could not measure loudness via loudnorm filter".to_string(),
+                severity: QaSeverity::Minor,
+            });
         }
     }
 
@@ -1305,16 +1397,11 @@ pub fn run_render_qa(
     expected_has_audio: bool,
     captions_expected: bool,
     framing_plan: Option<&crate::media::SmartFramingPlan>,
-) -> Option<RenderQaReport> {
+) -> RenderQaOutcome {
     if !render_qa_enabled() {
-        return None;
+        return RenderQaOutcome::Disabled;
     }
 
-    // BUG FIX: this previously used `RenderQaConfig::default()`, whose
-    // `enabled` is `false`, so `is_enabled()` returned false and the engine
-    // short-circuited to a vacuous PASS report — even when the caller had
-    // already checked the env flag. The config must be structurally enabled
-    // here so the already-checked env flag is the only gate.
     let config = RenderQaConfig {
         enabled: true,
         ..Default::default()
@@ -1333,12 +1420,14 @@ pub fn run_render_qa(
         Ok(report) => {
             if report.has_critical_failures() {
                 eprintln!("[Render QA] CRITICAL FAILURES — render should be rejected");
+                RenderQaOutcome::Fail(report)
+            } else {
+                RenderQaOutcome::Pass(report)
             }
-            Some(report)
         }
         Err(e) => {
             eprintln!("[Render QA] Validation failed: {}", e);
-            None
+            RenderQaOutcome::Error(e.to_string())
         }
     }
 }
@@ -1413,7 +1502,7 @@ mod tests {
         }
 
         std::env::set_var("AUTOSHORTS_RENDER_QA", "1");
-        let report = run_render_qa(
+        let outcome = run_render_qa(
             &clip.to_string_lossy(),
             &clip.to_string_lossy(),
             "cand-1",
@@ -1424,7 +1513,10 @@ mod tests {
         );
         std::env::remove_var("AUTOSHORTS_RENDER_QA");
 
-        let report = report.expect("QA must produce a report when enabled");
+        let report = match outcome {
+            RenderQaOutcome::Pass(r) | RenderQaOutcome::Fail(r) => r,
+            other => panic!("QA must produce a report when enabled, got {:?}", other),
+        };
         assert!(
             !report.checks.is_empty(),
             "QA ran but produced ZERO checks — the vacuous-report bug is back"
@@ -1457,9 +1549,10 @@ mod tests {
     fn test_run_render_qa_is_noop_when_explicitly_disabled() {
         let _lock = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("AUTOSHORTS_RENDER_QA", "off");
+        let outcome = run_render_qa("nope.mp4", "nope.mp4", "c", None, false, false, None);
         assert!(
-            run_render_qa("nope.mp4", "nope.mp4", "c", None, false, false, None).is_none(),
-            "explicitly disabled QA must return None"
+            matches!(outcome, RenderQaOutcome::Disabled),
+            "explicitly disabled QA must return RenderQaOutcome::Disabled"
         );
         std::env::remove_var("AUTOSHORTS_RENDER_QA");
     }
@@ -1479,7 +1572,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
-        let report = run_render_qa(
+        let outcome = run_render_qa(
             &clip.to_string_lossy(),
             &clip.to_string_lossy(),
             "cand-default",
@@ -1488,12 +1581,87 @@ mod tests {
             false,
             None,
         );
-        let report = report.expect("QA must run by default in production");
+        let report = match outcome {
+            RenderQaOutcome::Pass(r) | RenderQaOutcome::Fail(r) => r,
+            other => panic!("QA must run by default in production, got {:?}", other),
+        };
         assert!(
             report.checks.iter().any(|c| c.name == "output_exists"),
             "default-enabled QA must execute real checks"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_render_qa_reports_all_14_checks_even_when_framing_absent() {
+        let _lock = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("as_14_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let clip = dir.join("clip.mp4");
+
+        if !make_test_clip(&clip, true) {
+            eprintln!("[skip] ffmpeg unavailable or libx264 missing");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let config = RenderQaConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let engine = RenderQaEngine::new(config);
+
+        let report = engine
+            .validate_render(
+                &clip.to_string_lossy(),
+                &clip.to_string_lossy(),
+                "cand-14",
+                Some(2.0),
+                true,
+                false,
+                None, // Framing plan absent
+            )
+            .expect("validate_render should succeed");
+
+        assert_eq!(
+            report.checks.len(),
+            14,
+            "Render QA must report exactly 14 checks (L2 accounting)"
+        );
+
+        let face_chk = report
+            .checks
+            .iter()
+            .find(|c| c.name == "face_containment")
+            .expect("face_containment check must be present");
+        assert_eq!(
+            face_chk.status,
+            QaStatus::Skipped,
+            "face_containment must be marked Skipped when framing plan is absent"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_render_qa_outcome_variants() {
+        let rep = RenderQaReport::new("o.mp4".into(), "s.mp4".into(), "c1".into());
+        let pass = RenderQaOutcome::Pass(rep.clone());
+        assert!(pass.is_pass());
+        assert!(!pass.is_fail());
+        assert_eq!(pass.report().unwrap().output_path, "o.mp4");
+
+        let fail = RenderQaOutcome::Fail(rep);
+        assert!(fail.is_fail());
+        assert!(!fail.is_pass());
+
+        let err = RenderQaOutcome::Error("ffmpeg broke".into());
+        assert!(err.is_error());
+        assert!(err.report().is_none());
+
+        let dis = RenderQaOutcome::Disabled;
+        assert!(dis.is_disabled());
+        assert!(dis.report().is_none());
     }
 
     /// A missing output file must produce a CRITICAL failure, never a pass.
@@ -1735,7 +1903,7 @@ mod tests {
     #[test]
     fn test_render_qa_config_default() {
         let config = RenderQaConfig::default();
-        assert!(!config.enabled);
+        assert!(config.enabled, "RenderQaConfig default must be enabled (N1)");
         assert_eq!(config.expected_width, 1080);
         assert_eq!(config.expected_height, 1920);
         assert_eq!(config.max_av_sync_drift_sec, 0.05);

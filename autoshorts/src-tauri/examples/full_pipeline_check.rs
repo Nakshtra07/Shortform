@@ -714,7 +714,7 @@ fn main() {
 
     // ── Render QA (MANDATORY) ─────────────────────────────────────────────
     let t_qa = StageTimer::start("RenderQA");
-    let qa = autoshorts_lib::render_qa::run_render_qa(
+    let qa_outcome = autoshorts_lib::render_qa::run_render_qa(
         &out_clip.to_string_lossy(),
         &source,
         &best.id,
@@ -730,9 +730,17 @@ fn main() {
         ass_path.exists(),
         Some(&plan),
     );
-    let Some(qa) = qa else {
-        t_qa.failed("Render QA disabled (AUTOSHORTS_RENDER_QA=0) — cannot certify success");
-        panic!("Render QA is mandatory but was disabled");
+    let qa = match qa_outcome {
+        autoshorts_lib::render_qa::RenderQaOutcome::Pass(r)
+        | autoshorts_lib::render_qa::RenderQaOutcome::Fail(r) => r,
+        autoshorts_lib::render_qa::RenderQaOutcome::Error(e) => {
+            t_qa.failed(&format!("Render QA error: {}", e));
+            panic!("Render QA error: {}", e);
+        }
+        autoshorts_lib::render_qa::RenderQaOutcome::Disabled => {
+            t_qa.failed("Render QA disabled (AUTOSHORTS_RENDER_QA=0) — cannot certify success");
+            panic!("Render QA is mandatory but was disabled");
+        }
     };
     t_qa.complete(format!("status={:?} checks={}", qa.overall_status, qa.checks.len()));
     for c in &qa.checks {
