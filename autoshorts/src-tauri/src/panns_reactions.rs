@@ -358,16 +358,21 @@ impl PannsEngine {
         // reaction intelligence" and let the pipeline continue. Unbounded
         // `.output()` here meant a wedged sidecar could stall candidate
         // generation forever.
-        let budget = std::time::Duration::from_secs_f64(PANNS_TIMEOUT_SEC);
-        println!("[PANNs] sidecar START budget={:.0}s", PANNS_TIMEOUT_SEC);
+        let timeout_sec = if self.config.timeout_sec > 0 {
+            self.config.timeout_sec
+        } else {
+            300
+        };
+        let budget = std::time::Duration::from_secs(timeout_sec);
+        println!("[PANNs] sidecar START budget={}s", timeout_sec);
         let output = crate::proc_guard::run_bounded(&mut cmd, budget, "PANNs/sidecar")
             .context("spawning PANNs sidecar")?;
 
         if output.timed_out {
             return Err(anyhow!(
-                "PANNs sidecar TIMEOUT after {:.0}s (budget {:.0}s); process tree killed",
+                "PANNs sidecar TIMEOUT after {:.0}s (budget {}s); process tree killed",
                 output.elapsed.as_secs_f64(),
-                PANNS_TIMEOUT_SEC
+                timeout_sec
             ));
         }
 
@@ -485,13 +490,6 @@ impl PannsEngine {
         Err(anyhow!("panns_reactions.py not found"))
     }
 }
-
-/// Wall-clock budget for the PANNs reaction sidecar (ADVISORY stage).
-///
-/// Event classification over a full source is linear in runtime; the budget is
-/// generous enough for a long source while still guaranteeing the pipeline
-/// falls back instead of hanging.
-const PANNS_TIMEOUT_SEC: f64 = 900.0;
 
 /// Feature flag
 pub fn panns_reactions_enabled() -> bool {
@@ -1098,5 +1096,13 @@ mod tests {
         // Metadata written, boost applied and capped.
         assert!(c.reactions_json.as_ref().unwrap().contains("Laughter"));
         assert_eq!(c.hook_score, Some(0.42 + 0.05 * 0.95));
+    }
+
+    #[test]
+    fn test_panns_config_timeout_authoritative() {
+        let mut config = PannsConfig::default();
+        assert_eq!(config.timeout_sec, 300);
+        config.timeout_sec = 45;
+        assert_eq!(config.timeout_sec, 45);
     }
 }

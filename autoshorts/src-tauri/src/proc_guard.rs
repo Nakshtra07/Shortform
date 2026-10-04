@@ -87,7 +87,8 @@ pub fn run_bounded(cmd: &mut Command, timeout: Duration, stage: &str) -> Result<
                 std::thread::sleep(poll);
             }
             Err(e) => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
+                let _ = child.wait();
                 return Err(anyhow!("{}: wait failed: {}", stage, e));
             }
         }
@@ -132,12 +133,13 @@ pub fn run_bounded(cmd: &mut Command, timeout: Duration, stage: &str) -> Result<
 
 /// Kill a child and, on Windows, its whole process tree.
 ///
-/// `Child::kill()` only terminates the direct child. When the command is a
-/// shell wrapper that has itself spawned the real worker (e.g. `cmd /C`),
-/// the grandchild would keep running — holding CPU, a file handle, or a port
-/// — long after the caller believes the process is gone. `taskkill /T` takes
-/// the tree down with it.
+/// If the process has already exited, no kill attempt is made.
+/// When the command is a shell wrapper that has itself spawned the real worker
+/// (e.g. `cmd /C`), `taskkill /T` takes the tree down with it.
 fn kill_process_tree(child: &mut std::process::Child) {
+    if let Ok(Some(_)) = child.try_wait() {
+        return;
+    }
     #[cfg(windows)]
     {
         let pid = child.id();
@@ -334,5 +336,19 @@ mod tests {
         t.complete("ok");
         let t2 = StageTimer::start("UnitTestStage2");
         t2.failed("synthetic");
+    }
+
+    #[test]
+    fn test_kill_process_tree_noop_when_already_exited() {
+        let mut cmd = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+        if cfg!(windows) {
+            cmd.args(["/C", "echo done"]);
+        } else {
+            cmd.args(["-c", "echo done"]);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let _ = child.wait().unwrap(); // Already exited and reaped
+        // Calling kill_process_tree on an exited process must not fail or panic
+        kill_process_tree(&mut child);
     }
 }
