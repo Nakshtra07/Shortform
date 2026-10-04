@@ -53,7 +53,7 @@ autoshorts/.git_sub_backup/
 *.part
 *.m4a
 *.wav
-!test_zero.wav
+!tests/test_zero.wav
 
 # Local Model Weights (Downloaded at Runtime)
 *.pt

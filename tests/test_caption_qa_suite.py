@@ -30,13 +30,14 @@ import tempfile
 from collections import defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC_TAURI = os.path.join(HERE, "autoshorts", "src-tauri")
+REPO_ROOT = os.path.dirname(HERE) if os.path.basename(HERE) == "tests" else HERE
+SRC_TAURI = os.path.join(REPO_ROOT, "autoshorts", "src-tauri")
 BIN = os.path.join(SRC_TAURI, "target", "debug", "caption_qa.exe")
-VENV_PY = os.path.join(HERE, ".venv", "Scripts", "python.exe")
+VENV_PY = os.path.join(REPO_ROOT, ".venv", "Scripts", "python.exe")
 DB = os.path.expandvars(r"C:\Users\naksh\AppData\Roaming\com.autoshorts.desktop\autoshorts.sqlite")
 SOURCE_MP4 = r"C:\Users\naksh\Downloads\AutoShorts_OcISVEh1jyw.mp4"
-OUT = os.path.join(HERE, "tmp", "qa_suite")
-REPORT_MD = os.path.join(HERE, "validation_report_caption_qa.md")
+OUT = os.path.join(REPO_ROOT, "tmp", "qa_suite")
+REPORT_MD = os.path.join(REPO_ROOT, "docs", "reports", "validation_report_caption_qa.md")
 
 ALL_CHECKS = []
 FAILURES = []
@@ -245,7 +246,7 @@ def phase_regression():
         "autoshorts/src-tauri/src/llm.rs",
         "autoshorts/src/main.tsx",
     ]
-    repo = os.path.join(HERE, "autoshorts")
+    repo = REPO_ROOT
     for f in protected:
         path = os.path.join(repo, f)
         rel = os.path.relpath(path, repo)

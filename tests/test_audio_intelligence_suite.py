@@ -24,7 +24,8 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ENGINE_DIR = os.path.join(HERE, "autoshorts", "src-tauri", "scripts")
+REPO_ROOT = os.path.dirname(HERE) if os.path.basename(HERE) == "tests" else HERE
+ENGINE_DIR = os.path.join(REPO_ROOT, "autoshorts", "src-tauri", "scripts")
 sys.path.insert(0, ENGINE_DIR)
 
 import audio_intelligence as ai  # noqa: E402  (real production engine)
@@ -465,7 +466,7 @@ def case_o():
 
 # ── P. Rust integration: audio_inspect end-to-end ───────────────────────────
 
-AUDIO_INSPECT = os.path.join(HERE, "autoshorts", "src-tauri", "target",
+AUDIO_INSPECT = os.path.join(REPO_ROOT, "autoshorts", "src-tauri", "target",
                              "debug", "audio_inspect.exe")
 
 

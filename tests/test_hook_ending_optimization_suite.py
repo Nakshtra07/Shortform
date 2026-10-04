@@ -49,11 +49,12 @@ import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-EXE = os.path.join(ROOT, "autoshorts", "src-tauri", "target", "debug",
+REPO_ROOT = os.path.dirname(ROOT) if os.path.basename(ROOT) == "tests" else ROOT
+EXE = os.path.join(REPO_ROOT, "autoshorts", "src-tauri", "target", "debug",
                    "boundary_inspect.exe")
-BEAT_VIDEO = os.path.join(ROOT, "Beat Emotional Fatigue_ Better Sleep & Clearer Mind.mp4")
+BEAT_VIDEO = os.path.join(REPO_ROOT, "Beat Emotional Fatigue_ Better Sleep & Clearer Mind.mp4")
 MESSI_VIDEO = os.path.join(
-    ROOT, "Messi vs Ronaldo Fans： The Psychology Explained [rssDTc086bk].mp4")
+    REPO_ROOT, "Messi vs Ronaldo Fans： The Psychology Explained [rssDTc086bk].mp4")
 
 if not os.path.exists(EXE):
     print("FATAL: boundary_inspect.exe not found at", EXE)

@@ -45,14 +45,25 @@ AutoShorts 11.0 is an enterprise-grade desktop application that transforms long-
 │   │   └── tests/                  # Rust integration test suites
 │   ├── package.json                # Frontend dependencies and build scripts
 │   └── .env.example                # Application environment variable template
-├── docs/                           # Architecture specs, design proposals & license audits
-│   ├── superpowers/specs/          # Detailed engineering specifications
-│   ├── superpowers/plans/          # Phase implementation plans
-│   └── license_audit/              # Compliance audits for ML models and third-party tools
+├── docs/                           # Architecture, reports, development plans & archives
+│   ├── architecture/               # System architecture & core ML research reports
+│   ├── development/                # Implementation plans and test infrastructure docs
+│   ├── reports/                    # Phase execution, audit, and validation reports
+│   ├── license_audit/              # Compliance audits for ML models and third-party tools
+│   ├── superpowers/                # Detailed engineering specifications & plans
+│   └── archive/                    # Archived project notes and historical requests
+├── tests/                          # Standalone integration and regression test suites
+│   ├── test_applied_features_suite.py
+│   ├── test_audio_intelligence_suite.py
+│   ├── test_caption_qa_suite.py
+│   ├── test_hook_closure_suite.py
+│   ├── test_hook_ending_optimization_suite.py
+│   ├── test_smart_pacing_suite.py
+│   ├── test_smart_pacing_2_suite.py
+│   └── test_zero.wav
 ├── Fontfabric-Matt-Trial/          # Typography assets for ASS caption engine
 ├── requirements.txt                # Root Python dependencies for DSP and ML sidecars
-├── run_test.bat                    # Windows batch runner for Python test suites
-├── test_*_suite.py                 # Comprehensive unit & regression test suites
+├── run_test.bat                    # Windows batch runner for test suites
 ├── .env.example                    # Root environment configuration template
 └── README.md                       # Repository documentation
 ```
@@ -157,10 +168,15 @@ cargo test --test t7_prosody_suite -j 2
 ### Python DSP & Intelligence Test Suite
 ```bash
 # From the root directory with .venv activated:
-python -m unittest test_applied_features_suite.py
-python -m unittest test_audio_intelligence_suite.py
-python -m unittest test_smart_pacing_suite.py
-python -m unittest test_hook_closure_suite.py
+python -m unittest discover -s tests -p "test_*.py"
+
+# Or run individual suites directly:
+python tests/test_applied_features_suite.py
+python tests/test_audio_intelligence_suite.py
+python tests/test_smart_pacing_suite.py
+python tests/test_smart_pacing_2_suite.py
+python tests/test_hook_closure_suite.py
+python tests/test_hook_ending_optimization_suite.py
 ```
 
 ---
