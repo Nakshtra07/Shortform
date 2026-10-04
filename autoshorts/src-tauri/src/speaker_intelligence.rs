@@ -1525,8 +1525,8 @@ mod tests {
         let diar_str = diar_tmp.to_string_lossy().into_owned();
         let gal_str = gallery_tmp.to_string_lossy().into_owned();
         let sidecar_inputs = crate::media::SpeakerIntelSidecarInputs {
-            diarization_json: diar_str.as_str(),
-            gallery_json: gal_str.as_str(),
+            diarization_json: Some(diar_str.as_str()),
+            gallery_json: Some(gal_str.as_str()),
             scene_cuts_json: None,
         };
         let plan = crate::media::detect_speaker_crop_params_with_intel(

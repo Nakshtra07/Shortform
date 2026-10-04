@@ -599,8 +599,8 @@ fn main() {
     let diar_s = diar_tmp.to_string_lossy().into_owned();
     let gal_s = gal_tmp.to_string_lossy().into_owned();
     let sidecar_inputs = autoshorts_lib::media::SpeakerIntelSidecarInputs {
-        diarization_json: diar_s.as_str(),
-        gallery_json: gal_s.as_str(),
+        diarization_json: Some(diar_s.as_str()),
+        gallery_json: Some(gal_s.as_str()),
         scene_cuts_json: scene_sidecar_path.as_deref(),
     };
     let plan = autoshorts_lib::media::detect_speaker_crop_params_with_intel(

@@ -621,16 +621,17 @@ def build_diarization_segments_from_words(words, clip_start: float, clip_end: fl
     return segments
 
 
-def load_diarization_sidecar_json(path):
+def load_diarization_sidecar_json(path, return_speaker_map=False):
     """Load cached source-level diarization (absolute source seconds) written
     by the Rust Speaker Intelligence engine (speaker_diarization.py output).
 
-    Returns a list of DiarizedSegment, or [] when the file is missing,
-    unreadable, malformed, or has no segments (fallback: transcript labels).
+    Returns a list of DiarizedSegment, or (segments, speaker_map) if return_speaker_map=True.
+    Missing/corrupt file -> empty list (or ([], {})).
     """
     segments = []
+    speaker_map = {}
     if not path:
-        return segments
+        return (segments, speaker_map) if return_speaker_map else segments
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -645,12 +646,24 @@ def load_diarization_sidecar_json(path):
                 end=float(e),
                 confidence=float(seg.get("confidence", 0.8) or 0.8),
             ))
+        for m in data.get("speaker_map", []) or []:
+            sid = m.get("speaker_id")
+            role = m.get("role")
+            if sid is not None and role is not None:
+                speaker_map[str(sid)] = str(role)
         if segments:
             sys.stderr.write(f"[SpeakerIntel] loaded {len(segments)} cached diarization segments\n")
     except Exception as e:
         sys.stderr.write(f"[SpeakerIntel] diarization sidecar load failed ({e}); transcript fallback\n")
-        return []
-    return segments
+        return ([], {}) if return_speaker_map else []
+    return (segments, speaker_map) if return_speaker_map else segments
+
+
+def load_speaker_map_from_sidecar(path):
+    """Load speaker_map from cached diarization sidecar JSON.
+    Returns dict of {speaker_id: role_str}."""
+    _, speaker_map = load_diarization_sidecar_json(path, return_speaker_map=True)
+    return speaker_map
 
 
 def load_persisted_gallery_json(path):
@@ -858,7 +871,7 @@ def fusion_states_for_window(fusion_states, rel_ts, rel_te, clip_start_sec,
 
 
 def build_speaker_intel_block(gallery_manager, all_fusion_states, clip_start_sec,
-                              fusion_method="fusion"):
+                              fusion_method="fusion", speaker_map=None):
     """Emit the speakerIntel plan block consumed by the Rust engine:
     Re-ID gallery entries (EMA embeddings, base64 float32) + fused active
     speaker intervals (absolute source seconds)."""
@@ -887,12 +900,14 @@ def build_speaker_intel_block(gallery_manager, all_fusion_states, clip_start_sec
         sys.stderr.write(f"[SpeakerIntel] gallery serialization failed ({e}); emitting without gallery\n")
         gallery_entries = []
 
+    spk_map = speaker_map or {}
     intervals = []
     for s in all_fusion_states or []:
         try:
+            role = spk_map.get(s.diarization_id) if s.diarization_id else None
             intervals.append({
                 "trackId": int(s.track_id),
-                "applicationRole": None,
+                "applicationRole": role,
                 "diarizationId": s.diarization_id,
                 "start": round(float(s.start), 3),
                 "end": round(float(s.end), 3),
@@ -6367,10 +6382,14 @@ def run(
     # the transcript; otherwise empty (fusion then runs visual-only and the
     # deterministic heuristic remains authoritative).
     diar_segments = []
+    speaker_map = {}
     if speaker_fusion_enabled() and _asf is not None:
-        diar_segments = load_diarization_sidecar_json(diarization_json_path)
+        if diarization_json_path:
+            diar_segments, speaker_map = load_diarization_sidecar_json(diarization_json_path, return_speaker_map=True)
         if not diar_segments:
             diar_segments = build_diarization_segments_from_words(transcript_words or [], start_sec, end_sec)
+    elif diarization_json_path:
+        _, speaker_map = load_diarization_sidecar_json(diarization_json_path, return_speaker_map=True)
     persisted_gallery = load_persisted_gallery_json(gallery_json_path) if speaker_reid_enabled() else {}
     try:
         fusion_interval_sec = float(os.environ.get("AUTOSHORTS_FUSION_INTERVAL_SEC", "1.0") or 1.0)
@@ -6758,6 +6777,7 @@ def run(
             speaker_intel=build_speaker_intel_block(
                 get_reid_manager(), all_fusion_states, start_sec,
                 fusion_method="fusion" if all_fusion_states else "heuristic_fallback",
+                speaker_map=speaker_map,
             ) if (speaker_fusion_enabled() or speaker_reid_enabled()) else None,
         )
         sys.stderr.write("[DualFrame] layout_plan total_segments=1 dual_segments=0\n")
@@ -6853,6 +6873,7 @@ def run(
     plan.speaker_intel = build_speaker_intel_block(
         get_reid_manager(), all_fusion_states, start_sec,
         fusion_method="fusion" if all_fusion_states else "heuristic_fallback",
+        speaker_map=speaker_map,
     ) if (speaker_fusion_enabled() or speaker_reid_enabled()) else None
 
     print(plan.to_json())

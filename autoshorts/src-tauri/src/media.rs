@@ -1514,8 +1514,8 @@ impl From<&SmartFramingPlan> for SpeakerCropResult {
 /// Re-ID gallery for cross-render track association. `None` keeps the legacy
 /// CLI contract (transcript-derived evidence only).
 pub struct SpeakerIntelSidecarInputs<'a> {
-    pub diarization_json: &'a str,
-    pub gallery_json: &'a str,
+    pub diarization_json: Option<&'a str>,
+    pub gallery_json: Option<&'a str>,
     /// Phase 3 scene intelligence: cached PySceneDetect boundary JSON
     /// ({"scenes":[{"sceneId","start","end"},...]}, absolute source seconds).
     /// None keeps the tracker's own cut detection as the sole source.
@@ -1635,8 +1635,12 @@ pub fn detect_speaker_crop_params_with_intel(
             // gallery (source-level, absolute-time) when the engine produced them.
             // Feature flags flow through inherited env vars to the sidecar.
             if let Some(inputs) = speaker_intel_inputs {
-                cmd.arg("--diarization-json").arg(inputs.diarization_json);
-                cmd.arg("--gallery-json").arg(inputs.gallery_json);
+                if let Some(diar) = inputs.diarization_json {
+                    cmd.arg("--diarization-json").arg(diar);
+                }
+                if let Some(gal) = inputs.gallery_json {
+                    cmd.arg("--gallery-json").arg(gal);
+                }
                 if let Some(scenes) = inputs.scene_cuts_json {
                     cmd.arg("--scene-cuts-json").arg(scenes);
                 }
@@ -3369,4 +3373,17 @@ mod tests {
         );
         assert_eq!(portrait_plan.fallback_reason, None);
     }
+
+    #[test]
+    fn test_speaker_intel_sidecar_inputs_decoupled() {
+        let inputs = SpeakerIntelSidecarInputs {
+            diarization_json: None,
+            gallery_json: None,
+            scene_cuts_json: Some("path/to/scenes.json"),
+        };
+        assert!(inputs.scene_cuts_json.is_some());
+        assert!(inputs.diarization_json.is_none());
+        assert!(inputs.gallery_json.is_none());
+    }
 }
+

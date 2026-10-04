@@ -2224,7 +2224,8 @@ async fn render_flat_clip_for_candidate(
         // sidecar's speakerIntel block is persisted back per candidate. Any
         // failure here leaves speaker_intel_inputs = None and the pipeline
         // runs exactly as before (deterministic fallbacks).
-        let mut speaker_intel_inputs: Option<(String, String, Option<String>)> = None;
+        let mut diar_tmp_path: Option<String> = None;
+        let mut gallery_tmp_path: Option<String> = None;
         if speaker_intelligence::speaker_intelligence_enabled() {
             match speaker_intelligence::SpeakerIntelligenceEngine::new(
                 speaker_intelligence::SpeakerIntelligenceConfig {
@@ -2253,6 +2254,10 @@ async fn render_flat_clip_for_candidate(
                                 "end": s.end,
                                 "confidence": s.confidence,
                             })).collect::<Vec<_>>(),
+                            "speaker_map": si.speaker_map.mappings.iter().map(|m| serde_json::json!({
+                                "speaker_id": m.diarization_id,
+                                "role": m.application_role,
+                            })).collect::<Vec<_>>(),
                         });
                         let gallery_doc = serde_json::json!({
                             "entries": si.reid_embeddings,
@@ -2265,13 +2270,13 @@ async fn render_flat_clip_for_candidate(
                             .ok()
                             .and_then(|c| std::fs::write(&gallery_tmp, c).ok())
                             .is_some();
-                        if diar_ok || gallery_ok {
-                            speaker_intel_inputs = Some((
-                                diar_tmp.to_string_lossy().into_owned(),
-                                gallery_tmp.to_string_lossy().into_owned(),
-                                None,
-                            ));
-                        } else {
+                        if diar_ok {
+                            diar_tmp_path = Some(diar_tmp.to_string_lossy().into_owned());
+                        }
+                        if gallery_ok {
+                            gallery_tmp_path = Some(gallery_tmp.to_string_lossy().into_owned());
+                        }
+                        if !diar_ok && !gallery_ok {
                             eprintln!("[SpeakerIntel] sidecar temp files could not be written — continuing without speaker intelligence inputs");
                         }
                     }
@@ -2315,14 +2320,15 @@ async fn render_flat_clip_for_candidate(
             }
         }
 
-        let sidecar_inputs = speaker_intel_inputs.as_ref().map(|(d, g, s)| {
-            let _ = (d, g, s);
-            media::SpeakerIntelSidecarInputs {
-                diarization_json: d.as_str(),
-                gallery_json: g.as_str(),
-                scene_cuts_json: s.as_deref(),
-            }
-        });
+        let sidecar_inputs = if diar_tmp_path.is_some() || gallery_tmp_path.is_some() || scene_cuts_json.is_some() {
+            Some(media::SpeakerIntelSidecarInputs {
+                diarization_json: diar_tmp_path.as_deref(),
+                gallery_json: gallery_tmp_path.as_deref(),
+                scene_cuts_json: scene_cuts_json.as_deref(),
+            })
+        } else {
+            None
+        };
         let framing_plan = media::detect_speaker_crop_params_with_intel(
             &project.source_path,
             render_start,
@@ -2365,8 +2371,10 @@ async fn render_flat_clip_for_candidate(
                 }
             }
         }
-        if let Some((ref d, ref g, _)) = speaker_intel_inputs {
+        if let Some(ref d) = diar_tmp_path {
             let _ = std::fs::remove_file(d);
+        }
+        if let Some(ref g) = gallery_tmp_path {
             let _ = std::fs::remove_file(g);
         }
         if let Some(ref s) = scene_cuts_json {

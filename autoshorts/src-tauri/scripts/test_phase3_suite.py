@@ -195,6 +195,71 @@ class TestSceneIntelligenceSidecar(unittest.TestCase):
         os.remove(path)
 
 
+class TestSpeakerMapRoleConsumption(unittest.TestCase):
+    def test_13_load_diarization_and_speaker_map(self):
+        import speaker_tracker as st
+        doc = {
+            "model": "deepgram",
+            "segments": [
+                {"speaker_id": "spk_0", "start": 0.0, "end": 2.5, "confidence": 0.9},
+                {"speaker_id": "spk_1", "start": 2.5, "end": 5.0, "confidence": 0.85},
+            ],
+            "speaker_map": [
+                {"speaker_id": "spk_0", "role": "host"},
+                {"speaker_id": "spk_1", "role": "guest"},
+            ],
+        }
+        path = os.path.join(os.environ.get("TEMP", "/tmp"), "diar_spk_map_test.json")
+        with open(path, "w") as f:
+            json.dump(doc, f)
+        try:
+            # Test default backwards compatibility
+            segs = st.load_diarization_sidecar_json(path)
+            self.assertEqual(len(segs), 2)
+            self.assertEqual(segs[0].speaker_id, "spk_0")
+
+            # Test return_speaker_map=True
+            segs, spk_map = st.load_diarization_sidecar_json(path, return_speaker_map=True)
+            self.assertEqual(len(segs), 2)
+            self.assertEqual(spk_map.get("spk_0"), "host")
+            self.assertEqual(spk_map.get("spk_1"), "guest")
+
+            # Test helper
+            spk_map2 = st.load_speaker_map_from_sidecar(path)
+            self.assertEqual(spk_map2, {"spk_0": "host", "spk_1": "guest"})
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_14_build_speaker_intel_block_populates_application_role(self):
+        import speaker_tracker as st
+        import types
+        # Create a mock fusion state
+        state1 = types.SimpleNamespace(
+            track_id=1, diarization_id="spk_0", start=1.0, end=3.0,
+            audio_evidence=0.8, visual_evidence=0.9, speaking_probability=0.85,
+            confidence=0.88, evidence_sources=["diarization", "visual_mouth_motion"]
+        )
+        state2 = types.SimpleNamespace(
+            track_id=2, diarization_id="spk_1", start=3.0, end=5.0,
+            audio_evidence=0.7, visual_evidence=0.8, speaking_probability=0.75,
+            confidence=0.80, evidence_sources=["diarization"]
+        )
+        state_unknown = types.SimpleNamespace(
+            track_id=3, diarization_id=None, start=5.0, end=6.0,
+            audio_evidence=0.0, visual_evidence=0.5, speaking_probability=0.4,
+            confidence=0.50, evidence_sources=[]
+        )
+        speaker_map = {"spk_0": "host", "spk_1": "guest"}
+        block = st.build_speaker_intel_block(None, [state1, state2, state_unknown], 0.0, speaker_map=speaker_map)
+
+        intervals = block["fusion"]["intervals"]
+        self.assertEqual(len(intervals), 3)
+        self.assertEqual(intervals[0]["applicationRole"], "host")
+        self.assertEqual(intervals[1]["applicationRole"], "guest")
+        self.assertIsNone(intervals[2]["applicationRole"])
+
+
 class TestT7ProsodyPipeline(unittest.TestCase):
     """
     Self-contained: builds its own deterministic media fixture with ffmpeg.
