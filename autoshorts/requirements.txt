@@ -1,0 +1,8 @@
+# AutoShorts 3.0 � Python Runtime Dependencies
+# Used by Smart Reframing (speaker_tracker.py) and Multimodal Hook Analyzer (multimodal_hook_analyzer.py)
+# yt-dlp powers the YouTube import feature (youtube.rs); discovered via media.rs::find_ytdlp_cmd() .venv candidates
+
+opencv-python>=4.8.0
+numpy>=1.24.0
+scipy>=1.10.0
+yt-dlp>=2026.8.19

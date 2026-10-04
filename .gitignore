@@ -1,0 +1,122 @@
+# ==============================================================================
+# AutoShorts 11.0 - Production Git Ignore Configuration
+# ==============================================================================
+
+# Secrets and Local Configurations
+.env
+.env.*
+!.env.example
+
+# Python Environments & Cache
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Node.js
+node_modules/
+dist/
+.npm/
+
+# Rust / Tauri Build Artifacts
+target/
+**/target/
+src-tauri/target/
+**/src-tauri/target/
+
+# IDE & Local Tooling
+.vscode/
+.idea/
+.claude/
+.agents/
+.superpowers/
+%USERPROFILE%/
+*.swp
+*~
+
+# Nested Git Repositories / Backups
+autoshorts/.git/
+autoshorts/.git_sub_backup/
+.git_sub_backup/
+*.git.bak
+
+# Large Media & Video Files (>100MB / Render Outputs)
+*.mp4
+*.webm
+*.mov
+*.mkv
+*.avi
+*.part
+*.m4a
+*.wav
+!test_zero.wav
+
+# Local Model Weights (Downloaded at Runtime)
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.bin
+models/
+**/models/*.pt
+**/models/*.onnx
+**/models/*.safetensors
+
+# Verification & Test Frame Dumps
+audit_framing/
+ref_video/
+scratch/
+tmp/
+temp/
+**/tmp/
+**/temp/
+**/scratch/
+**/e2e_output/
+**/v5_crop_validation_test/
+**/v7_verification/
+**/v8_render_validation/
+**/visual_verification/
+**/visual_verification_final/
+**/active_speaker_first_verification/
+**/clipsai_pipeline_acceptance/
+**/editorial_polish_verification/
+**/final_active_speaker_acceptance/
+**/inspection_latest_failure/
+**/multi_speaker_test/
+**/multi_speaker_test_v2/
+**/ref_frames/
+
+# Test Frame Images and Captions
+test_*.png
+test_*.ass
+**/scripts/*.png
+**/scripts/*.ass
+**/scripts/_diag*
+**/scripts/_measure*
+**/scripts/_profile*
+**/scripts/_run_real*
+
+# Temporary Terminal Logs, Outputs and Dumps
+*.log
+*.sqlite
+*.db
+pacing_stderr.txt
+pacing_stdout.json
+bd_clean.json
+bd_out.json
+tmp_words_empty.json
+tmp_pk.html
+pyr_test_*.py.txt
+prompt.txt
+fix_report2.py
+remove_deepfilter_section.py
+request_options.py.backup
+
+# OS Specific
+.DS_Store
+._*
+Thumbs.db

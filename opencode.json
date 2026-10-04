@@ -1,0 +1,27 @@
+
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "apinex": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Apinex",
+      "options": {
+        "baseURL": "https://api.apinex.bond/v1"
+      },
+     "models": {
+  "free/mimo-v2.6-pro": {
+    "name": "MiMo V2.6 Pro"
+  },
+  "free/deepseek-v4.1-flash": {
+    "name": "DeepSeek V4.1 Flash"
+  },
+  "free/gpt-6-luna": {
+    "name": "GPT-6 Luna"
+  },
+  "free/glm-5.3-flash": {
+    "name": "GLM-5.3 Flash"
+  }
+}
+    }
+  }
+}

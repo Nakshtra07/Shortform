@@ -1,0 +1,72 @@
+# Dependencies / builds
+node_modules/
+dist/
+target/
+src-tauri/target/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+
+# Local model weights
+models/
+src-tauri/models/
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# Generated media
+*.mp4
+*.webm
+*.mov
+*.mkv
+*.avi
+
+# Temporary / validation
+tmp/
+temp/
+scratch/
+src-tauri/tmp/
+
+# Generated validation directories
+active_speaker_first_verification/
+clipsai_pipeline_acceptance/
+editorial_polish_verification/
+final_active_speaker_acceptance/
+inspection_latest_failure/
+multi_speaker_test/
+multi_speaker_test_v2/
+ref_frames/
+v5_crop_validation_test/
+v7_verification/
+v8_render_validation/
+visual_verification/
+visual_verification_final/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Generated test/diagnostic artifacts
+e2e_output/
+src-tauri/e2e_output/
+src-tauri/scripts/*.png
+src-tauri/scripts/*.ass
+src-tauri/scripts/_diag*
+src-tauri/scripts/_measure*
+src-tauri/scripts/_profile*
+src-tauri/scripts/_run_real*
