@@ -73,7 +73,7 @@ Schema evolution is made explicit, inspection-backed, and failure-aware:
    }
    ```
 3. **Strict Execution**: If a column is missing, run `conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {def}"), [])?`. If this fails, return `Err(e)` immediately.
-4. **Post-Condition Verification**: Verify that all expected columns now exist.
+4. **Post-Condition Schema Verification**: Verify that all expected tables and columns actually exist in SQLite. This verification runs **even when `user_version` is already current**, ensuring schema integrity is validated against external corruption or partial manual edits.
 5. **Version Advancement**: Only after all table definitions and missing columns are verified, advance `PRAGMA user_version`:
    ```rust
    conn.execute_batch(&format!("PRAGMA user_version = {TARGET_SCHEMA_VERSION};"))?;
@@ -82,7 +82,7 @@ Schema evolution is made explicit, inspection-backed, and failure-aware:
 ### 3.3 Verification Strategy
 - **Fresh Database**: Initializes cleanly to `TARGET_SCHEMA_VERSION`.
 - **Existing Database**: Accurately detects existing columns, adds only missing ones, and advances version.
-- **Repeat Initialization**: Subsequent calls detect `user_version >= TARGET_SCHEMA_VERSION` and no-op idempotently.
+- **Repeat Initialization**: Subsequent calls verify the actual schema even when `user_version >= TARGET_SCHEMA_VERSION` and no-op idempotently.
 - **Genuine Error**: Injected syntax or permission error aborts `Database::open` with an explicit error.
 
 ---
@@ -314,12 +314,13 @@ struct PacingCacheDescriptor<'a> {
 ```
 
 ### 8.4 Invariants & Guarantees
-1. **Source Identity**: Reuses the repository's canonical `compute_source_hash` (SHA-256 of size + mtime + first 4MB).
-2. **No-Op Caching**: Valid plans resulting in 0 cuts or default framing are valid and fully cacheable.
-3. **Semantic Equality**: Cache hit verification compares semantic plan structures rather than fragile raw byte equality.
-4. **Subprocess Bypass**: A cache hit avoids launching Python or FFmpeg subprocesses.
-5. **Atomic Concurrency**: Write to temp file $\rightarrow$ flush/close $\rightarrow$ atomic rename guarantees zero partial or corrupted cache files.
-6. **Strict Invalidation**: Incrementing `algorithm_version` or `cache_schema_version` naturally invalidates older cache entries.
+1. **Source Identity**: Reuses the repository's canonical `compute_source_hash` as a **fast source fingerprint** (SHA-256 of file size + modification timestamp + first 4MB of header data). It is an established fingerprint rather than an exhaustive full-content media hash.
+2. **Scope of Candidate Caching**: Caching operates at the candidate descriptor level. It eliminates redundant decoding for identical candidate intervals, re-renders, and multi-pass stages (such as preview vs final render). However, **it does not guarantee the elimination of all overlapping source-level decoding** across distinct candidate intervals that share partial video ranges.
+3. **No-Op Caching**: Valid plans resulting in 0 cuts or default framing are valid and fully cacheable.
+4. **Semantic Equality**: Cache hit verification compares semantic plan structures rather than fragile raw byte equality.
+5. **Subprocess Bypass**: A cache hit avoids launching Python or FFmpeg subprocesses.
+6. **Atomic Concurrency**: Write to temp file $\rightarrow$ flush/close $\rightarrow$ atomic rename guarantees zero partial or corrupted cache files.
+7. **Strict Invalidation**: Incrementing `algorithm_version` or `cache_schema_version` naturally invalidates older cache entries.
 
 ---
 
