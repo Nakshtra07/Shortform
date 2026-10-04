@@ -27,6 +27,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::media::{
+    atomic_write_cache_file, compute_source_fingerprint, compute_words_fingerprint,
     escape_ffmpeg_filter_path, find_python_cmd, probe_media, resolve_and_verify_fonts_param,
     CropRectExpr, LayoutSegment, SmartFramingPlan,
 };
@@ -840,6 +841,68 @@ pub fn smart_pacing_enabled() -> bool {
     }
 }
 
+pub fn pacing_cache_dir() -> PathBuf {
+    dirs::data_dir()
+        .map(|d| d.join("com.autoshorts.desktop").join("pacing_cache"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("com.autoshorts.desktop")
+                .join("pacing_cache")
+        })
+}
+
+pub fn pacing_cache_enabled() -> bool {
+    match std::env::var("AUTOSHORTS_PACING_CACHE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+pub fn compute_effective_pacing_config_fingerprint(v2: bool) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(if v2 { b"v2:1" } else { b"v2:0" });
+    let learned = crate::pause_intel_enabled();
+    hasher.update(if learned { b"learned:1" } else { b"learned:0" });
+    if let Ok(model) = std::env::var("AUTOSHORTS_PAUSE_MODEL") {
+        hasher.update(model.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PacingCacheDescriptor {
+    pub schema_version: String,
+    pub algorithm_version: String,
+    pub source_fingerprint: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub pacing_mode: String,
+    pub words_fingerprint: String,
+    pub effective_config_fingerprint: String,
+}
+
+impl PacingCacheDescriptor {
+    pub fn compute_cache_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let serialized = serde_json::to_vec(self).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(&serialized);
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedPacingEntry {
+    pub descriptor: PacingCacheDescriptor,
+    pub plan: Option<SmartPacingPlan>,
+}
+
 /// Budget for one `smart_pacing.py` sidecar invocation.
 ///
 /// The engine performs FFmpeg silencedetect across the whole candidate range,
@@ -886,7 +949,7 @@ pub fn pacing_summary(plan: &SmartPacingPlan) -> String {
 }
 
 /// Run the Python pacing engine for a candidate range. Returns None when the
-/// engine is unavailable or it produced no safe edits â€” in every such case the
+/// engine is unavailable or it produced no safe edits — in every such case the
 /// caller renders the legacy unmodified clip.
 ///
 /// `v2` controls the engine's Smart Pacing 2.0 stage: the env var is set
@@ -899,6 +962,59 @@ fn run_pacing_engine(
     words: &[TranscriptWord],
     v2: bool,
 ) -> Option<SmartPacingPlan> {
+    let start_ms = (start_sec * 1000.0) as i64;
+    let end_ms = (end_sec * 1000.0) as i64;
+
+    let use_cache = pacing_cache_enabled();
+    let cache_dir = pacing_cache_dir();
+    let source_fp = compute_source_fingerprint(Path::new(source_path)).unwrap_or_default();
+
+    let descriptor = PacingCacheDescriptor {
+        schema_version: "1".to_string(),
+        algorithm_version: "v2.0".to_string(),
+        source_fingerprint: source_fp,
+        start_ms,
+        end_ms,
+        pacing_mode: if v2 { "sp2".to_string() } else { "sp1".to_string() },
+        words_fingerprint: compute_words_fingerprint(Some(words)),
+        effective_config_fingerprint: compute_effective_pacing_config_fingerprint(v2),
+    };
+    let cache_key = descriptor.compute_cache_key();
+    let cache_file_name = format!("{}.json", cache_key);
+
+    if use_cache && !descriptor.source_fingerprint.is_empty() {
+        let cache_path = cache_dir.join(&cache_file_name);
+        if cache_path.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&cache_path) {
+                if let Ok(entry) = serde_json::from_str::<CachedPacingEntry>(&content) {
+                    if let Some(ref plan) = entry.plan {
+                        if plan.status == "ok" && plan.validate().is_ok() {
+                            eprintln!(
+                                "[Smart Pacing] CACHE HIT for range {}..{}ms mode={} edits={} key={}",
+                                start_ms, end_ms, descriptor.pacing_mode, plan.edits.len(), &cache_key[..12]
+                            );
+                            return Some(plan.clone());
+                        }
+                    } else {
+                        eprintln!(
+                            "[Smart Pacing] CACHE HIT (verified no-op / 0-cut) for range {}..{}ms mode={} key={}",
+                            start_ms, end_ms, descriptor.pacing_mode, &cache_key[..12]
+                        );
+                        return None;
+                    }
+                } else if let Ok(plan) = serde_json::from_str::<SmartPacingPlan>(&content) {
+                    if plan.status == "ok" && plan.validate().is_ok() {
+                        eprintln!(
+                            "[Smart Pacing] CACHE HIT for range {}..{}ms mode={} edits={} key={}",
+                            start_ms, end_ms, descriptor.pacing_mode, plan.edits.len(), &cache_key[..12]
+                        );
+                        return Some(plan);
+                    }
+                }
+            }
+        }
+    }
+
     let script = find_smart_pacing_script()?;
     let python = find_python_cmd();
 
@@ -907,8 +1023,6 @@ fn run_pacing_engine(
         .ok()
         .and_then(|json| std::fs::write(&tmp, json).ok().map(|_| tmp.clone()))?;
 
-    let start_ms = (start_sec * 1000.0) as i64;
-    let end_ms = (end_sec * 1000.0) as i64;
     let mut cmd = Command::new(&python);
     cmd.arg(&script)
         .arg(source_path)
@@ -953,17 +1067,44 @@ fn run_pacing_engine(
         .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('['))
-        .last()?
-        .to_string();
-    let plan: SmartPacingPlan = serde_json::from_str(&last_line).ok()?;
-    if plan.status != "ok" || plan.is_noop() {
-        return None;
+        .last();
+
+    let mut successful_plan: Option<SmartPacingPlan> = None;
+    let mut is_verified_noop = false;
+
+    if let Some(line) = last_line {
+        if let Ok(plan) = serde_json::from_str::<SmartPacingPlan>(line) {
+            if plan.status == "ok" && !plan.is_noop() && plan.validate().is_ok() {
+                successful_plan = Some(plan);
+            } else if plan.status == "skipped" || plan.is_noop() {
+                is_verified_noop = true;
+            }
+        } else if line.contains("\"status\"") && line.contains("\"skipped\"") {
+            is_verified_noop = true;
+        }
     }
-    if let Err(e) = plan.validate() {
-        eprintln!("[Smart Pacing] rejecting engine plan: {e}");
-        return None;
+
+    if use_cache && !descriptor.source_fingerprint.is_empty() {
+        if let Some(ref plan) = successful_plan {
+            let entry = CachedPacingEntry {
+                descriptor: descriptor.clone(),
+                plan: Some(plan.clone()),
+            };
+            if let Ok(serialized) = serde_json::to_vec_pretty(&entry) {
+                let _ = atomic_write_cache_file(&cache_dir, &cache_file_name, &serialized);
+            }
+        } else if is_verified_noop {
+            let entry = CachedPacingEntry {
+                descriptor: descriptor.clone(),
+                plan: None,
+            };
+            if let Ok(serialized) = serde_json::to_vec_pretty(&entry) {
+                let _ = atomic_write_cache_file(&cache_dir, &cache_file_name, &serialized);
+            }
+        }
     }
-    Some(plan)
+
+    successful_plan
 }
 
 /// v1 entry point: Smart Pacing 1.0 exactly. The engine's v2 stage is
@@ -1903,5 +2044,116 @@ mod tests {
         let s = pacing_summary(&plan);
         assert!(s.contains("breath_pause"));
         assert!(s.contains("[Smart Pacing]"));
+    }
+
+    #[test]
+    fn test_pacing_cache_descriptor_hashing() {
+        let d1 = PacingCacheDescriptor {
+            schema_version: "1".to_string(),
+            algorithm_version: "v2.0".to_string(),
+            source_fingerprint: "src_fp_123".to_string(),
+            start_ms: 1000,
+            end_ms: 30000,
+            pacing_mode: "sp2".to_string(),
+            words_fingerprint: "words_fp_abc".to_string(),
+            effective_config_fingerprint: "config_fp_xyz".to_string(),
+        };
+        let k1 = d1.compute_cache_key();
+        assert_eq!(k1.len(), 64);
+
+        // sp1 vs sp2 changes key
+        let mut d2 = d1.clone();
+        d2.pacing_mode = "sp1".to_string();
+        let k2 = d2.compute_cache_key();
+        assert_ne!(k1, k2);
+
+        // words fingerprint changes key
+        let mut d3 = d1.clone();
+        d3.words_fingerprint = "words_fp_different".to_string();
+        let k3 = d3.compute_cache_key();
+        assert_ne!(k1, k3);
+
+        // range changes key
+        let mut d4 = d1.clone();
+        d4.start_ms = 2000;
+        let k4 = d4.compute_cache_key();
+        assert_ne!(k1, k4);
+    }
+
+    #[test]
+    fn test_pacing_cache_no_op_plan_cacheable() {
+        let temp_dir = std::env::temp_dir().join(format!("pacing_cache_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let descriptor = PacingCacheDescriptor {
+            schema_version: "1".to_string(),
+            algorithm_version: "v2.0".to_string(),
+            source_fingerprint: "src_noop".to_string(),
+            start_ms: 0,
+            end_ms: 15000,
+            pacing_mode: "sp2".to_string(),
+            words_fingerprint: "words_noop".to_string(),
+            effective_config_fingerprint: "config_noop".to_string(),
+        };
+        let key = descriptor.compute_cache_key();
+        let file_name = format!("{}.json", key);
+
+        let entry = CachedPacingEntry {
+            descriptor: descriptor.clone(),
+            plan: None,
+        };
+
+        let serialized = serde_json::to_vec_pretty(&entry).unwrap();
+        atomic_write_cache_file(&temp_dir, &file_name, &serialized).unwrap();
+
+        // Verify read-back preserves verified no-op (0 cuts) status
+        let read_content = std::fs::read_to_string(temp_dir.join(&file_name)).unwrap();
+        let loaded: CachedPacingEntry = serde_json::from_str(&read_content).unwrap();
+
+        assert_eq!(loaded.descriptor.compute_cache_key(), key);
+        assert!(loaded.plan.is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_pacing_cache_positive_plan_cacheable() {
+        let temp_dir = std::env::temp_dir().join(format!("pacing_cache_pos_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let descriptor = PacingCacheDescriptor {
+            schema_version: "1".to_string(),
+            algorithm_version: "v2.0".to_string(),
+            source_fingerprint: "src_pos".to_string(),
+            start_ms: 0,
+            end_ms: 15000,
+            pacing_mode: "sp1".to_string(),
+            words_fingerprint: "words_pos".to_string(),
+            effective_config_fingerprint: "config_pos".to_string(),
+        };
+        let key = descriptor.compute_cache_key();
+        let file_name = format!("{}.json", key);
+
+        let plan = plan_with(vec![(5.0, 6.0)], 15.0);
+        assert!(plan.validate().is_ok());
+
+        let entry = CachedPacingEntry {
+            descriptor: descriptor.clone(),
+            plan: Some(plan.clone()),
+        };
+
+        let serialized = serde_json::to_vec_pretty(&entry).unwrap();
+        atomic_write_cache_file(&temp_dir, &file_name, &serialized).unwrap();
+
+        let read_content = std::fs::read_to_string(temp_dir.join(&file_name)).unwrap();
+        let loaded: CachedPacingEntry = serde_json::from_str(&read_content).unwrap();
+
+        assert_eq!(loaded.descriptor.compute_cache_key(), key);
+        let loaded_plan = loaded.plan.expect("plan must be present");
+        assert_eq!(loaded_plan.status, "ok");
+        assert_eq!(loaded_plan.edits.len(), 1);
+        assert!(loaded_plan.validate().is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

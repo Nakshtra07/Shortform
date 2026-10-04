@@ -1,4 +1,5 @@
 use std::{
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -6,6 +7,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::models::{CandidateDraft, MediaProbe, MultimodalStatus, TranscriptWord};
 
@@ -1522,6 +1524,133 @@ pub struct SpeakerIntelSidecarInputs<'a> {
     pub scene_cuts_json: Option<&'a str>,
 }
 
+/// Computes a fast, stable Sha256 source fingerprint for the source media file.
+/// Hashes file length, modified timestamp, and the first 4 MB of content.
+///
+/// Note: This is a source fingerprint, not a full content hash.
+/// Candidate-result caching does not guarantee elimination of all overlapping
+/// source-level decoding.
+pub fn compute_source_fingerprint(source_path: &Path) -> Result<String> {
+    let meta = std::fs::metadata(source_path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(meta.len().to_le_bytes());
+    if let Ok(modified) = meta.modified() {
+        if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
+            hasher.update(dur.as_secs().to_le_bytes());
+        }
+    }
+
+    let mut file = std::fs::File::open(source_path)?;
+    let mut buffer = [0u8; 65536];
+    let mut total_read = 0;
+    while total_read < 4 * 1024 * 1024 {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+        total_read += n;
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn compute_words_fingerprint(words: Option<&[TranscriptWord]>) -> String {
+    let mut hasher = Sha256::new();
+    if let Some(ws) = words {
+        for w in ws {
+            hasher.update(w.start.to_le_bytes());
+            hasher.update(w.end.to_le_bytes());
+            hasher.update(w.text.as_bytes());
+            if let Some(ref spk) = w.speaker {
+                hasher.update(spk.as_bytes());
+            }
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn compute_file_or_content_fingerprint(path_or_str: Option<&str>) -> Option<String> {
+    let s = path_or_str?;
+    let path = Path::new(s);
+    if path.is_file() {
+        if let Ok(bytes) = std::fs::read(path) {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            return Some(format!("{:x}", hasher.finalize()));
+        }
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+pub fn framing_cache_dir() -> PathBuf {
+    dirs::data_dir()
+        .map(|d| d.join("com.autoshorts.desktop").join("framing_cache"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("com.autoshorts.desktop")
+                .join("framing_cache")
+        })
+}
+
+pub fn framing_cache_enabled() -> bool {
+    match std::env::var("AUTOSHORTS_FRAMING_CACHE") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Err(_) => true,
+    }
+}
+
+pub fn atomic_write_cache_file(cache_dir: &Path, file_name: &str, content: &[u8]) -> Result<()> {
+    std::fs::create_dir_all(cache_dir)?;
+    let tmp_file_name = format!("{}.tmp.{}", file_name, uuid::Uuid::new_v4());
+    let tmp_path = cache_dir.join(&tmp_file_name);
+    let target_path = cache_dir.join(file_name);
+
+    std::fs::write(&tmp_path, content)?;
+    let _ = std::fs::remove_file(&target_path);
+    if let Err(e) = std::fs::rename(&tmp_path, &target_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FramingCacheDescriptor {
+    pub schema_version: String,
+    pub algorithm_version: String,
+    pub source_fingerprint: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub iw: i64,
+    pub ih: i64,
+    pub crop_w: i64,
+    pub framing_mode: String,
+    pub words_fingerprint: String,
+    pub diarization_fingerprint: Option<String>,
+    pub gallery_fingerprint: Option<String>,
+    pub scene_cuts_fingerprint: Option<String>,
+}
+
+impl FramingCacheDescriptor {
+    pub fn compute_cache_key(&self) -> String {
+        let serialized = serde_json::to_vec(self).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(&serialized);
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedFramingEntry {
+    pub descriptor: FramingCacheDescriptor,
+    pub plan: SmartFramingPlan,
+}
+
 pub fn detect_speaker_crop_params(
     source_path: &str,
     start_sec: f64,
@@ -1587,6 +1716,63 @@ pub fn detect_speaker_crop_params_with_intel(
 
     let start_ms = (start_sec * 1000.0) as i64;
     let end_ms = (end_sec * 1000.0) as i64;
+
+    let use_cache = framing_cache_enabled();
+    let cache_dir = framing_cache_dir();
+    let source_fp = compute_source_fingerprint(Path::new(source_path)).unwrap_or_default();
+
+    let diarization_fingerprint = speaker_intel_inputs
+        .and_then(|i| compute_file_or_content_fingerprint(i.diarization_json));
+    let gallery_fingerprint = speaker_intel_inputs
+        .and_then(|i| compute_file_or_content_fingerprint(i.gallery_json));
+    let scene_cuts_fingerprint = speaker_intel_inputs
+        .and_then(|i| compute_file_or_content_fingerprint(i.scene_cuts_json));
+
+    let descriptor = FramingCacheDescriptor {
+        schema_version: "1".to_string(),
+        algorithm_version: "v12.0".to_string(),
+        source_fingerprint: source_fp,
+        start_ms,
+        end_ms,
+        iw,
+        ih,
+        crop_w: effective_crop_w,
+        framing_mode: framing_mode.to_string(),
+        words_fingerprint: compute_words_fingerprint(transcript_words),
+        diarization_fingerprint,
+        gallery_fingerprint,
+        scene_cuts_fingerprint,
+    };
+    let cache_key = descriptor.compute_cache_key();
+    let cache_file_name = format!("{}.json", cache_key);
+
+    if use_cache && !descriptor.source_fingerprint.is_empty() {
+        let cache_path = cache_dir.join(&cache_file_name);
+        if cache_path.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&cache_path) {
+                let maybe_plan = serde_json::from_str::<CachedFramingEntry>(&content)
+                    .map(|entry| entry.plan)
+                    .or_else(|_| serde_json::from_str::<SmartFramingPlan>(&content));
+
+                if let Ok(mut plan) = maybe_plan {
+                    if !plan.is_emergency_fallback && (!plan.segments.is_empty() || !plan.x.is_empty()) {
+                        if plan.segments.len() == 1 {
+                            if let LayoutSegment::Single { ref mut end, .. } = plan.segments[0] {
+                                if *end == 0.0 && clip_dur > 0.0 {
+                                    *end = clip_dur;
+                                }
+                            }
+                        }
+                        eprintln!(
+                            "[Framing] CACHE HIT for range {}..{}ms mode={} key={}",
+                            start_ms, end_ms, framing_mode, &cache_key[..12]
+                        );
+                        return plan;
+                    }
+                }
+            }
+        }
+    }
 
     // 1. Try the standalone multi-speaker script if available
     if let Some(script_path) = find_speaker_tracker_script() {
@@ -1783,6 +1969,15 @@ pub fn detect_speaker_crop_params_with_intel(
                                         }
                                     }
                                 }
+                                if use_cache && !descriptor.source_fingerprint.is_empty() {
+                                    let entry = CachedFramingEntry {
+                                        descriptor: descriptor.clone(),
+                                        plan: plan.clone(),
+                                    };
+                                    if let Ok(serialized) = serde_json::to_vec_pretty(&entry) {
+                                        let _ = atomic_write_cache_file(&cache_dir, &cache_file_name, &serialized);
+                                    }
+                                }
                                 return plan;
                             }
 
@@ -1800,6 +1995,15 @@ pub fn detect_speaker_crop_params_with_intel(
                             );
                             plan.is_emergency_fallback = false;
                             plan.fallback_reason = None;
+                            if use_cache && !descriptor.source_fingerprint.is_empty() {
+                                let entry = CachedFramingEntry {
+                                    descriptor: descriptor.clone(),
+                                    plan: plan.clone(),
+                                };
+                                if let Ok(serialized) = serde_json::to_vec_pretty(&entry) {
+                                    let _ = atomic_write_cache_file(&cache_dir, &cache_file_name, &serialized);
+                                }
+                            }
                             return plan;
                         }
                     }
@@ -3384,6 +3588,132 @@ mod tests {
         assert!(inputs.scene_cuts_json.is_some());
         assert!(inputs.diarization_json.is_none());
         assert!(inputs.gallery_json.is_none());
+    }
+
+    #[test]
+    fn test_compute_source_fingerprint() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("test_src_fp_{}.bin", uuid::Uuid::new_v4()));
+        std::fs::write(&file_path, b"test content for source fingerprinting").unwrap();
+
+        let fp1 = compute_source_fingerprint(&file_path).unwrap();
+        assert_eq!(fp1.len(), 64);
+        let fp2 = compute_source_fingerprint(&file_path).unwrap();
+        assert_eq!(fp1, fp2);
+
+        // Modifying content modifies the fingerprint
+        std::fs::write(&file_path, b"modified content for source fingerprinting").unwrap();
+        let fp3 = compute_source_fingerprint(&file_path).unwrap();
+        assert_ne!(fp1, fp3);
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_framing_cache_descriptor_hashing() {
+        let d1 = FramingCacheDescriptor {
+            schema_version: "1".to_string(),
+            algorithm_version: "v12.0".to_string(),
+            source_fingerprint: "abc123source".to_string(),
+            start_ms: 0,
+            end_ms: 10000,
+            iw: 1920,
+            ih: 1080,
+            crop_w: 608,
+            framing_mode: "original".to_string(),
+            words_fingerprint: "words123".to_string(),
+            diarization_fingerprint: None,
+            gallery_fingerprint: None,
+            scene_cuts_fingerprint: None,
+        };
+        let key1 = d1.compute_cache_key();
+        assert_eq!(key1.len(), 64);
+
+        // Scene cuts presence changes key
+        let mut d2 = d1.clone();
+        d2.scene_cuts_fingerprint = Some("cuts_hash_123".to_string());
+        let key2 = d2.compute_cache_key();
+        assert_ne!(key1, key2);
+
+        // Diarization presence changes key
+        let mut d3 = d1.clone();
+        d3.diarization_fingerprint = Some("diar_hash_123".to_string());
+        let key3 = d3.compute_cache_key();
+        assert_ne!(key1, key3);
+
+        // Framing mode changes key
+        let mut d4 = d1.clone();
+        d4.framing_mode = "adaptive".to_string();
+        let key4 = d4.compute_cache_key();
+        assert_ne!(key1, key4);
+    }
+
+    #[test]
+    fn test_framing_cache_key_generation_and_semantic_hit() {
+        let temp_dir = std::env::temp_dir().join(format!("framing_test_cache_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let descriptor = FramingCacheDescriptor {
+            schema_version: "1".to_string(),
+            algorithm_version: "v12.0".to_string(),
+            source_fingerprint: "test_src_hash".to_string(),
+            start_ms: 1000,
+            end_ms: 6000,
+            iw: 1920,
+            ih: 1080,
+            crop_w: 608,
+            framing_mode: "original".to_string(),
+            words_fingerprint: "words_fp".to_string(),
+            diarization_fingerprint: None,
+            gallery_fingerprint: None,
+            scene_cuts_fingerprint: None,
+        };
+        let key = descriptor.compute_cache_key();
+        let file_name = format!("{}.json", key);
+
+        let plan = SmartFramingPlan {
+            mode: "single".to_string(),
+            x: "100".to_string(),
+            y: "0".to_string(),
+            w: "608".to_string(),
+            h: "1080".to_string(),
+            segments: vec![LayoutSegment::Single {
+                start: 0.0,
+                end: 5.0,
+                crop: CropRectExpr {
+                    x: "100".to_string(),
+                    y: "0".to_string(),
+                    w: "608".to_string(),
+                    h: "1080".to_string(),
+                },
+                face_bounds: None,
+            }],
+            face_bounds: None,
+            framing: default_original_framing(),
+            is_emergency_fallback: false,
+            fallback_reason: None,
+            speaker_intel: None,
+        };
+
+        let entry = CachedFramingEntry {
+            descriptor: descriptor.clone(),
+            plan: plan.clone(),
+        };
+
+        let serialized = serde_json::to_vec_pretty(&entry).unwrap();
+        atomic_write_cache_file(&temp_dir, &file_name, &serialized).unwrap();
+
+        // Read and verify semantic equivalence
+        let read_content = std::fs::read_to_string(temp_dir.join(&file_name)).unwrap();
+        let loaded: CachedFramingEntry = serde_json::from_str(&read_content).unwrap();
+
+        assert_eq!(loaded.descriptor.compute_cache_key(), key);
+        assert_eq!(loaded.plan.x, "100");
+        assert_eq!(loaded.plan.w, "608");
+        assert_eq!(loaded.plan.segments.len(), 1);
+        assert!(!loaded.plan.is_emergency_fallback);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 
