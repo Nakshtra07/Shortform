@@ -16,6 +16,103 @@ use crate::models::{
     SpeakerMapping, TrackReIdEmbedding, Transcript,
 };
 
+pub const CURRENT_SCHEMA_VERSION: i32 = 1;
+
+fn get_table_columns(conn: &Connection, table: &str) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut set = std::collections::HashSet::new();
+    for col in cols {
+        set.insert(col?.to_ascii_lowercase());
+    }
+    Ok(set)
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, col_type: &str) -> Result<()> {
+    let cols = get_table_columns(conn, table)?;
+    if !cols.contains(&column.to_ascii_lowercase()) {
+        conn.execute(
+            &format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type),
+            [],
+        )
+        .with_context(|| format!("adding column {}.{}", table, column))?;
+    }
+    Ok(())
+}
+
+fn verify_schema(conn: &Connection) -> Result<()> {
+    let expected_tables = [
+        "projects",
+        "transcripts",
+        "candidates",
+        "clips",
+        "clip_copy",
+        "speaker_diarization",
+        "speaker_mapping",
+        "visual_track_identity",
+        "active_speaker_fusion",
+    ];
+    for table in &expected_tables {
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![table],
+                |r| r.get(0),
+            )
+            .with_context(|| format!("checking table {}", table))?;
+        if count == 0 {
+            bail!("Schema verification failed: missing table {}", table);
+        }
+    }
+
+    let cand_cols = get_table_columns(conn, "candidates")?;
+    for col in &[
+        "id", "project_id", "start_sec", "end_sec", "score", "hook", "rationale", "rank", "selected",
+        "hook_start_sec", "hook_end_sec", "hook_confidence", "opening_context_score",
+        "payoff_text", "payoff_start_sec", "payoff_end_sec", "payoff_score", "payoff_completion", "metadata_json",
+    ] {
+        if !cand_cols.contains(&col.to_ascii_lowercase()) {
+            bail!("Schema verification failed: candidates missing column {}", col);
+        }
+    }
+
+    let proj_cols = get_table_columns(conn, "projects")?;
+    for col in &[
+        "id", "name", "source_path", "source_duration", "status", "transcription_mode", "caption_style", "framing_mode", "created_at", "updated_at",
+    ] {
+        if !proj_cols.contains(&col.to_ascii_lowercase()) {
+            bail!("Schema verification failed: projects missing column {}", col);
+        }
+    }
+
+    let clip_cols = get_table_columns(conn, "clips")?;
+    for col in &[
+        "id", "candidate_id", "status", "output_path", "face_track_json", "caption_ass_path", "render_log", "applied_features",
+    ] {
+        if !clip_cols.contains(&col.to_ascii_lowercase()) {
+            bail!("Schema verification failed: clips missing column {}", col);
+        }
+    }
+
+    let transcript_cols = get_table_columns(conn, "transcripts")?;
+    for col in &["raw_transcript_json"] {
+        if !transcript_cols.contains(&col.to_ascii_lowercase()) {
+            bail!("Schema verification failed: transcripts missing column {}", col);
+        }
+    }
+
+    let vti_cols = get_table_columns(conn, "visual_track_identity")?;
+    for col in &[
+        "id", "project_id", "source_hash", "track_id", "shot_idx", "reid_embedding", "embedding_model", "first_seen_sec", "last_seen_sec", "total_detections", "created_at",
+    ] {
+        if !vti_cols.contains(&col.to_ascii_lowercase()) {
+            bail!("Schema verification failed: visual_track_identity missing column {}", col);
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -37,176 +134,158 @@ impl Database {
 
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().expect("database mutex poisoned");
-        conn.execute_batch(
-            "
-            PRAGMA foreign_keys = ON;
+        conn.execute("PRAGMA foreign_keys = ON;", [])?;
 
-            CREATE TABLE IF NOT EXISTS projects (
-                id TEXT PRIMARY KEY,
-                name TEXT,
-                source_path TEXT NOT NULL,
-                source_duration REAL,
-                status TEXT NOT NULL,
-                transcription_mode TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
+        let current_version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
 
-            CREATE TABLE IF NOT EXISTS transcripts (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                engine TEXT NOT NULL,
-                raw_json TEXT NOT NULL,
-                raw_transcript_json TEXT,
-                language TEXT,
-                created_at TEXT NOT NULL
-            );
+        if current_version < CURRENT_SCHEMA_VERSION {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    source_path TEXT NOT NULL,
+                    source_duration REAL,
+                    status TEXT NOT NULL,
+                    transcription_mode TEXT NOT NULL,
+                    caption_style TEXT,
+                    framing_mode TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS candidates (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                start_sec REAL NOT NULL,
-                end_sec REAL NOT NULL,
-                score REAL NOT NULL,
-                hook TEXT NOT NULL,
-                rationale TEXT NOT NULL,
-                rank INTEGER NOT NULL,
-                selected INTEGER NOT NULL DEFAULT 0,
-                hook_start_sec REAL,
-                hook_end_sec REAL,
-                hook_confidence REAL,
-                opening_context_score REAL,
-                payoff_text TEXT,
-                payoff_start_sec REAL,
-                payoff_end_sec REAL,
-                payoff_score REAL,
-                payoff_completion INTEGER,
-                metadata_json TEXT
-            );
+                CREATE TABLE IF NOT EXISTS transcripts (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    engine TEXT NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    raw_transcript_json TEXT,
+                    language TEXT,
+                    created_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS clips (
-                id TEXT PRIMARY KEY,
-                candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
-                status TEXT NOT NULL,
-                output_path TEXT,
-                face_track_json TEXT,
-                caption_ass_path TEXT,
-                render_log TEXT,
-                applied_features TEXT
-            );
+                CREATE TABLE IF NOT EXISTS candidates (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    start_sec REAL NOT NULL,
+                    end_sec REAL NOT NULL,
+                    score REAL NOT NULL,
+                    hook TEXT NOT NULL,
+                    rationale TEXT NOT NULL,
+                    rank INTEGER NOT NULL,
+                    selected INTEGER NOT NULL DEFAULT 0,
+                    hook_start_sec REAL,
+                    hook_end_sec REAL,
+                    hook_confidence REAL,
+                    opening_context_score REAL,
+                    payoff_text TEXT,
+                    payoff_start_sec REAL,
+                    payoff_end_sec REAL,
+                    payoff_score REAL,
+                    payoff_completion INTEGER,
+                    metadata_json TEXT
+                );
 
-            CREATE TABLE IF NOT EXISTS clip_copy (
-                id TEXT PRIMARY KEY,
-                clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
-                platform TEXT NOT NULL,
-                hook_text TEXT,
-                caption_text TEXT,
-                hashtags TEXT
-            );
+                CREATE TABLE IF NOT EXISTS clips (
+                    id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    output_path TEXT,
+                    face_track_json TEXT,
+                    caption_ass_path TEXT,
+                    render_log TEXT,
+                    applied_features TEXT
+                );
 
-            ",
-        )?;
-        let _ = conn.execute("ALTER TABLE projects ADD COLUMN name TEXT", []);
-        let _ = conn.execute("ALTER TABLE projects ADD COLUMN caption_style TEXT", []);
-        let _ = conn.execute("ALTER TABLE projects ADD COLUMN framing_mode TEXT", []);
-        let _ = conn.execute("ALTER TABLE candidates ADD COLUMN hook_start_sec REAL", []);
-        let _ = conn.execute("ALTER TABLE candidates ADD COLUMN hook_end_sec REAL", []);
-        let _ = conn.execute("ALTER TABLE candidates ADD COLUMN hook_confidence REAL", []);
-        let _ = conn.execute(
-            "ALTER TABLE candidates ADD COLUMN opening_context_score REAL",
-            [],
-        );
-        let _ = conn.execute("ALTER TABLE candidates ADD COLUMN payoff_text TEXT", []);
-        let _ = conn.execute(
-            "ALTER TABLE candidates ADD COLUMN payoff_start_sec REAL",
-            [],
-        );
-        let _ = conn.execute("ALTER TABLE candidates ADD COLUMN payoff_end_sec REAL", []);
-        let _ = conn.execute("ALTER TABLE candidates ADD COLUMN payoff_score REAL", []);
-        let _ = conn.execute(
-            "ALTER TABLE candidates ADD COLUMN payoff_completion INTEGER",
-            [],
-        );
-        match conn.execute("ALTER TABLE candidates ADD COLUMN metadata_json TEXT", []) {
-            Ok(_) => {}
-            Err(e) => {
-                let msg = e.to_string().to_lowercase();
-                if !msg.contains("duplicate column") {
-                    return Err(e.into());
-                }
-            }
+                CREATE TABLE IF NOT EXISTS clip_copy (
+                    id TEXT PRIMARY KEY,
+                    clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                    platform TEXT NOT NULL,
+                    hook_text TEXT,
+                    caption_text TEXT,
+                    hashtags TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS speaker_diarization (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    source_hash TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    speakers_json TEXT NOT NULL,
+                    segments_json TEXT NOT NULL,
+                    confidence REAL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, source_hash, model, version)
+                );
+
+                CREATE TABLE IF NOT EXISTS speaker_mapping (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    diarization_id TEXT NOT NULL,
+                    application_role TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    evidence_json TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, diarization_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS visual_track_identity (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    source_hash TEXT,
+                    track_id INTEGER NOT NULL,
+                    shot_idx INTEGER DEFAULT 0,
+                    reid_embedding BLOB,
+                    embedding_model TEXT,
+                    first_seen_sec REAL,
+                    last_seen_sec REAL,
+                    total_detections INTEGER,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS active_speaker_fusion (
+                    id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+                    intervals_json TEXT NOT NULL,
+                    model_version TEXT,
+                    created_at TEXT NOT NULL
+                );
+                ",
+            )?;
+
+            // Inspect and ensure columns exist for existing legacy databases
+            ensure_column(&conn, "projects", "name", "TEXT")?;
+            ensure_column(&conn, "projects", "caption_style", "TEXT")?;
+            ensure_column(&conn, "projects", "framing_mode", "TEXT")?;
+
+            ensure_column(&conn, "candidates", "hook_start_sec", "REAL")?;
+            ensure_column(&conn, "candidates", "hook_end_sec", "REAL")?;
+            ensure_column(&conn, "candidates", "hook_confidence", "REAL")?;
+            ensure_column(&conn, "candidates", "opening_context_score", "REAL")?;
+            ensure_column(&conn, "candidates", "payoff_text", "TEXT")?;
+            ensure_column(&conn, "candidates", "payoff_start_sec", "REAL")?;
+            ensure_column(&conn, "candidates", "payoff_end_sec", "REAL")?;
+            ensure_column(&conn, "candidates", "payoff_score", "REAL")?;
+            ensure_column(&conn, "candidates", "payoff_completion", "INTEGER")?;
+            ensure_column(&conn, "candidates", "metadata_json", "TEXT")?;
+
+            ensure_column(&conn, "transcripts", "raw_transcript_json", "TEXT")?;
+            ensure_column(&conn, "clips", "applied_features", "TEXT")?;
+
+            ensure_column(&conn, "visual_track_identity", "source_hash", "TEXT")?;
+            ensure_column(&conn, "visual_track_identity", "shot_idx", "INTEGER DEFAULT 0")?;
+
+            // Post-condition schema verification
+            verify_schema(&conn)?;
+
+            // Advance user_version only after successful verification
+            conn.execute(&format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION), [])?;
+        } else {
+            // Verify schema even when user_version is already current (user refinement 1)
+            verify_schema(&conn)?;
         }
-        let _ = conn.execute(
-            "ALTER TABLE transcripts ADD COLUMN raw_transcript_json TEXT",
-            [],
-        );
-        // AutoShorts 8.0 — structured per-clip feature-application status.
-        // NULL = legacy clip (no feature-status information). Non-NULL = complete
-        // boolean truth table for a clip generated after this migration.
-        let _ = conn.execute("ALTER TABLE clips ADD COLUMN applied_features TEXT", []);
 
-        // Phase 2 migration addenda: visual_track_identity columns added after
-        // the initial Phase 2 migration (existing dev databases). The `let _ =`
-        // pattern ignores "duplicate column" errors, consistent with above.
-        let _ = conn.execute(
-            "ALTER TABLE visual_track_identity ADD COLUMN source_hash TEXT",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE visual_track_identity ADD COLUMN shot_idx INTEGER DEFAULT 0",
-            [],
-        );
-
-        // Phase 2: Speaker Intelligence tables
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS speaker_diarization (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                source_hash TEXT NOT NULL,
-                model TEXT NOT NULL,
-                version TEXT NOT NULL,
-                speakers_json TEXT NOT NULL,
-                segments_json TEXT NOT NULL,
-                confidence REAL,
-                created_at TEXT NOT NULL,
-                UNIQUE(project_id, source_hash, model, version)
-            );
-
-            CREATE TABLE IF NOT EXISTS speaker_mapping (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                diarization_id TEXT NOT NULL,
-                application_role TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                evidence_json TEXT,
-                created_at TEXT NOT NULL,
-                UNIQUE(project_id, diarization_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS visual_track_identity (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                source_hash TEXT,
-                track_id INTEGER NOT NULL,
-                shot_idx INTEGER DEFAULT 0,
-                reid_embedding BLOB,
-                embedding_model TEXT,
-                first_seen_sec REAL,
-                last_seen_sec REAL,
-                total_detections INTEGER,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS active_speaker_fusion (
-                id TEXT PRIMARY KEY,
-                candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
-                intervals_json TEXT NOT NULL,
-                model_version TEXT,
-                created_at TEXT NOT NULL
-            );
-            ",
-        )?;
         Ok(())
     }
 
@@ -383,8 +462,10 @@ impl Database {
         project_id: &str,
         drafts: &[CandidateDraft],
     ) -> Result<Vec<Candidate>> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
-        conn.execute(
+        let mut conn = self.conn.lock().expect("database mutex poisoned");
+        let tx = conn.transaction()?;
+
+        tx.execute(
             "DELETE FROM candidates WHERE project_id = ?1",
             params![project_id],
         )?;
@@ -419,7 +500,7 @@ impl Database {
             let payoff_completion_int: Option<i64> =
                 candidate.payoff_completion.map(|b| if b { 1 } else { 0 });
 
-            conn.execute(
+            tx.execute(
                 "INSERT INTO candidates (
                     id, project_id, start_sec, end_sec, score, hook, rationale, rank, selected,
                     hook_start_sec, hook_end_sec, hook_confidence, opening_context_score,
@@ -450,7 +531,7 @@ impl Database {
                 ],
             )?;
 
-            conn.execute(
+            tx.execute(
                 "INSERT INTO clips (id, candidate_id, status) VALUES (?1, ?2, 'pending')",
                 params![Uuid::new_v4().to_string(), &candidate.id],
             )?;
@@ -458,6 +539,7 @@ impl Database {
             candidates.push(candidate);
         }
 
+        tx.commit()?;
         Ok(candidates)
     }
 
@@ -2100,5 +2182,95 @@ mod tests {
         let err = bad_alter.unwrap_err();
         let msg = err.to_string().to_lowercase();
         assert!(!msg.contains("duplicate column"));
+    }
+
+    #[test]
+    fn test_replace_candidates_atomic_rollback_on_failure() {
+        let db_path = std::env::temp_dir().join(format!("test_rollback_{}.db", Uuid::new_v4()));
+        let db = Database::open(&db_path).unwrap();
+
+        let project = db
+            .create_project(
+                "/tmp/rollback-source.mp4",
+                "local",
+                "preset_viral_bold",
+                "adaptive",
+                Some(60.0),
+            )
+            .expect("create project");
+
+        let init_candidate = CandidateDraft {
+            start: 10.0,
+            end: 20.0,
+            score: 8.5,
+            hook: "Initial Hook".to_string(),
+            rationale: "Initial Rationale".to_string(),
+            hook_start: Some(10.0),
+            hook_end: Some(13.0),
+            hook_confidence: Some(0.9),
+            opening_context_score: Some(8.0),
+            payoff_text: Some("Initial Payoff".to_string()),
+            payoff_start: Some(17.0),
+            payoff_end: Some(20.0),
+            payoff_score: Some(8.0),
+            payoff_completion: Some(true),
+            ..Default::default()
+        };
+        let initial_candidates = db.replace_candidates(&project.id, &[init_candidate.clone()]).unwrap();
+        assert_eq!(initial_candidates.len(), 1);
+
+        // Attach an abort trigger for hook == 'FORCE_ROLLBACK'
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "CREATE TRIGGER test_abort_trigger BEFORE INSERT ON candidates WHEN NEW.hook = 'FORCE_ROLLBACK'
+                 BEGIN SELECT RAISE(ABORT, 'forced rollback test failure'); END;",
+                [],
+            ).unwrap();
+        }
+
+        let draft_good = CandidateDraft {
+            start: 25.0,
+            end: 35.0,
+            score: 9.0,
+            hook: "Good Second Hook".to_string(),
+            rationale: "Good Second Rationale".to_string(),
+            ..Default::default()
+        };
+        let draft_bad = CandidateDraft {
+            start: 40.0,
+            end: 50.0,
+            score: 7.0,
+            hook: "FORCE_ROLLBACK".to_string(),
+            rationale: "Bad Rationale".to_string(),
+            ..Default::default()
+        };
+
+        let result = db.replace_candidates(&project.id, &[draft_good, draft_bad]);
+        assert!(result.is_err(), "Expected replace_candidates to fail due to trigger");
+
+        // D1 Assertion: on failure, the original candidate must STILL exist because the delete was rolled back!
+        let remaining = db.list_candidates(&project.id).unwrap();
+        assert_eq!(remaining.len(), 1, "Rollback must preserve original candidates");
+        assert_eq!(remaining[0].hook, "Initial Hook");
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn test_schema_migration_inspection_backed_and_idempotent() {
+        let db_path = std::env::temp_dir().join(format!("test_migrate_{}.db", Uuid::new_v4()));
+        let db = Database::open(&db_path).unwrap();
+
+        // Verify user_version was advanced to CURRENT_SCHEMA_VERSION
+        let user_ver: i64 = db.conn.lock().unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(user_ver, CURRENT_SCHEMA_VERSION as i64);
+
+        // Opening a second time must verify schema and succeed idempotently
+        let db2 = Database::open(&db_path).unwrap();
+        let user_ver2: i64 = db2.conn.lock().unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(user_ver2, CURRENT_SCHEMA_VERSION as i64);
+        let _ = std::fs::remove_file(db_path);
     }
 }
