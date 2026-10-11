@@ -1,0 +1,89 @@
+   Compiling autoshorts v0.1.3 (D:\College\Autoshorts 11.0\autoshorts\src-tauri)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 00s
+     Running `target\debug\examples\autoclip_live_validation.exe`
+==============================================================
+  AUTOSHORTS 11.0 — LIVE AUTOCLIP SCORING + TOP-N VALIDATION 
+==============================================================
+[Validation] AUTOSHORTS_SCORING_BACKEND=Legacy threshold=0.65 top_n=Some(12)
+[Validation] Working on a DISPOSABLE COPY of the production DB: C:\Users\naksh\AppData\Local\Temp\autoshorts_autoclip_validation_34bcb142-1112-4e8a-8101-76b24b20f15b.sqlite
+[Validation] project=649ca76e-22d7-449e-8dca-825e0af15485 words=25485 pool=34
+[AutoClip Scoring] Backend=autoclip provider=nvidia_nim model=nvidia/nemotron-3-ultra-550b-a55b prompt_version=v2.0 candidates=34 batch_size=6 concurrency=2
+[AutoClip Scoring] Run complete: entered=34 cache_hits=34 live_batches=0 valid=34 unscored=0 invalid=0 failed_batches=0 — final_score is AUTHORITATIVE in autoclip mode
+[Validation] live run #1 finished in 0.1s: entered=34 cache_hits=34 cache_misses=0 valid=34 unscored=0 invalid=0 ambiguous=0 unknown=0 failed_batches=0
+---- scored pool (run #1) ----
+  "cand-0000" [ 5228.0s ->  5332.7s] final_score=0.78 source="llm" reason=Strong self‑responsibility message with Tyson Fury example; clear arc but familiar narrati
+  "cand-0001" [ 1514.2s ->  1544.8s] final_score=0.86 source="llm" reason=Humorous jet ownership reveal and 'time travel' line deliver high surprise and shareable q
+  "cand-0002" [ 4360.2s ->  4443.5s] final_score=0.80 source="llm" reason=Discipline‑over‑motivation rant offers actionable insight; memorable 'motivation is a scam
+  "cand-0003" [  316.4s ->   352.3s] final_score=0.83 source="llm" reason=Concise Matrix definition frames systemic oppression as a game; empowering payoff line mak
+  "cand-0004" [ 3575.5s ->  3619.6s] final_score=0.79 source="llm" reason=Skepticism toward course sellers reframed as laziness excuse; punchy payoff line fuels deb
+  "cand-0005" [ 3905.6s ->  3953.3s] final_score=0.82 source="llm" reason=Work‑smart vs hard‑work breakdown with clear math‑style payoff; strong actionable advice a
+  "cand-0006" [  793.1s ->   851.2s] final_score=0.85 source="llm" reason=High-value insight on wealth perception with humble relatability, strong quotable lines, a
+  "cand-0007" [ 5535.8s ->  5649.9s] final_score=0.82 source="llm" reason=Provocative parenting philosophy sparks debate, clear emotional stance, and full structura
+  "cand-0008" [ 1726.1s ->  1833.2s] final_score=0.80 source="llm" reason=Psychologically rich reflection on limitations vs freedom, resonant nostalgia, and satisfy
+  "cand-0009" [ 2426.5s ->  2452.8s] final_score=0.65 source="llm" reason=Brief but coherent trust lesson; limited depth and emotional punch reduce shareability and
+  "cand-0010" [ 2759.8s ->  2790.9s] final_score=0.75 source="llm" reason=Polarizing gender essentialism drives high shareability and emotional reaction, though inf
+  "cand-0011" [ 4896.6s ->  4932.2s] final_score=0.78 source="llm" reason=Bold stance on rigid principles delivers strong emotional resonance, memorable closing lin
+  "cand-0012" [ 1578.3s ->  1614.2s] final_score=0.35 source="llm" reason=Sexist rant lacks insight; high outrage drives shares but harms brand; structurally comple
+  "cand-0013" [ 3398.7s ->  3442.3s] final_score=0.85 source="llm" reason=Compelling case study of teen monetization; clear story arc, quotable hook, high curiosity
+  "cand-0014" [ 1460.6s ->  1496.8s] final_score=0.78 source="llm" reason=Balanced debate on Dubai lifestyle; strong hook, clear stance, quotable safety argument, c
+  "cand-0015" [ 1146.8s ->  1211.3s] final_score=0.55 source="llm" reason=Conspiracy-driven monologue on COVID; high emotional charge but misinformation reduces cre
+  "cand-0016" [ 5709.7s ->  5839.5s] final_score=0.70 source="llm" reason=Authenticity reveal from public figure; intriguing hook, deep insight, lengthy but resolve
+  "cand-0017" [ 5963.0s ->  5993.3s] final_score=0.82 source="llm" reason=Motivational advice for men; concise claim-development-payoff, strong hook, quotable freed
+  "cand-0018" [ 2199.2s ->  2335.3s] final_score=0.82 source="llm" reason=Compelling personal story of scarcity to abundance with a memorable payoff line, strong em
+  "cand-0019" [ 5401.0s ->  5528.1s] final_score=0.62 source="llm" reason=Logical relationship philosophy lacks emotional payoff; weak closure and limited shareable
+  "cand-0020" [ 3240.2s ->  3291.6s] final_score=0.90 source="llm" reason=High-value insight on attention economy, punchy quotable lines, tight structure makes it h
+  "cand-0021" [ 2082.5s ->  2120.8s] final_score=0.74 source="llm" reason=Reveals harsh reality of kickboxing earnings with a blunt payoff, decent structure but nic
+  "cand-0022" [ 3339.7s ->  3379.5s] final_score=0.81 source="llm" reason=Critiques outdated financial advice with modern wealth perspective, strong quotable takeaw
+  "cand-0023" [ 5761.8s ->  5790.2s] final_score=0.88 source="llm" reason=Matrix metaphor delivers provocative truth-seeking message, memorable lines and concise ar
+  "cand-0024" [ 4131.3s ->  4161.8s] final_score=0.88 source="llm" reason=Strong anti-quitter stance delivers a quotable payoff, high emotional intensity, and a cle
+  "cand-0025" [ 4002.0s ->  4037.6s] final_score=0.84 source="llm" reason=Blunt debunking of the passive-income myth offers an actionable call to work first, with a
+  "cand-0026" [ 5073.6s ->  5091.3s] final_score=0.80 source="llm" reason=Provocative elite hypocrisy claim delivers a sharp payoff in a tight 18-second arc, fuelin
+  "cand-0027" [ 2439.7s ->  2500.4s] final_score=0.62 source="llm" reason=Trust-pooling insight is undermined by a misogynistic payoff; the long clip feels incomple
+  "cand-0028" [  984.9s ->  1004.9s] final_score=0.76 source="llm" reason=Concise passive-income takedown uses a relatable landlord headache line, solid hook-payoff
+  "cand-0029" [  273.9s ->   297.9s] final_score=0.87 source="llm" reason=Actionable wealth-building lesson urges viewers to reverse-engineer success, featuring a c
+  "cand-0030" [ 1015.2s ->  1059.0s] final_score=0.85 source="llm" reason=Compelling anti-materialism narrative with quotable 'rent everything' philosophy; clear ar
+  "cand-0031" [ 2454.2s ->  2485.1s] final_score=0.88 source="llm" reason=Actionable wealth-building via trust-based income pooling; punchy hook, clear payoff, high
+  "cand-0032" [  930.1s ->  1004.9s] final_score=0.72 source="llm" reason=Provocative rant on wealth's emptiness and property traps; emotionally charged but meander
+  "cand-0033" [ 4646.9s ->  4700.1s] final_score=0.82 source="llm" reason=Practical financial awareness exercise with cynical empowerment payoff; strong insight, cl
+[Validation] run #1 attribution: 34 genuine llm scores, 0 fallbacks (never cached)
+[Validation] eligibility gate (>= 0.65): 4 of 34 removed, unscored alternatives retained
+[Validation] ranked pool: 30 (gate removed 4, dedup removed 0), eligible=30, top_n=Some(12) -> selected_count=12
+---- final ranked pool ----
+  "cand-0020" [ 3240.2s ->  3291.6s] final_score=0.90 source="llm" reason=High-value insight on attention economy, punchy quotable lines, tight structure makes it h
+  "cand-0031" [ 2454.2s ->  2485.1s] final_score=0.88 source="llm" reason=Actionable wealth-building via trust-based income pooling; punchy hook, clear payoff, high
+  "cand-0024" [ 4131.3s ->  4161.8s] final_score=0.88 source="llm" reason=Strong anti-quitter stance delivers a quotable payoff, high emotional intensity, and a cle
+  "cand-0023" [ 5761.8s ->  5790.2s] final_score=0.88 source="llm" reason=Matrix metaphor delivers provocative truth-seeking message, memorable lines and concise ar
+  "cand-0029" [  273.9s ->   297.9s] final_score=0.87 source="llm" reason=Actionable wealth-building lesson urges viewers to reverse-engineer success, featuring a c
+  "cand-0001" [ 1514.2s ->  1544.8s] final_score=0.86 source="llm" reason=Humorous jet ownership reveal and 'time travel' line deliver high surprise and shareable q
+  "cand-0006" [  793.1s ->   851.2s] final_score=0.85 source="llm" reason=High-value insight on wealth perception with humble relatability, strong quotable lines, a
+  "cand-0030" [ 1015.2s ->  1059.0s] final_score=0.85 source="llm" reason=Compelling anti-materialism narrative with quotable 'rent everything' philosophy; clear ar
+  "cand-0013" [ 3398.7s ->  3442.3s] final_score=0.85 source="llm" reason=Compelling case study of teen monetization; clear story arc, quotable hook, high curiosity
+  "cand-0025" [ 4002.0s ->  4037.6s] final_score=0.84 source="llm" reason=Blunt debunking of the passive-income myth offers an actionable call to work first, with a
+  "cand-0003" [  316.4s ->   352.3s] final_score=0.83 source="llm" reason=Concise Matrix definition frames systemic oppression as a game; empowering payoff line mak
+  "cand-0018" [ 2199.2s ->  2335.3s] final_score=0.82 source="llm" reason=Compelling personal story of scarcity to abundance with a memorable payoff line, strong em
+  "cand-0005" [ 3905.6s ->  3953.3s] final_score=0.82 source="llm" reason=Work‑smart vs hard‑work breakdown with clear math‑style payoff; strong actionable advice a
+  "cand-0033" [ 4646.9s ->  4700.1s] final_score=0.82 source="llm" reason=Practical financial awareness exercise with cynical empowerment payoff; strong insight, cl
+  "cand-0007" [ 5535.8s ->  5649.9s] final_score=0.82 source="llm" reason=Provocative parenting philosophy sparks debate, clear emotional stance, and full structura
+  "cand-0017" [ 5963.0s ->  5993.3s] final_score=0.82 source="llm" reason=Motivational advice for men; concise claim-development-payoff, strong hook, quotable freed
+  "cand-0022" [ 3339.7s ->  3379.5s] final_score=0.81 source="llm" reason=Critiques outdated financial advice with modern wealth perspective, strong quotable takeaw
+  "cand-0008" [ 1726.1s ->  1833.2s] final_score=0.80 source="llm" reason=Psychologically rich reflection on limitations vs freedom, resonant nostalgia, and satisfy
+  "cand-0002" [ 4360.2s ->  4443.5s] final_score=0.80 source="llm" reason=Discipline‑over‑motivation rant offers actionable insight; memorable 'motivation is a scam
+  "cand-0026" [ 5073.6s ->  5091.3s] final_score=0.80 source="llm" reason=Provocative elite hypocrisy claim delivers a sharp payoff in a tight 18-second arc, fuelin
+  "cand-0004" [ 3575.5s ->  3619.6s] final_score=0.79 source="llm" reason=Skepticism toward course sellers reframed as laziness excuse; punchy payoff line fuels deb
+  "cand-0014" [ 1460.6s ->  1496.8s] final_score=0.78 source="llm" reason=Balanced debate on Dubai lifestyle; strong hook, clear stance, quotable safety argument, c
+  "cand-0011" [ 4896.6s ->  4932.2s] final_score=0.78 source="llm" reason=Bold stance on rigid principles delivers strong emotional resonance, memorable closing lin
+  "cand-0000" [ 5228.0s ->  5332.7s] final_score=0.78 source="llm" reason=Strong self‑responsibility message with Tyson Fury example; clear arc but familiar narrati
+  "cand-0028" [  984.9s ->  1004.9s] final_score=0.76 source="llm" reason=Concise passive-income takedown uses a relatable landlord headache line, solid hook-payoff
+  "cand-0010" [ 2759.8s ->  2790.9s] final_score=0.75 source="llm" reason=Polarizing gender essentialism drives high shareability and emotional reaction, though inf
+  "cand-0021" [ 2082.5s ->  2120.8s] final_score=0.74 source="llm" reason=Reveals harsh reality of kickboxing earnings with a blunt payoff, decent structure but nic
+  "cand-0032" [  930.1s ->  1004.9s] final_score=0.72 source="llm" reason=Provocative rant on wealth's emptiness and property traps; emotionally charged but meander
+  "cand-0016" [ 5709.7s ->  5839.5s] final_score=0.70 source="llm" reason=Authenticity reveal from public figure; intriguing hook, deep insight, lengthy but resolve
+  "cand-0009" [ 2426.5s ->  2452.8s] final_score=0.65 source="llm" reason=Brief but coherent trust lesson; limited depth and emotional punch reduce shareability and
+[Validation] persistence verified: 30 persisted, 12 selected, 18 Not Selected alternatives retained
+[AutoClip Scoring] Backend=autoclip provider=nvidia_nim model=nvidia/nemotron-3-ultra-550b-a55b prompt_version=v2.0 candidates=34 batch_size=6 concurrency=2
+[AutoClip Scoring] Run complete: entered=34 cache_hits=34 live_batches=0 valid=34 unscored=0 invalid=0 failed_batches=0 — final_score is AUTHORITATIVE in autoclip mode
+[Validation] run #2 (cache attribution) in 0.0s: cache_hits=34 cache_misses=0 valid=34
+[Validation] cache replay verified: run-#1 llm scores identical via cache; run #2 now has 34 llm / 0 fallback
+==============================================================
+  LIVE AUTOCLIP SCORING + TOP-N VALIDATION: ALL CHECKS PASSED
+==============================================================

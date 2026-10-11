@@ -75,6 +75,7 @@ type Candidate = {
   rationale: string;
   rank: number;
   selected: boolean;
+  metadataJson?: string | null;
 };
 
 type Clip = {
@@ -87,6 +88,20 @@ type Clip = {
   renderLog: string | null;
   appliedFeatures: string | null;
 };
+
+// Score provenance from the backend's candidate metadata. "llm" = a genuine
+// NVIDIA AutoClip model score; "fallback" = explicitly unscored (score 0.0,
+// never AutoClip-eligible). null = legacy composite scoring. The UI only
+// READS this state — it never recomputes scores, ranks or eligibility.
+function candidateScoreSource(candidate: Candidate): string | null {
+  if (!candidate.metadataJson) return null;
+  try {
+    const meta = JSON.parse(candidate.metadataJson) as { scoreSource?: string | null };
+    return typeof meta.scoreSource === "string" ? meta.scoreSource : null;
+  } catch {
+    return null;
+  }
+}
 
 type ProjectDetail = {
   project: Project;
@@ -203,6 +218,16 @@ function App() {
   // form (to === null means "Last"). Lets the sync effect distinguish our own
   // writes echoing back through detail.candidates from external reloads.
   const lastAppliedRangeRef = useRef<{ from: number; to: number | null } | null>(null);
+
+  // Serialized selection updates: a monotonic token taken per selection
+  // request (rank range or Top-N). A response carrying an older token than
+  // the latest issued request is stale and its result is discarded, so an
+  // out-of-order invoke resolution can never overwrite a newer selection with
+  // older data. The backend remains authoritative for all selection state.
+  const selectionSeqRef = useRef(0);
+
+  // Transient Top-N input state (the backend response is authoritative).
+  const [topNValue, setTopNValue] = useState("");
 
   const transcript = useMemo(() => {
     if (!detail?.transcript) return null;
@@ -772,6 +797,9 @@ function App() {
   // Range-based selection: marks candidates with ranks in the inclusive 1-based
   // range [from, to] as selected; all others become unselected. `to === null`
   // means "Last" (the final candidate). Invalid/empty input never triggers a cut.
+  // Stale asynchronous responses are discarded via the monotonic
+  // `selectionSeqRef` token, so an older invoke can never overwrite a newer
+  // selection change.
   async function updateSelectionRange(from: number, to: number | null) {
     if (!detail) return;
     const total = detail.candidates.length;
@@ -779,13 +807,38 @@ function App() {
     if (!Number.isInteger(from) || !Number.isInteger(endRank)) return;
     if (from < 1 || endRank < from || endRank > total) return;
     lastAppliedRangeRef.current = { from, to };
+    const requestSeq = ++selectionSeqRef.current;
+    const projectId = detail.project.id;
     await run("clipCount", async () => {
       const candidates = await invoke<Candidate[]>("set_selected_rank_range", {
-        projectId: detail.project.id,
+        projectId,
         startRank: from,
-        endRank: endRank,
+        endRank,
       });
-      setDetail({ ...detail, candidates });
+      if (requestSeq !== selectionSeqRef.current) return; // stale response — discard
+      setDetail((prev) =>
+        prev && prev.project.id === projectId ? { ...prev, candidates } : prev
+      );
+    });
+  }
+
+  // Top-N selection: marks ranks 1..N as selected through the backend's
+  // authoritative set_selected_clip_count command (0 = no selection). The UI
+  // never recomputes Top-N itself — it only displays backend state.
+  async function updateTopN(count: number) {
+    if (!detail) return;
+    if (!Number.isInteger(count) || count < 0 || count > detail.candidates.length) return;
+    const requestSeq = ++selectionSeqRef.current;
+    const projectId = detail.project.id;
+    await run("clipCount", async () => {
+      const candidates = await invoke<Candidate[]>("set_selected_clip_count", {
+        projectId,
+        count,
+      });
+      if (requestSeq !== selectionSeqRef.current) return; // stale response — discard
+      setDetail((prev) =>
+        prev && prev.project.id === projectId ? { ...prev, candidates } : prev
+      );
     });
   }
 
@@ -1346,6 +1399,34 @@ function App() {
                         >
                           Last
                         </button>
+                        <label className="range-field">
+                          <span>Top N</span>
+                          <input
+                            type="number"
+                            min="0"
+                            max={totalCandidateCount}
+                            value={topNValue}
+                            placeholder="—"
+                            onChange={(event) => {
+                              const raw = event.target.value;
+                              setTopNValue(raw);
+                              const parsed = Number.parseInt(raw, 10);
+                              if (Number.isInteger(parsed)) {
+                                void updateTopN(parsed);
+                              }
+                            }}
+                            onBlur={(event) => {
+                              const parsed = Number.parseInt(event.target.value, 10);
+                              if (!Number.isInteger(parsed) || parsed < 0) {
+                                setTopNValue("");
+                              } else if (parsed > totalCandidateCount) {
+                                setTopNValue(String(totalCandidateCount));
+                              }
+                            }}
+                            disabled={busy !== "idle" && busy !== "clipCount"}
+                            title="Select the top N candidates by rank (backend-authoritative; 0 clears the selection)"
+                          />
+                        </label>
                         <span
                           className={`range-count ${rangeInputsValid ? "" : "invalid"}`}
                           title="Derived selection count: end - start + 1"
@@ -1403,6 +1484,24 @@ function App() {
                                     ✨ Multimodal
                                   </span>
                                 )}
+                                {(() => {
+                                  const scoreSource = candidateScoreSource(candidate);
+                                  if (scoreSource === "llm") {
+                                    return (
+                                      <span style={{ fontSize: "0.68rem", padding: "1px 6px", borderRadius: "8px", background: "rgba(94, 160, 255, 0.15)", color: "#7fb0ff", border: "1px solid rgba(94, 160, 255, 0.35)" }}>
+                                        AutoClip Score
+                                      </span>
+                                    );
+                                  }
+                                  if (scoreSource === "fallback") {
+                                    return (
+                                      <span style={{ fontSize: "0.68rem", padding: "1px 6px", borderRadius: "8px", background: "rgba(255, 120, 120, 0.12)", color: "#ff8f8f", border: "1px solid rgba(255, 120, 120, 0.3)" }}>
+                                        Unscored (fallback)
+                                      </span>
+                                    );
+                                  }
+                                  return null;
+                                })()}
                                 <span className="candidate-score">{Math.round(candidate.score * 100)}% Match</span>
                               </div>
                             </div>

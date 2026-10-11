@@ -15,6 +15,7 @@ pub mod panns_reactions;
 pub mod proc_guard;
 pub mod render_qa;
 pub mod scene_intelligence;
+pub mod scoring;
 pub mod speaker_intelligence;
 pub mod transcript_normalizer;
 pub mod transcription;
@@ -727,6 +728,41 @@ async fn generate_candidates(
     discovery_mode: Option<String>,
     reze_provider: Option<String>,
 ) -> Result<Vec<Candidate>, String> {
+    // Scoring backend authority. `legacy` (default): composite_score remains
+    // authoritative end-to-end and NO NVIDIA credential is required.
+    // `autoclip`: NVIDIA NIM holistic final_score is authoritative, and the
+    // key must exist BEFORE any discovery work is spent.
+    let scoring_backend = scoring::resolve_scoring_backend().map_err(to_command_error)?;
+    let nvidia_scorer_key: Option<String> = match scoring_backend {
+        scoring::ScoringBackend::AutoClip => {
+            let key = std::env::var("NVIDIA_API_KEY").unwrap_or_default();
+            if key.trim().is_empty() {
+                return Err(
+                    "[AutoClip Scoring] AUTOSHORTS_SCORING_BACKEND=autoclip requires NVIDIA_API_KEY \
+                     to be configured (environment or .env). Fix the key, or unset \
+                     AUTOSHORTS_SCORING_BACKEND to return to the default legacy backend."
+                        .to_string(),
+                );
+            }
+            Some(key)
+        }
+        scoring::ScoringBackend::Legacy => None,
+    };
+    match scoring_backend {
+        scoring::ScoringBackend::Legacy => println!(
+            "[Scoring Backend] legacy — legacy composite_score is AUTHORITATIVE for ranking"
+        ),
+        scoring::ScoringBackend::AutoClip => println!(
+            "[Scoring Backend] autoclip — NVIDIA holistic final_score is AUTHORITATIVE for ranking"
+        ),
+    }
+    let autoclip_threshold: Option<f64> = match scoring_backend {
+        scoring::ScoringBackend::AutoClip => Some(
+            scoring::resolve_recommend_threshold().map_err(to_command_error)?,
+        ),
+        scoring::ScoringBackend::Legacy => None,
+    };
+
     let db = state.db.clone();
     let transcript = db
         .latest_transcript(&project_id)
@@ -1013,33 +1049,102 @@ async fn generate_candidates(
     }
 
     // 1c. Quality Gate: Anti-filler filter (drop candidates below minimum score threshold)
-    let min_score = discovery_config.min_candidate_score;
-    let before_quality = drafts.len();
-    let quality_backup = drafts.clone();
-    drafts.retain(|d| llm::composite_score(d) >= min_score);
-    if drafts.is_empty() {
-        eprintln!("[Quality Gate] Warning: All candidates fell below min score {:.2}, restoring top candidates", min_score);
-        drafts = quality_backup;
-    } else if drafts.len() < before_quality {
-        println!(
-            "[Quality Gate] Filtered {} low-scoring filler candidates (< {:.2}) ({} remaining)",
-            before_quality - drafts.len(),
-            min_score,
-            drafts.len()
-        );
+    //     LEGACY AUTHORITY ONLY. In explicit autoclip mode this composite gate
+    //     is skipped: the AutoClip eligibility gate (final_score >= threshold)
+    //     below is the single authoritative score gate.
+    if autoclip_threshold.is_none() {
+        let min_score = discovery_config.min_candidate_score;
+        let before_quality = drafts.len();
+        let quality_backup = drafts.clone();
+        drafts.retain(|d| llm::composite_score(d) >= min_score);
+        if drafts.is_empty() {
+            eprintln!("[Quality Gate] Warning: All candidates fell below min score {:.2}, restoring top candidates", min_score);
+            drafts = quality_backup;
+        } else if drafts.len() < before_quality {
+            println!(
+                "[Quality Gate] Filtered {} low-scoring filler candidates (< {:.2}) ({} remaining)",
+                before_quality - drafts.len(),
+                min_score,
+                drafts.len()
+            );
+        }
     }
 
     // 2. Multimodal Hook Intelligence Analysis (Visual, Acoustic, Temporal Signals)
-    let (mm_drafts, mm_status) = media::analyze_multimodal_hook_signals(
+    //    Runs BEFORE AutoClip scoring so any naturally available evidence is
+    //    prepared for the holistic scorer (evidence is context only — it is
+    //    never blended into the authoritative final_score).
+    let (mut mm_drafts, mm_status) = media::analyze_multimodal_hook_signals(
         &project.source_path,
         &drafts,
         normalized.duration,
         None,
     );
 
-    // 3. High-Precision Re-Ranking and Temporal Balancing (preserve full pool, top 12 selected)
-    let mut all_drafts =
-        llm::deduplicate_and_rank_all_candidates(mm_drafts, normalized.duration, 12);
+    // 3. Scoring + High-Precision Re-Ranking and Temporal Balancing
+    //    (preserve full pool, top 12 selected)
+    let mut all_drafts = match autoclip_threshold {
+        Some(threshold) => {
+            // ── AutoClip holistic scoring (NVIDIA NIM) ──
+            // The accepted final_score REPLACES the discovery-level score and
+            // is the AUTHORITATIVE ranking score. Unscored/invalid results
+            // become explicit fallbacks (score 0.0, never eligible).
+            let nvidia_key = nvidia_scorer_key.clone().unwrap_or_default();
+            let source_identity = llm::compute_transcript_source_identity(&normalized);
+            let summary = scoring::run_autoclip_scoring(
+                &source_identity,
+                &mut mm_drafts,
+                &normalized.words,
+                &nvidia_key,
+            )
+            .await
+            .map_err(|f| format!("[AutoClip Scoring] run failed: {f}"))?;
+
+            // ── Eligibility gate (>= threshold, inclusive) ──
+            // Scored candidates below the threshold are removed; explicit
+            // unscored/fallback candidates are RETAINED as visible Not
+            // Selected alternatives (a failed scoring operation never
+            // destroys candidate records). Counts are reported separately.
+            let before_gate = mm_drafts.len();
+            let gate_backup = mm_drafts.clone();
+            mm_drafts.retain(|d| {
+                let llm_scored = d.score_source.as_deref() == Some(scoring::SCORE_SOURCE_LLM);
+                !llm_scored || d.score >= threshold
+            });
+            let unscored_retained = mm_drafts
+                .iter()
+                .filter(|d| d.score_source.as_deref() == Some(scoring::SCORE_SOURCE_FALLBACK))
+                .count();
+            if mm_drafts.is_empty() {
+                eprintln!(
+                    "[AutoClip Scoring] Eligibility gate removed every candidate; restoring pool as explicit unscored alternatives"
+                );
+                mm_drafts = gate_backup;
+            } else {
+                println!(
+                    "[AutoClip Scoring] Eligibility gate (>= {:.2}): {} of {} scored candidates removed; {} unscored fallback alternatives retained",
+                    threshold,
+                    before_gate - mm_drafts.len(),
+                    before_gate,
+                    unscored_retained
+                );
+            }
+            println!(
+                "[AutoClip Scoring] valid_scores={} unscored={} cache_hits={} failed_batches={}",
+                summary.valid_scores,
+                summary.unscored + summary.invalid_scores,
+                summary.cache_hits,
+                summary.failed_batches
+            );
+
+            llm::deduplicate_and_rank_all_candidates_autoclip(
+                mm_drafts,
+                normalized.duration,
+                12,
+            )
+        }
+        None => llm::deduplicate_and_rank_all_candidates(mm_drafts, normalized.duration, 12),
+    };
 
     // ── Phase 4: Candidate Redundancy Detection (DETERMINISTIC, signal-only) ──
     // Runs on the ranked pool so obvious near-duplicates never reach the user.
@@ -1306,9 +1411,36 @@ async fn generate_candidates(
         println!();
     }
 
-    let candidates = db
-        .replace_candidates(&project_id, &all_drafts)
-        .map_err(to_command_error)?;
+    // Persistence. Legacy mode: original cutoff semantics (min(12).max(3)).
+    // AutoClip mode: rank = index + 1 in the authoritative ranked pool and
+    // selected = index < min(effective_top_n, eligible_count). Not Selected
+    // alternatives remain persisted with their scores, ranks and provenance.
+    let candidates = match autoclip_threshold {
+        Some(threshold) => {
+            let eligible_count = all_drafts
+                .iter()
+                .filter(|d| scoring::is_autoclip_eligible(d, threshold))
+                .count();
+            let top_n = scoring::resolve_top_n().map_err(to_command_error)?;
+            let selected_count = scoring::effective_selected_count(top_n, eligible_count);
+            println!(
+                "[AutoClip Scoring] Top-N: effective N={} -> selected_count={} (eligible={} of {} ranked, threshold >= {:.2}); {} eligible-but-not-selected alternatives retained",
+                top_n
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "disabled (all eligible)".to_string()),
+                selected_count,
+                eligible_count,
+                all_drafts.len(),
+                threshold,
+                eligible_count.saturating_sub(selected_count)
+            );
+            db.replace_candidates_with_selection(&project_id, &all_drafts, selected_count)
+                .map_err(to_command_error)?
+        }
+        None => db
+            .replace_candidates(&project_id, &all_drafts)
+            .map_err(to_command_error)?,
+    };
     db.update_project_status(&project_id, "ready", None)
         .map_err(to_command_error)?;
     Ok(candidates)

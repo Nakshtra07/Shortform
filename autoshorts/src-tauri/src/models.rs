@@ -501,6 +501,21 @@ pub struct CandidateDraft {
     pub vlm_scored_at: Option<String>,
     #[serde(default)]
     pub vlm_evidence: Option<Vec<String>>,
+
+    // ==========================================
+    // AutoClip holistic scoring provenance (v11.1 reconstruction)
+    // ==========================================
+    /// Scoring provenance: `Some("llm")` = genuine NVIDIA model `final_score`
+    /// (authoritative in explicit autoclip mode); `Some("fallback")` =
+    /// explicit unscored fallback (score 0.0, never AutoClip-eligible);
+    /// `None` = legacy composite scoring authority. Serialized into
+    /// `metadata_json`, so pre-existing rows deserialize as `None`.
+    #[serde(default)]
+    pub score_source: Option<String>,
+    /// Transient scoring identity (`cand-%04d`) from the scoring pool
+    /// position. Persisted for reproducible tie-breaks and diagnostics.
+    #[serde(default)]
+    pub scoring_id: Option<String>,
 }
 
 /// Central configuration for the verified hook pipeline thresholds.
