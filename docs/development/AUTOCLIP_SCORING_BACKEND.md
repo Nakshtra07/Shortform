@@ -81,6 +81,23 @@ Provenance is persisted inside `metadata_json` via two serde-default
 - any other value — hard configuration error. No silent substitution,
   no silent fallback between backends, no cross-backend cache reuse.
 
+**Per-call override (UI scoring-mode selector).** The import/caption-style
+dialog (and the per-project "Scoring: …" select) passes an explicit
+`scoring_mode` argument to `generate_candidates`:
+
+- `legacy` → forces the legacy backend for that call, even when the env
+  default is `autoclip`.
+- `autoclip` → forces the AutoClip backend for that call, even when the env
+  default is `legacy`. The same `NVIDIA_API_KEY` hard-error contract applies
+  (see `scoring::resolve_scoring_authority_for_call`).
+- unset/empty → the `AUTOSHORTS_SCORING_BACKEND` default applies.
+- any other value — hard configuration error (never a silent substitution).
+
+The selection is UI state persisted in `localStorage`
+(`autoshorts_scoring_mode`), independent of caption style and framing mode;
+changing either never resets it. It applies to the current operation only —
+the env default is untouched.
+
 ## 4. NVIDIA NIM configuration
 
 | Setting | Default | Override |

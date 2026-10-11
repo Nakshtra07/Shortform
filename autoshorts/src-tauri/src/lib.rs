@@ -22,7 +22,7 @@ pub mod transcription;
 pub mod vlm_scoring;
 mod pause_intel;
 mod t7_prosody;
-mod youtube;
+pub mod youtube;
 
 pub use pause_intel::{score_gaps, PauseIntelGap};
 pub use t7_prosody::{predict_t7_boundaries, T7Boundary};
@@ -214,6 +214,11 @@ async fn environment_status(
         has_openai_key: std::env::var("OPENAI_API_KEY").is_ok(),
         has_openrouter_key: std::env::var("OPENROUTER_API_KEY").is_ok(),
         has_groq_key: std::env::var("GROQ_API_KEY").is_ok(),
+        // Mirrors the AutoClip scorer's own gate (empty/whitespace keys do not
+        // count as configured) so the UI warning matches backend behavior.
+        has_nvidia_key: std::env::var("NVIDIA_API_KEY")
+            .map(|k| !k.trim().is_empty())
+            .unwrap_or(false),
         llm_provider,
         has_local_whisper_model,
         has_ollama,
@@ -489,19 +494,35 @@ fn create_project_from_path(
     caption_style: String,
     framing_mode: String,
 ) -> Result<Project, String> {
-    validate_media_extension(&path).map_err(to_command_error)?;
-    let probe = media::probe_media(&path).ok();
+    create_project_from_path_impl(
+        &state.db,
+        &path,
+        &transcription_mode,
+        &caption_style,
+        &framing_mode,
+    )
+}
 
-    state
-        .db
-        .create_project(
-            &path,
-            &transcription_mode,
-            &caption_style,
-            &framing_mode,
-            probe.and_then(|probe| probe.duration_sec),
-        )
-        .map_err(to_command_error)
+/// Production project-creation path (extension validation + ffprobe + DB row),
+/// callable outside the Tauri shell.
+pub fn create_project_from_path_impl(
+    db: &Database,
+    path: &str,
+    transcription_mode: &str,
+    caption_style: &str,
+    framing_mode: &str,
+) -> Result<Project, String> {
+    validate_media_extension(path).map_err(to_command_error)?;
+    let probe = media::probe_media(path).ok();
+
+    db.create_project(
+        path,
+        transcription_mode,
+        caption_style,
+        framing_mode,
+        probe.and_then(|probe| probe.duration_sec),
+    )
+    .map_err(to_command_error)
 }
 
 #[tauri::command]
@@ -558,8 +579,26 @@ async fn transcribe_project(
     provider: String,
     api_key: Option<String>,
 ) -> Result<Transcript, String> {
-    let db = state.db.clone();
-    let data_dir = state.data_dir.clone();
+    transcribe_project_impl(
+        state.db.clone(),
+        state.data_dir.clone(),
+        project_id,
+        provider,
+        api_key,
+    )
+    .await
+}
+
+/// Production transcription path, callable outside the Tauri shell (the
+/// command above is a thin State-unwrapping wrapper). Used by the acceptance
+/// harness to exercise the REAL pipeline end to end.
+pub async fn transcribe_project_impl(
+    db: Database,
+    data_dir: PathBuf,
+    project_id: String,
+    provider: String,
+    api_key: Option<String>,
+) -> Result<Transcript, String> {
     let project = db.get_project(&project_id).map_err(to_command_error)?;
     db.update_project_status(&project_id, "transcribing", None)
         .map_err(to_command_error)?;
@@ -727,27 +766,50 @@ async fn generate_candidates(
     _allow_demo: Option<bool>,
     discovery_mode: Option<String>,
     reze_provider: Option<String>,
+    scoring_mode: Option<String>,
 ) -> Result<Vec<Candidate>, String> {
-    // Scoring backend authority. `legacy` (default): composite_score remains
-    // authoritative end-to-end and NO NVIDIA credential is required.
+    generate_candidates_impl(
+        state.db.clone(),
+        project_id,
+        api_key,
+        provider,
+        model_name,
+        _allow_demo,
+        discovery_mode,
+        reze_provider,
+        scoring_mode,
+    )
+    .await
+}
+
+/// Production candidate pipeline (discovery -> AutoClip scoring -> eligibility
+/// gate -> deterministic ranking -> Top-N -> persistence), callable outside the
+/// Tauri shell. The command above is a thin State-unwrapping wrapper.
+///
+/// `scoring_mode` is the explicit UI scoring-mode selection ("legacy" or
+/// "autoclip"); it overrides the `AUTOSHORTS_SCORING_BACKEND` default for
+/// THIS call only.
+pub async fn generate_candidates_impl(
+    db: Database,
+    project_id: String,
+    api_key: Option<String>,
+    provider: Option<String>,
+    model_name: Option<String>,
+    _allow_demo: Option<bool>,
+    discovery_mode: Option<String>,
+    reze_provider: Option<String>,
+    scoring_mode: Option<String>,
+) -> Result<Vec<Candidate>, String> {
+    // Scoring backend authority. The explicit UI selection (`scoring_mode`)
+    // overrides the env default for this call. `legacy`: composite_score
+    // remains authoritative end-to-end and NO NVIDIA credential is required.
     // `autoclip`: NVIDIA NIM holistic final_score is authoritative, and the
-    // key must exist BEFORE any discovery work is spent.
-    let scoring_backend = scoring::resolve_scoring_backend().map_err(to_command_error)?;
-    let nvidia_scorer_key: Option<String> = match scoring_backend {
-        scoring::ScoringBackend::AutoClip => {
-            let key = std::env::var("NVIDIA_API_KEY").unwrap_or_default();
-            if key.trim().is_empty() {
-                return Err(
-                    "[AutoClip Scoring] AUTOSHORTS_SCORING_BACKEND=autoclip requires NVIDIA_API_KEY \
-                     to be configured (environment or .env). Fix the key, or unset \
-                     AUTOSHORTS_SCORING_BACKEND to return to the default legacy backend."
-                        .to_string(),
-                );
-            }
-            Some(key)
-        }
-        scoring::ScoringBackend::Legacy => None,
-    };
+    // key must exist BEFORE any discovery work is spent — a missing key is a
+    // hard error, never a silent fallback to legacy.
+    let (scoring_backend, nvidia_scorer_key) = scoring::resolve_scoring_authority_for_call(
+        scoring_mode.as_deref(),
+    )
+    .map_err(to_command_error)?;
     match scoring_backend {
         scoring::ScoringBackend::Legacy => println!(
             "[Scoring Backend] legacy — legacy composite_score is AUTHORITATIVE for ranking"
@@ -763,7 +825,6 @@ async fn generate_candidates(
         scoring::ScoringBackend::Legacy => None,
     };
 
-    let db = state.db.clone();
     let transcript = db
         .latest_transcript(&project_id)
         .map_err(to_command_error)?
@@ -2213,22 +2274,35 @@ async fn render_flat_clip_for_candidate(
     state: tauri::State<'_, AppState>,
     candidate_id: String,
 ) -> Result<String, String> {
-    let (candidate, project) = state
-        .db
+    render_flat_clip_for_candidate_impl(
+        state.db.clone(),
+        state.data_dir.clone(),
+        state.render_tracker.clone(),
+        candidate_id,
+    )
+    .await
+}
+
+/// Production render path (boundary pass -> smart pacing -> framing -> ASS
+/// captions -> ffmpeg -> Render QA -> persistence), callable outside the Tauri
+/// shell. The command above is a thin State-unwrapping wrapper.
+pub async fn render_flat_clip_for_candidate_impl(
+    db: Database,
+    data_dir: PathBuf,
+    render_tracker: InFlightRenderTracker,
+    candidate_id: String,
+) -> Result<String, String> {
+    let (candidate, project) = db
         .get_candidate_with_project(&candidate_id)
         .map_err(to_command_error)?;
 
     // 1. In-flight check keyed to candidate_id AND output identity (project_id, rank)
-    let render_guard = state
-        .render_tracker
+    let render_guard = render_tracker
         .try_acquire_output(&candidate_id, &project.id, candidate.rank)
         .map_err(|err| {
             println!("[Render Lock Rejected] {}", err);
             err
         })?;
-
-    let db = state.db.clone();
-    let data_dir = state.data_dir.clone();
 
     tokio::task::spawn_blocking(move || {
         let _guard = render_guard;

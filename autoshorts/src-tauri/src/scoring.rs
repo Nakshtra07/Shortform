@@ -96,6 +96,70 @@ pub fn resolve_scoring_backend() -> Result<ScoringBackend, String> {
     }
 }
 
+/// Resolve the scoring backend for ONE generate-candidates call.
+///
+/// `scoring_mode` is the explicit per-call UI selection (the scoring-mode
+/// selector in the import/caption-style dialog):
+/// - `None` or empty → the env default (`resolve_scoring_backend`) applies.
+/// - `"legacy"` → force the legacy backend for this call, even when the env
+///   default is `autoclip`.
+/// - `"autoclip"` → force the AutoClip backend for this call, even when the
+///   env default is `legacy` (the production default).
+/// - any other value is a hard configuration error — never a silent
+///   substitution.
+pub fn resolve_scoring_backend_with_override(
+    scoring_mode: Option<&str>,
+) -> Result<ScoringBackend, String> {
+    match scoring_mode {
+        None => resolve_scoring_backend(),
+        Some(raw) => {
+            let trimmed = raw.trim().to_ascii_lowercase();
+            match trimmed.as_str() {
+                "" => resolve_scoring_backend(),
+                "legacy" => Ok(ScoringBackend::Legacy),
+                "autoclip" => Ok(ScoringBackend::AutoClip),
+                other => Err(format!(
+                    "[AutoClip Scoring] Invalid scoring-mode selection '{other}'. \
+                     Supported values: 'legacy' or 'autoclip'."
+                )),
+            }
+        }
+    }
+}
+
+/// Verified NVIDIA scorer credential for a call resolved to the AutoClip
+/// backend. A missing credential is a HARD error before any discovery work —
+/// AutoClip mode never silently falls back to the legacy backend.
+pub fn resolve_scorer_credential(backend: ScoringBackend) -> Result<Option<String>, String> {
+    match backend {
+        ScoringBackend::Legacy => Ok(None),
+        ScoringBackend::AutoClip => {
+            let key = std::env::var("NVIDIA_API_KEY").unwrap_or_default();
+            if key.trim().is_empty() {
+                return Err(
+                    "[AutoClip Scoring] AutoClip Scoring (NVIDIA) requires NVIDIA_API_KEY \
+                     to be configured (environment or .env). Fix the key, or select \
+                     Legacy Scoring instead."
+                        .to_string(),
+                );
+            }
+            Ok(Some(key))
+        }
+    }
+}
+
+/// One-call scoring authority used by `generate_candidates`: the explicit UI
+/// selection (`scoring_mode`) overrides the env default for this call only,
+/// and an AutoClip call must carry a verified NVIDIA credential before any
+/// discovery work is spent.
+pub fn resolve_scoring_authority_for_call(
+    scoring_mode: Option<&str>,
+) -> Result<(ScoringBackend, Option<String>), String> {
+    let backend = resolve_scoring_backend_with_override(scoring_mode)?;
+    let credential = resolve_scorer_credential(backend)?;
+    Ok((backend, credential))
+}
+
 /// Resolve the AutoClip eligibility threshold.
 /// `AUTOCLIP_RECOMMEND_THRESHOLD` overrides the documented default of 0.65.
 pub fn resolve_recommend_threshold() -> Result<f64, String> {
@@ -1146,14 +1210,31 @@ mod tests {
 
     // ---------------- Scoring configuration ----------------
 
+    /// Scorer configuration is resolved from process-env variables, which are
+    /// global state shared by every test in this binary (tests run in
+    /// parallel threads). Verified defect: in a full-suite run,
+    /// `scorer_config_defaults_match_documented_contract` raced with
+    /// `scorer_config_endpoint_and_model_overrides` and failed despite passing
+    /// in isolation. Every test that reads or writes a scorer env var must
+    /// hold this lock for its whole body.
+    static SCORER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_scorer_env() -> std::sync::MutexGuard<'static, ()> {
+        SCORER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn scoring_backend_defaults_to_legacy() {
+        let _env = lock_scorer_env();
         std::env::remove_var("AUTOSHORTS_SCORING_BACKEND");
         assert_eq!(resolve_scoring_backend().unwrap(), ScoringBackend::Legacy);
     }
 
     #[test]
     fn scoring_backend_explicit_autoclip() {
+        let _env = lock_scorer_env();
         std::env::set_var("AUTOSHORTS_SCORING_BACKEND", "autoclip");
         assert_eq!(resolve_scoring_backend().unwrap(), ScoringBackend::AutoClip);
         std::env::set_var("AUTOSHORTS_SCORING_BACKEND", "AUTOCLIP");
@@ -1163,13 +1244,119 @@ mod tests {
 
     #[test]
     fn scoring_backend_invalid_is_hard_error_not_silent_substitution() {
+        let _env = lock_scorer_env();
         std::env::set_var("AUTOSHORTS_SCORING_BACKEND", "openai");
         assert!(resolve_scoring_backend().is_err());
         std::env::remove_var("AUTOSHORTS_SCORING_BACKEND");
     }
 
+    // ---------------- UI scoring-mode selector (per-call override) ----------------
+
+    #[test]
+    fn scoring_mode_override_none_and_empty_fall_back_to_env_default() {
+        let _env = lock_scorer_env();
+        std::env::remove_var("AUTOSHORTS_SCORING_BACKEND");
+        assert_eq!(
+            resolve_scoring_backend_with_override(None).unwrap(),
+            ScoringBackend::Legacy
+        );
+        assert_eq!(
+            resolve_scoring_backend_with_override(Some("")).unwrap(),
+            ScoringBackend::Legacy
+        );
+        std::env::set_var("AUTOSHORTS_SCORING_BACKEND", "autoclip");
+        assert_eq!(
+            resolve_scoring_backend_with_override(None).unwrap(),
+            ScoringBackend::AutoClip
+        );
+        assert_eq!(
+            resolve_scoring_backend_with_override(Some("   ")).unwrap(),
+            ScoringBackend::AutoClip
+        );
+        std::env::remove_var("AUTOSHORTS_SCORING_BACKEND");
+    }
+
+    #[test]
+    fn scoring_mode_override_legacy_forces_legacy_even_when_env_is_autoclip() {
+        let _env = lock_scorer_env();
+        std::env::set_var("AUTOSHORTS_SCORING_BACKEND", "autoclip");
+        // The explicit Legacy selection reaches the backend and overrides the
+        // configured default for this call.
+        assert_eq!(
+            resolve_scoring_backend_with_override(Some("legacy")).unwrap(),
+            ScoringBackend::Legacy
+        );
+        // Case-insensitive + whitespace-tolerant, mirroring the env resolver.
+        assert_eq!(
+            resolve_scoring_backend_with_override(Some(" Legacy ")).unwrap(),
+            ScoringBackend::Legacy
+        );
+        std::env::remove_var("AUTOSHORTS_SCORING_BACKEND");
+    }
+
+    #[test]
+    fn scoring_mode_override_autoclip_forces_autoclip_even_when_env_default_is_legacy() {
+        let _env = lock_scorer_env();
+        std::env::remove_var("AUTOSHORTS_SCORING_BACKEND");
+        // Production default is legacy; the user's AutoClip selection must be
+        // authoritative for this call.
+        assert_eq!(
+            resolve_scoring_backend_with_override(Some("autoclip")).unwrap(),
+            ScoringBackend::AutoClip
+        );
+        assert_eq!(
+            resolve_scoring_backend_with_override(Some("AutoClip")).unwrap(),
+            ScoringBackend::AutoClip
+        );
+    }
+
+    #[test]
+    fn scoring_mode_override_unknown_selection_is_a_hard_error() {
+        let _env = lock_scorer_env();
+        std::env::remove_var("AUTOSHORTS_SCORING_BACKEND");
+        let err = resolve_scoring_backend_with_override(Some("nvidia")).unwrap_err();
+        assert!(err.contains("Invalid scoring-mode selection"), "{err}");
+        assert!(err.contains("'nvidia'"), "{err}");
+    }
+
+    #[test]
+    fn scorer_credential_gate_missing_key_is_hard_error_not_silent_legacy_fallback() {
+        let _env = lock_scorer_env();
+        std::env::remove_var("NVIDIA_API_KEY");
+        // Selecting AutoClip without a credential must produce a clear error,
+        // never a silent switch to the legacy backend.
+        let err = resolve_scorer_credential(ScoringBackend::AutoClip).unwrap_err();
+        assert!(err.contains("NVIDIA_API_KEY"), "{err}");
+        let err = resolve_scoring_authority_for_call(Some("autoclip")).unwrap_err();
+        assert!(err.contains("NVIDIA_API_KEY"), "{err}");
+        assert!(err.contains("Legacy Scoring"), "{err}");
+    }
+
+    #[test]
+    fn scorer_credential_gate_legacy_needs_no_credential() {
+        let _env = lock_scorer_env();
+        std::env::remove_var("NVIDIA_API_KEY");
+        assert_eq!(resolve_scorer_credential(ScoringBackend::Legacy).unwrap(), None);
+        let (backend, credential) =
+            resolve_scoring_authority_for_call(Some("legacy")).unwrap();
+        assert_eq!(backend, ScoringBackend::Legacy);
+        assert_eq!(credential, None);
+    }
+
+    #[test]
+    fn scorer_credential_gate_autoclip_with_key_returns_verified_credential() {
+        let _env = lock_scorer_env();
+        std::env::set_var("NVIDIA_API_KEY", "nvapi-test-selector-key");
+        let (backend, credential) =
+            resolve_scoring_authority_for_call(Some("autoclip")).unwrap();
+        assert_eq!(backend, ScoringBackend::AutoClip);
+        assert_eq!(credential.as_deref(), Some("nvapi-test-selector-key"));
+        std::env::remove_var("NVIDIA_API_KEY");
+    }
+
     #[test]
     fn scorer_config_defaults_match_documented_contract() {
+        let _env = lock_scorer_env();
         std::env::remove_var("NVIDIA_SCORER_BASE_URL");
         std::env::remove_var("AUTOSHORTS_SCORER_MODEL");
         std::env::remove_var("AUTOSHORTS_SCORER_THINKING");
@@ -1191,6 +1378,7 @@ mod tests {
 
     #[test]
     fn scorer_config_endpoint_and_model_overrides() {
+        let _env = lock_scorer_env();
         std::env::set_var("NVIDIA_SCORER_BASE_URL", "https://example.test/v1/");
         std::env::set_var("AUTOSHORTS_SCORER_MODEL", "custom/model-x");
         let config = AutoClipScorerConfig::from_env();
@@ -1214,6 +1402,7 @@ mod tests {
 
     #[test]
     fn thinking_flag_and_max_tokens_overrides() {
+        let _env = lock_scorer_env();
         std::env::set_var("AUTOSHORTS_SCORER_THINKING", "1");
         std::env::set_var("AUTOSHORTS_SCORER_MAX_TOKENS", "2048");
         let config = AutoClipScorerConfig::from_env();
@@ -1227,6 +1416,7 @@ mod tests {
     fn legacy_mode_never_requires_nvidia_credential() {
         // The backend switch itself is independent of credentials; the
         // credential requirement applies only to the explicit autoclip path.
+        let _env = lock_scorer_env();
         std::env::remove_var("AUTOSHORTS_SCORING_BACKEND");
         assert_eq!(resolve_scoring_backend().unwrap(), ScoringBackend::Legacy);
     }
@@ -1235,6 +1425,7 @@ mod tests {
 
     #[test]
     fn threshold_defaults_to_documented_0_65_and_supports_override() {
+        let _env = lock_scorer_env();
         std::env::remove_var("AUTOCLIP_RECOMMEND_THRESHOLD");
         assert!((resolve_recommend_threshold().unwrap() - 0.65).abs() < 1e-9);
         std::env::set_var("AUTOCLIP_RECOMMEND_THRESHOLD", "0.5");
@@ -1246,6 +1437,7 @@ mod tests {
 
     #[test]
     fn top_n_defaults_to_12_and_non_positive_disables() {
+        let _env = lock_scorer_env();
         std::env::remove_var("AUTOSHORTS_TOP_N");
         assert_eq!(resolve_top_n().unwrap(), Some(12));
         std::env::set_var("AUTOSHORTS_TOP_N", "3");
@@ -1796,6 +1988,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_credential_is_a_hard_error_before_any_scoring() {
+        let _env = lock_scorer_env();
         let mut drafts = vec![draft(0.0, 1.0, 0.5)];
         let err = run_autoclip_scoring("src", &mut drafts, &[], "  ").await;
         assert_eq!(err.unwrap_err(), ScoringFailure::MissingCredential);
@@ -1803,6 +1996,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_pool_is_a_clean_noop() {
+        let _env = lock_scorer_env();
         let summary = run_autoclip_scoring("src", &mut [], &[], "key").await.unwrap();
         assert_eq!(summary.candidates_entering, 0);
     }

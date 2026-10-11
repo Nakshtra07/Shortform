@@ -38,6 +38,7 @@ type EnvironmentStatus = {
   hasOpenaiKey: boolean;
   hasOpenrouterKey: boolean;
   hasGroqKey: boolean;
+  hasNvidiaKey: boolean;
   llmProvider: string;
   hasLocalWhisperModel: boolean;
   hasOllama: boolean;
@@ -147,6 +148,15 @@ function App() {
   // opt-in. Per generation call — flip and re-run to compare on the same project.
   const [discoveryMode, setDiscoveryMode] = useState<string>("timestamp_generation");
   const [rezeProvider, setRezeProvider] = useState<string>("");
+  // Scoring-mode selector (import/caption-style dialog + Find Viral Moments):
+  // "legacy" (default) keeps the composite-score pipeline; "autoclip" makes the
+  // NVIDIA holistic final_score authoritative (eligibility gate + deterministic
+  // Top-N). Persisted like the other engine settings; changing captions or
+  // framing never resets it. Passed explicitly to generate_candidates so the
+  // selection overrides the backend's env default for the current operation.
+  const [scoringMode, setScoringMode] = useState<"legacy" | "autoclip">(() => {
+    return (localStorage.getItem("autoshorts_scoring_mode") as "legacy" | "autoclip") || "legacy";
+  });
   const [mediaPathToImport, setMediaPathToImport] = useState<string | null>(null);
 
   const [youtubeModalOpen, setYoutubeModalOpen] = useState(false);
@@ -344,6 +354,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem("autoshorts_transcription_engine", transcriptionEngine);
   }, [transcriptionEngine]);
+
+  useEffect(() => {
+    localStorage.setItem("autoshorts_scoring_mode", scoringMode);
+  }, [scoringMode]);
 
   useEffect(() => {
     localStorage.setItem("autoshorts_llm_engine", llmEngine);
@@ -570,6 +584,15 @@ function App() {
     setError(null);
     const env = await invoke<EnvironmentStatus>("environment_status");
 
+    // AutoClip Scoring requires the NVIDIA key BEFORE any billable work
+    // (transcription included). The backend would hard-error at the start of
+    // generate_candidates anyway; failing fast here avoids spending the
+    // transcription call. Never silently falls back to Legacy Scoring.
+    if (scoringMode === "autoclip" && !env.hasNvidiaKey) {
+      setError("Import successful. AutoClip Scoring (NVIDIA) is selected but NVIDIA_API_KEY is missing. Configure the key in your .env or environment, or switch the scoring mode to Legacy Scoring.");
+      return;
+    }
+
     if (transcriptionEngine === "local") {
       if (!env.hasLocalWhisperModel) {
         setError("Import successful. Local Whisper GGML model (ggml-base.bin) is missing in your models directory. Please add it to start transcription.");
@@ -660,6 +683,8 @@ function App() {
         discovery_mode: discoveryMode,
         rezeProvider: isReze ? (rezeProvider || "nvidia_diffusiongemma") : undefined,
         reze_provider: isReze ? (rezeProvider || "nvidia_diffusiongemma") : undefined,
+        scoringMode,
+        scoring_mode: scoringMode,
       });
       await refresh(projectId);
     } catch (err) {
@@ -774,6 +799,8 @@ function App() {
           discovery_mode: discoveryMode,
           rezeProvider: isReze ? (rezeProvider || "nvidia_diffusiongemma") : undefined,
           reze_provider: isReze ? (rezeProvider || "nvidia_diffusiongemma") : undefined,
+          scoringMode,
+          scoring_mode: scoringMode,
         });
         await refresh(currentProjectId);
       } catch (err) {
@@ -1286,6 +1313,23 @@ function App() {
                         <option value="timestamp_generation">Discovery: Timestamp Generation</option>
                         <option value="window_scoring">Discovery: REZE Window Scoring</option>
                       </select>
+                      <select
+                        value={scoringMode}
+                        onChange={(e) => setScoringMode(e.target.value as "legacy" | "autoclip")}
+                        disabled={busy !== "idle"}
+                        title="Scoring mode for candidate ranking & Top-N: Legacy keeps the multimodal composite score authoritative; AutoClip (NVIDIA) makes the holistic final_score authoritative (requires NVIDIA_API_KEY). Re-run Find Viral Moments to apply."
+                        style={{
+                          fontSize: "0.8rem",
+                          padding: "6px 8px",
+                          borderRadius: "8px",
+                          border: scoringMode === "autoclip" ? "1px solid rgba(94, 160, 255, 0.5)" : "1px solid var(--border-color, #333)",
+                          background: "var(--bg-secondary, #1a1a1a)",
+                          color: "inherit",
+                        }}
+                      >
+                        <option value="legacy">Scoring: Legacy</option>
+                        <option value="autoclip">Scoring: AutoClip (NVIDIA)</option>
+                      </select>
                       <button onClick={cutSelected} disabled={busy !== "idle" || selectedCount === 0 || !environment?.hasFfmpeg}>
                         {busy === "cut" ? <Loader2 className="spin" size={16} /> : <Scissors size={16} />}
                         Cut Selected ({selectedCount})
@@ -1296,6 +1340,12 @@ function App() {
                       </button>
                     </div>
                   </div>
+
+                  {scoringMode === "autoclip" && environment !== null && !environment.hasNvidiaKey && (
+                    <div className="api-warning">
+                      ⚠️ AutoClip Scoring (NVIDIA) is the active scoring mode but NVIDIA_API_KEY is missing. Find Viral Moments will report a configuration error — it will not silently fall back to Legacy Scoring. Configure the key or switch the scoring mode back to Legacy.
+                    </div>
+                  )}
 
                   {!canUseDiscoveryLlm && (
                     <div className="api-warning">
@@ -1693,6 +1743,31 @@ function App() {
                   <div className="framing-card-desc">Composition derived from the real footage — never split-screen. Two people who fit comfortably stay in one natural shot; subjects far apart get an active-speaker focus. Final canvas stays 9:16.</div>
                 </div>
               </div>
+            </div>
+
+            <div className="framing-section">
+              <div className="framing-section-title">Scoring Mode</div>
+              <div className="framing-grid">
+                <div
+                  className={`framing-card ${scoringMode === "legacy" ? "selected" : ""}`}
+                  onClick={() => setScoringMode("legacy")}
+                >
+                  <div className="framing-card-title">Legacy Scoring</div>
+                  <div className="framing-card-desc">The original multimodal composite score stays authoritative for ranking and Top-N selection. No NVIDIA key required.</div>
+                </div>
+                <div
+                  className={`framing-card ${scoringMode === "autoclip" ? "selected" : ""}`}
+                  onClick={() => setScoringMode("autoclip")}
+                >
+                  <div className="framing-card-title">AutoClip Scoring (NVIDIA)</div>
+                  <div className="framing-card-desc">NVIDIA holistic final_score is authoritative: eligibility gate (≥ 0.65 by default), deterministic ranking and Top-N selection. Requires NVIDIA_API_KEY; failures show a clear error and never silently fall back to legacy.</div>
+                </div>
+              </div>
+              {scoringMode === "autoclip" && environment !== null && !environment.hasNvidiaKey && (
+                <div className="api-warning">
+                  ⚠️ AutoClip Scoring (NVIDIA) is selected but NVIDIA_API_KEY is missing. Configure it in your .env or environment, or switch back to Legacy Scoring — moment finding will report this error instead of falling back.
+                </div>
+              )}
             </div>
 
             <div className="style-grid">
