@@ -1384,6 +1384,10 @@ pub async fn discover_candidates_reze_scoring(
             format_transcript_window(&transcript.segments, &transcript.words, w_start, w_end);
         let cache_clone = active_cache.clone();
         let source_identity = source_identity.clone();
+        // Cache identity must track the configured scoring prompt version —
+        // never a hardcoded constant — so a version bump invalidates the
+        // window-score cache coherently (historical 11.1 defect, fixed here).
+        let prompt_version = config.scoring_prompt_version.clone();
 
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore acquired");
@@ -1396,7 +1400,7 @@ pub async fn discover_candidates_reze_scoring(
                 &transcript_text,
                 &provider,
                 &effective_model,
-                "v1.0",
+                &prompt_version,
             );
 
             if let Some(ref c) = cache_clone {
@@ -4715,17 +4719,30 @@ pub async fn spans_to_candidate_drafts(
 ///   1. Top `target_count` temporally balanced selections across the entire duration (ranks 1..target_count)
 ///   2. All remaining valid, distinct discovered candidates sorted by composite quality score (ranks target_count+1..N)
 /// - Preserves the entire discovered candidate pool without silently dropping candidates.
-pub fn deduplicate_and_rank_all_candidates(
+/// Legacy comparator: composite quality score descending.
+/// (Bit-identical to the original hardcoded sort.)
+fn legacy_rank_cmp(a: &CandidateDraft, b: &CandidateDraft) -> std::cmp::Ordering {
+    composite_score(b).total_cmp(&composite_score(a))
+}
+
+/// Comparator-parameterized dedup + adaptive temporal-balancing engine.
+/// The comparator replaces the original hardcoded composite-score ordering;
+/// dedup rules, temporal-bin logic and full-pool preservation are unchanged.
+/// Separate public wrappers bind legacy vs AutoClip score semantics:
+/// - legacy wrapper → `composite_score` (original behavior, unchanged)
+/// - AutoClip wrapper → authoritative `final_score` (see `scoring.rs`)
+fn deduplicate_and_rank_all_candidates_with(
     mut raw_candidates: Vec<CandidateDraft>,
     podcast_duration: f64,
     target_count: usize,
+    rank_cmp: fn(&CandidateDraft, &CandidateDraft) -> std::cmp::Ordering,
 ) -> Vec<CandidateDraft> {
     if raw_candidates.is_empty() {
         return Vec::new();
     }
 
-    // 1. Sort by composite quality score descending
-    raw_candidates.sort_by(|a, b| composite_score(b).total_cmp(&composite_score(a)));
+    // 1. Sort by the authoritative ranking comparator
+    raw_candidates.sort_by(|a, b| rank_cmp(a, b));
 
     // 2. Deduplicate overlapping candidates
     let mut deduplicated: Vec<CandidateDraft> = Vec::new();
@@ -4774,7 +4791,7 @@ pub fn deduplicate_and_rank_all_candidates(
 
         // Collect all remaining unchosen candidates from all bins
         let mut remaining: Vec<CandidateDraft> = by_bin.into_iter().flatten().collect();
-        remaining.sort_by(|a, b| composite_score(b).total_cmp(&composite_score(a)));
+        remaining.sort_by(|a, b| rank_cmp(a, b));
 
         // Fill up to target_count slots for the balanced selection
         if balanced.len() < target_count {
@@ -4783,15 +4800,50 @@ pub fn deduplicate_and_rank_all_candidates(
             balanced.extend(fill);
         }
 
-        // Sort the primary balanced selection by composite score descending
-        balanced.sort_by(|a, b| composite_score(b).total_cmp(&composite_score(a)));
+        // Sort the primary balanced selection by the ranking comparator
+        balanced.sort_by(|a, b| rank_cmp(a, b));
 
-        // Append the remaining discovered pool (sorted descending by composite score)
+        // Append the remaining discovered pool (sorted by the ranking comparator)
         balanced.extend(remaining);
         return balanced;
     }
 
     deduplicated
+}
+
+/// Legacy ranking wrapper: composite-score authority, original behavior
+/// preserved exactly.
+pub fn deduplicate_and_rank_all_candidates(
+    raw_candidates: Vec<CandidateDraft>,
+    podcast_duration: f64,
+    target_count: usize,
+) -> Vec<CandidateDraft> {
+    deduplicate_and_rank_all_candidates_with(
+        raw_candidates,
+        podcast_duration,
+        target_count,
+        legacy_rank_cmp,
+    )
+}
+
+/// AutoClip ranking wrapper: shared dedup + temporal-balancing engine with
+/// the AutoClip comparator (valid scored before unscored, `final_score`
+/// descending, start asc, end asc, transient scoring id asc). The final
+/// order is a pure comparator sort over the full pool — bucket interleaving
+/// never reorders the final AutoClip ranking.
+pub fn deduplicate_and_rank_all_candidates_autoclip(
+    raw_candidates: Vec<CandidateDraft>,
+    podcast_duration: f64,
+    target_count: usize,
+) -> Vec<CandidateDraft> {
+    let mut pool = deduplicate_and_rank_all_candidates_with(
+        raw_candidates,
+        podcast_duration,
+        target_count,
+        crate::scoring::autoclip_rank_cmp,
+    );
+    pool.sort_by(crate::scoring::autoclip_rank_cmp);
+    pool
 }
 
 /// Backward-compatible wrapper that returns only the top `target_count` balanced candidates.
@@ -6214,6 +6266,163 @@ mod tests {
         for i in 0..12 {
             assert_eq!(all_ranked[i].start, truncated[i].start);
             assert_eq!(all_ranked[i].hook, truncated[i].hook);
+        }
+    }
+
+    #[test]
+    fn test_autoclip_ranking_uses_final_score_authority_not_composite() {
+        // A: high authoritative final_score but deliberately terrible
+        //    composite inputs (hard-capped composite ≈ 0.50).
+        // B: lower final_score but excellent composite inputs.
+        // The AutoClip wrapper must order by final_score, NOT composite_score.
+        let mut a = CandidateDraft {
+            start: 0.0,
+            end: 30.0,
+            score: 0.95,
+            hook: "A".to_string(),
+            hook_topic_clarity: Some(0.10),
+            coherence_score: Some(0.10),
+            payoff_score: Some(0.10),
+            ..Default::default()
+        };
+        a.score_source = Some(crate::scoring::SCORE_SOURCE_LLM.to_string());
+        a.scoring_id = Some("cand-0000".to_string());
+        let mut b = CandidateDraft {
+            start: 60.0,
+            end: 90.0,
+            score: 0.70,
+            hook: "B".to_string(),
+            hook_topic_clarity: Some(0.95),
+            coherence_score: Some(0.95),
+            payoff_score: Some(0.95),
+            ..Default::default()
+        };
+        b.score_source = Some(crate::scoring::SCORE_SOURCE_LLM.to_string());
+        b.scoring_id = Some("cand-0001".to_string());
+
+        assert!(
+            composite_score(&b) > composite_score(&a),
+            "fixture sanity: legacy composite must prefer B"
+        );
+
+        let pool = deduplicate_and_rank_all_candidates_autoclip(vec![a, b], 300.0, 12);
+        assert_eq!(pool[0].hook, "A", "final_score authority: A must rank first");
+        assert_eq!(pool[1].hook, "B");
+
+        // The legacy wrapper on the same inputs still follows composite_score.
+        let legacy_pool = deduplicate_and_rank_all_candidates(
+            vec![
+                CandidateDraft {
+                    start: 0.0,
+                    end: 30.0,
+                    score: 0.95,
+                    hook: "A".to_string(),
+                    hook_topic_clarity: Some(0.10),
+                    coherence_score: Some(0.10),
+                    payoff_score: Some(0.10),
+                    ..Default::default()
+                },
+                CandidateDraft {
+                    start: 60.0,
+                    end: 90.0,
+                    score: 0.70,
+                    hook: "B".to_string(),
+                    hook_topic_clarity: Some(0.95),
+                    coherence_score: Some(0.95),
+                    payoff_score: Some(0.95),
+                    ..Default::default()
+                },
+            ],
+            300.0,
+            12,
+        );
+        assert_eq!(legacy_pool[0].hook, "B", "legacy wrapper unchanged: composite authority");
+    }
+
+    #[test]
+    fn test_autoclip_ranking_final_order_is_pure_comparator_no_bucket_interleave() {
+        // Long duration (>600s) with more candidates than the target count:
+        // temporal balancing still runs, but the FINAL order must be the pure
+        // AutoClip comparator over the full pool (globally non-increasing).
+        let mut raw = Vec::new();
+        for i in 0..25 {
+            let start = (i as f64) * 140.0;
+            let mut d = CandidateDraft {
+                start,
+                end: start + 30.0,
+                score: 0.30 + ((i * 7) % 13) as f64 * 0.05,
+                hook: format!("Moment {}", i),
+                ..Default::default()
+            };
+            d.score_source = Some(crate::scoring::SCORE_SOURCE_LLM.to_string());
+            d.scoring_id = Some(format!("cand-{:04}", i));
+            raw.push(d);
+        }
+        let pool = deduplicate_and_rank_all_candidates_autoclip(raw, 3600.0, 12);
+        assert_eq!(pool.len(), 25, "full pool preserved");
+        for pair in pool.windows(2) {
+            assert!(
+                crate::scoring::autoclip_rank_cmp(&pair[0], &pair[1])
+                    != std::cmp::Ordering::Greater,
+                "final order must be globally comparator-sorted: {:?} before {:?}",
+                pair[0].scoring_id,
+                pair[1].scoring_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_autoclip_ranking_unscored_cannot_outrank_scored() {
+        let mut scored = CandidateDraft {
+            start: 0.0,
+            end: 30.0,
+            score: 0.10,
+            hook: "scored-low".to_string(),
+            ..Default::default()
+        };
+        scored.score_source = Some(crate::scoring::SCORE_SOURCE_LLM.to_string());
+        scored.scoring_id = Some("cand-0000".to_string());
+        let mut unscored = CandidateDraft {
+            start: 60.0,
+            end: 90.0,
+            score: 0.0,
+            hook: "unscored".to_string(),
+            ..Default::default()
+        };
+        unscored.score_source = Some(crate::scoring::SCORE_SOURCE_FALLBACK.to_string());
+        unscored.scoring_id = Some("cand-0001".to_string());
+
+        let pool =
+            deduplicate_and_rank_all_candidates_autoclip(vec![unscored, scored], 300.0, 12);
+        assert_eq!(pool[0].hook, "scored-low");
+        assert_eq!(pool[1].hook, "unscored");
+    }
+
+    #[test]
+    fn test_legacy_ranking_wrapper_is_unchanged_by_refactor() {
+        // Deterministic regression: legacy wrapper output must be identical
+        // to the comparator engine bound to the original composite ordering,
+        // across several input orders.
+        let make = |i: usize| CandidateDraft {
+            start: (i as f64) * 100.0,
+            end: (i as f64) * 100.0 + 40.0,
+            score: 0.5 + ((i * 11) % 17) as f64 * 0.02,
+            hook: format!("H{}", i),
+            hook_topic_clarity: Some(0.6 + ((i * 3) % 5) as f64 * 0.05),
+            coherence_score: Some(0.5 + ((i * 5) % 9) as f64 * 0.04),
+            payoff_score: Some(0.55 + (i % 7) as f64 * 0.05),
+            emotional_impact_score: Some(0.4 + ((i * 7) % 11) as f64 * 0.03),
+            ..Default::default()
+        };
+        let base: Vec<CandidateDraft> = (0..18).map(make).collect();
+        let reference = deduplicate_and_rank_all_candidates(base.clone(), 3600.0, 12);
+        for seed in 0..6 {
+            let mut rotated = base.clone();
+            rotated.rotate_left(seed);
+            let got = deduplicate_and_rank_all_candidates(rotated, 3600.0, 12);
+            let ref_hooks: Vec<&str> = reference.iter().map(|d| d.hook.as_str()).collect();
+            let got_hooks: Vec<&str> = got.iter().map(|d| d.hook.as_str()).collect();
+            assert_eq!(ref_hooks, got_hooks, "seed {seed}");
         }
     }
 

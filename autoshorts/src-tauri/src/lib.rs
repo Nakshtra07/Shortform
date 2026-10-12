@@ -15,13 +15,14 @@ pub mod panns_reactions;
 pub mod proc_guard;
 pub mod render_qa;
 pub mod scene_intelligence;
+pub mod scoring;
 pub mod speaker_intelligence;
 pub mod transcript_normalizer;
 pub mod transcription;
 pub mod vlm_scoring;
 mod pause_intel;
 mod t7_prosody;
-mod youtube;
+pub mod youtube;
 
 pub use pause_intel::{score_gaps, PauseIntelGap};
 pub use t7_prosody::{predict_t7_boundaries, T7Boundary};
@@ -213,6 +214,11 @@ async fn environment_status(
         has_openai_key: std::env::var("OPENAI_API_KEY").is_ok(),
         has_openrouter_key: std::env::var("OPENROUTER_API_KEY").is_ok(),
         has_groq_key: std::env::var("GROQ_API_KEY").is_ok(),
+        // Mirrors the AutoClip scorer's own gate (empty/whitespace keys do not
+        // count as configured) so the UI warning matches backend behavior.
+        has_nvidia_key: std::env::var("NVIDIA_API_KEY")
+            .map(|k| !k.trim().is_empty())
+            .unwrap_or(false),
         llm_provider,
         has_local_whisper_model,
         has_ollama,
@@ -488,19 +494,35 @@ fn create_project_from_path(
     caption_style: String,
     framing_mode: String,
 ) -> Result<Project, String> {
-    validate_media_extension(&path).map_err(to_command_error)?;
-    let probe = media::probe_media(&path).ok();
+    create_project_from_path_impl(
+        &state.db,
+        &path,
+        &transcription_mode,
+        &caption_style,
+        &framing_mode,
+    )
+}
 
-    state
-        .db
-        .create_project(
-            &path,
-            &transcription_mode,
-            &caption_style,
-            &framing_mode,
-            probe.and_then(|probe| probe.duration_sec),
-        )
-        .map_err(to_command_error)
+/// Production project-creation path (extension validation + ffprobe + DB row),
+/// callable outside the Tauri shell.
+pub fn create_project_from_path_impl(
+    db: &Database,
+    path: &str,
+    transcription_mode: &str,
+    caption_style: &str,
+    framing_mode: &str,
+) -> Result<Project, String> {
+    validate_media_extension(path).map_err(to_command_error)?;
+    let probe = media::probe_media(path).ok();
+
+    db.create_project(
+        path,
+        transcription_mode,
+        caption_style,
+        framing_mode,
+        probe.and_then(|probe| probe.duration_sec),
+    )
+    .map_err(to_command_error)
 }
 
 #[tauri::command]
@@ -557,8 +579,26 @@ async fn transcribe_project(
     provider: String,
     api_key: Option<String>,
 ) -> Result<Transcript, String> {
-    let db = state.db.clone();
-    let data_dir = state.data_dir.clone();
+    transcribe_project_impl(
+        state.db.clone(),
+        state.data_dir.clone(),
+        project_id,
+        provider,
+        api_key,
+    )
+    .await
+}
+
+/// Production transcription path, callable outside the Tauri shell (the
+/// command above is a thin State-unwrapping wrapper). Used by the acceptance
+/// harness to exercise the REAL pipeline end to end.
+pub async fn transcribe_project_impl(
+    db: Database,
+    data_dir: PathBuf,
+    project_id: String,
+    provider: String,
+    api_key: Option<String>,
+) -> Result<Transcript, String> {
     let project = db.get_project(&project_id).map_err(to_command_error)?;
     db.update_project_status(&project_id, "transcribing", None)
         .map_err(to_command_error)?;
@@ -726,8 +766,65 @@ async fn generate_candidates(
     _allow_demo: Option<bool>,
     discovery_mode: Option<String>,
     reze_provider: Option<String>,
+    scoring_mode: Option<String>,
 ) -> Result<Vec<Candidate>, String> {
-    let db = state.db.clone();
+    generate_candidates_impl(
+        state.db.clone(),
+        project_id,
+        api_key,
+        provider,
+        model_name,
+        _allow_demo,
+        discovery_mode,
+        reze_provider,
+        scoring_mode,
+    )
+    .await
+}
+
+/// Production candidate pipeline (discovery -> AutoClip scoring -> eligibility
+/// gate -> deterministic ranking -> Top-N -> persistence), callable outside the
+/// Tauri shell. The command above is a thin State-unwrapping wrapper.
+///
+/// `scoring_mode` is the explicit UI scoring-mode selection ("legacy" or
+/// "autoclip"); it overrides the `AUTOSHORTS_SCORING_BACKEND` default for
+/// THIS call only.
+pub async fn generate_candidates_impl(
+    db: Database,
+    project_id: String,
+    api_key: Option<String>,
+    provider: Option<String>,
+    model_name: Option<String>,
+    _allow_demo: Option<bool>,
+    discovery_mode: Option<String>,
+    reze_provider: Option<String>,
+    scoring_mode: Option<String>,
+) -> Result<Vec<Candidate>, String> {
+    // Scoring backend authority. The explicit UI selection (`scoring_mode`)
+    // overrides the env default for this call. `legacy`: composite_score
+    // remains authoritative end-to-end and NO NVIDIA credential is required.
+    // `autoclip`: NVIDIA NIM holistic final_score is authoritative, and the
+    // key must exist BEFORE any discovery work is spent — a missing key is a
+    // hard error, never a silent fallback to legacy.
+    let (scoring_backend, nvidia_scorer_key) = scoring::resolve_scoring_authority_for_call(
+        scoring_mode.as_deref(),
+    )
+    .map_err(to_command_error)?;
+    match scoring_backend {
+        scoring::ScoringBackend::Legacy => println!(
+            "[Scoring Backend] legacy — legacy composite_score is AUTHORITATIVE for ranking"
+        ),
+        scoring::ScoringBackend::AutoClip => println!(
+            "[Scoring Backend] autoclip — NVIDIA holistic final_score is AUTHORITATIVE for ranking"
+        ),
+    }
+    let autoclip_threshold: Option<f64> = match scoring_backend {
+        scoring::ScoringBackend::AutoClip => Some(
+            scoring::resolve_recommend_threshold().map_err(to_command_error)?,
+        ),
+        scoring::ScoringBackend::Legacy => None,
+    };
+
     let transcript = db
         .latest_transcript(&project_id)
         .map_err(to_command_error)?
@@ -1013,33 +1110,102 @@ async fn generate_candidates(
     }
 
     // 1c. Quality Gate: Anti-filler filter (drop candidates below minimum score threshold)
-    let min_score = discovery_config.min_candidate_score;
-    let before_quality = drafts.len();
-    let quality_backup = drafts.clone();
-    drafts.retain(|d| llm::composite_score(d) >= min_score);
-    if drafts.is_empty() {
-        eprintln!("[Quality Gate] Warning: All candidates fell below min score {:.2}, restoring top candidates", min_score);
-        drafts = quality_backup;
-    } else if drafts.len() < before_quality {
-        println!(
-            "[Quality Gate] Filtered {} low-scoring filler candidates (< {:.2}) ({} remaining)",
-            before_quality - drafts.len(),
-            min_score,
-            drafts.len()
-        );
+    //     LEGACY AUTHORITY ONLY. In explicit autoclip mode this composite gate
+    //     is skipped: the AutoClip eligibility gate (final_score >= threshold)
+    //     below is the single authoritative score gate.
+    if autoclip_threshold.is_none() {
+        let min_score = discovery_config.min_candidate_score;
+        let before_quality = drafts.len();
+        let quality_backup = drafts.clone();
+        drafts.retain(|d| llm::composite_score(d) >= min_score);
+        if drafts.is_empty() {
+            eprintln!("[Quality Gate] Warning: All candidates fell below min score {:.2}, restoring top candidates", min_score);
+            drafts = quality_backup;
+        } else if drafts.len() < before_quality {
+            println!(
+                "[Quality Gate] Filtered {} low-scoring filler candidates (< {:.2}) ({} remaining)",
+                before_quality - drafts.len(),
+                min_score,
+                drafts.len()
+            );
+        }
     }
 
     // 2. Multimodal Hook Intelligence Analysis (Visual, Acoustic, Temporal Signals)
-    let (mm_drafts, mm_status) = media::analyze_multimodal_hook_signals(
+    //    Runs BEFORE AutoClip scoring so any naturally available evidence is
+    //    prepared for the holistic scorer (evidence is context only — it is
+    //    never blended into the authoritative final_score).
+    let (mut mm_drafts, mm_status) = media::analyze_multimodal_hook_signals(
         &project.source_path,
         &drafts,
         normalized.duration,
         None,
     );
 
-    // 3. High-Precision Re-Ranking and Temporal Balancing (preserve full pool, top 12 selected)
-    let mut all_drafts =
-        llm::deduplicate_and_rank_all_candidates(mm_drafts, normalized.duration, 12);
+    // 3. Scoring + High-Precision Re-Ranking and Temporal Balancing
+    //    (preserve full pool, top 12 selected)
+    let mut all_drafts = match autoclip_threshold {
+        Some(threshold) => {
+            // ── AutoClip holistic scoring (NVIDIA NIM) ──
+            // The accepted final_score REPLACES the discovery-level score and
+            // is the AUTHORITATIVE ranking score. Unscored/invalid results
+            // become explicit fallbacks (score 0.0, never eligible).
+            let nvidia_key = nvidia_scorer_key.clone().unwrap_or_default();
+            let source_identity = llm::compute_transcript_source_identity(&normalized);
+            let summary = scoring::run_autoclip_scoring(
+                &source_identity,
+                &mut mm_drafts,
+                &normalized.words,
+                &nvidia_key,
+            )
+            .await
+            .map_err(|f| format!("[AutoClip Scoring] run failed: {f}"))?;
+
+            // ── Eligibility gate (>= threshold, inclusive) ──
+            // Scored candidates below the threshold are removed; explicit
+            // unscored/fallback candidates are RETAINED as visible Not
+            // Selected alternatives (a failed scoring operation never
+            // destroys candidate records). Counts are reported separately.
+            let before_gate = mm_drafts.len();
+            let gate_backup = mm_drafts.clone();
+            mm_drafts.retain(|d| {
+                let llm_scored = d.score_source.as_deref() == Some(scoring::SCORE_SOURCE_LLM);
+                !llm_scored || d.score >= threshold
+            });
+            let unscored_retained = mm_drafts
+                .iter()
+                .filter(|d| d.score_source.as_deref() == Some(scoring::SCORE_SOURCE_FALLBACK))
+                .count();
+            if mm_drafts.is_empty() {
+                eprintln!(
+                    "[AutoClip Scoring] Eligibility gate removed every candidate; restoring pool as explicit unscored alternatives"
+                );
+                mm_drafts = gate_backup;
+            } else {
+                println!(
+                    "[AutoClip Scoring] Eligibility gate (>= {:.2}): {} of {} scored candidates removed; {} unscored fallback alternatives retained",
+                    threshold,
+                    before_gate - mm_drafts.len(),
+                    before_gate,
+                    unscored_retained
+                );
+            }
+            println!(
+                "[AutoClip Scoring] valid_scores={} unscored={} cache_hits={} failed_batches={}",
+                summary.valid_scores,
+                summary.unscored + summary.invalid_scores,
+                summary.cache_hits,
+                summary.failed_batches
+            );
+
+            llm::deduplicate_and_rank_all_candidates_autoclip(
+                mm_drafts,
+                normalized.duration,
+                12,
+            )
+        }
+        None => llm::deduplicate_and_rank_all_candidates(mm_drafts, normalized.duration, 12),
+    };
 
     // ── Phase 4: Candidate Redundancy Detection (DETERMINISTIC, signal-only) ──
     // Runs on the ranked pool so obvious near-duplicates never reach the user.
@@ -1306,9 +1472,36 @@ async fn generate_candidates(
         println!();
     }
 
-    let candidates = db
-        .replace_candidates(&project_id, &all_drafts)
-        .map_err(to_command_error)?;
+    // Persistence. Legacy mode: original cutoff semantics (min(12).max(3)).
+    // AutoClip mode: rank = index + 1 in the authoritative ranked pool and
+    // selected = index < min(effective_top_n, eligible_count). Not Selected
+    // alternatives remain persisted with their scores, ranks and provenance.
+    let candidates = match autoclip_threshold {
+        Some(threshold) => {
+            let eligible_count = all_drafts
+                .iter()
+                .filter(|d| scoring::is_autoclip_eligible(d, threshold))
+                .count();
+            let top_n = scoring::resolve_top_n().map_err(to_command_error)?;
+            let selected_count = scoring::effective_selected_count(top_n, eligible_count);
+            println!(
+                "[AutoClip Scoring] Top-N: effective N={} -> selected_count={} (eligible={} of {} ranked, threshold >= {:.2}); {} eligible-but-not-selected alternatives retained",
+                top_n
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "disabled (all eligible)".to_string()),
+                selected_count,
+                eligible_count,
+                all_drafts.len(),
+                threshold,
+                eligible_count.saturating_sub(selected_count)
+            );
+            db.replace_candidates_with_selection(&project_id, &all_drafts, selected_count)
+                .map_err(to_command_error)?
+        }
+        None => db
+            .replace_candidates(&project_id, &all_drafts)
+            .map_err(to_command_error)?,
+    };
     db.update_project_status(&project_id, "ready", None)
         .map_err(to_command_error)?;
     Ok(candidates)
@@ -2081,22 +2274,35 @@ async fn render_flat_clip_for_candidate(
     state: tauri::State<'_, AppState>,
     candidate_id: String,
 ) -> Result<String, String> {
-    let (candidate, project) = state
-        .db
+    render_flat_clip_for_candidate_impl(
+        state.db.clone(),
+        state.data_dir.clone(),
+        state.render_tracker.clone(),
+        candidate_id,
+    )
+    .await
+}
+
+/// Production render path (boundary pass -> smart pacing -> framing -> ASS
+/// captions -> ffmpeg -> Render QA -> persistence), callable outside the Tauri
+/// shell. The command above is a thin State-unwrapping wrapper.
+pub async fn render_flat_clip_for_candidate_impl(
+    db: Database,
+    data_dir: PathBuf,
+    render_tracker: InFlightRenderTracker,
+    candidate_id: String,
+) -> Result<String, String> {
+    let (candidate, project) = db
         .get_candidate_with_project(&candidate_id)
         .map_err(to_command_error)?;
 
     // 1. In-flight check keyed to candidate_id AND output identity (project_id, rank)
-    let render_guard = state
-        .render_tracker
+    let render_guard = render_tracker
         .try_acquire_output(&candidate_id, &project.id, candidate.rank)
         .map_err(|err| {
             println!("[Render Lock Rejected] {}", err);
             err
         })?;
-
-    let db = state.db.clone();
-    let data_dir = state.data_dir.clone();
 
     tokio::task::spawn_blocking(move || {
         let _guard = render_guard;
@@ -2853,6 +3059,42 @@ fn rename_project(
         .map_err(to_command_error)
 }
 
+#[tauri::command]
+fn update_project_style(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    caption_style: Option<String>,
+    framing_mode: Option<String>,
+) -> Result<(), String> {
+    state
+        .db
+        .update_project_style(
+            &project_id,
+            caption_style.as_deref(),
+            framing_mode.as_deref(),
+        )
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
+fn restore_clip_output_path(
+    state: tauri::State<'_, AppState>,
+    candidate_id: String,
+    output_path: String,
+) -> Result<(), String> {
+    state
+        .db
+        .update_clip_for_candidate(
+            &candidate_id,
+            "done",
+            Some(&output_path),
+            None,
+            None,
+            None,
+        )
+        .map_err(to_command_error)
+}
+
 pub fn run() {
     let _ = dotenvy::dotenv();
     let _ = dotenvy::from_filename("../.env");
@@ -2893,6 +3135,8 @@ pub fn run() {
             render_flat_clip_for_candidate,
             delete_project,
             rename_project,
+            update_project_style,
+            restore_clip_output_path,
             check_youtube_copyright,
             download_youtube_video
         ])

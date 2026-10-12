@@ -462,6 +462,24 @@ impl Database {
         project_id: &str,
         drafts: &[CandidateDraft],
     ) -> Result<Vec<Candidate>> {
+        // Legacy cutoff semantics, preserved exactly.
+        let selected_cutoff = drafts.len().min(12).max(3).min(drafts.len());
+        self.replace_candidates_with_selection(project_id, drafts, selected_cutoff)
+    }
+
+    /// Persistence with an EXPLICIT selection cutoff: rank = index + 1 in the
+    /// authoritative pool order and `selected = index < selected_count`.
+    /// Used by the AutoClip Top-N path, where `selected_count` is
+    /// `min(effective_top_n, eligible_count)` computed by the scoring backend.
+    /// The complete ranked pool (including Not Selected alternatives) is
+    /// persisted; a selection change never deletes candidate records.
+    pub fn replace_candidates_with_selection(
+        &self,
+        project_id: &str,
+        drafts: &[CandidateDraft],
+        selected_count: usize,
+    ) -> Result<Vec<Candidate>> {
+        let selected_cutoff = selected_count.min(drafts.len());
         let mut conn = self.conn.lock().expect("database mutex poisoned");
         let tx = conn.transaction()?;
 
@@ -470,7 +488,6 @@ impl Database {
             params![project_id],
         )?;
 
-        let selected_cutoff = drafts.len().min(12).max(3).min(drafts.len());
         let mut candidates = Vec::with_capacity(drafts.len());
 
         for (index, draft) in drafts.iter().enumerate() {
@@ -776,6 +793,21 @@ impl Database {
         conn.execute(
             "UPDATE projects SET name = ?1, updated_at = ?2 WHERE id = ?3",
             params![name, now, project_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_project_style(
+        &self,
+        project_id: &str,
+        caption_style: Option<&str>,
+        framing_mode: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE projects SET caption_style = COALESCE(?1, caption_style), framing_mode = COALESCE(?2, framing_mode), updated_at = ?3 WHERE id = ?4",
+            params![caption_style, framing_mode, now, project_id],
         )?;
         Ok(())
     }
@@ -1220,6 +1252,161 @@ mod tests {
         db.set_selected_rank_range(&project_id, 8, 10)
             .expect("apply range 8-10");
         assert_eq!(selected_ranks(&db, &project_id), vec![8, 9, 10]);
+    }
+
+    // ── AutoClip Top-N persistence (replace_candidates_with_selection) ──
+
+    fn autoclip_drafts(count: usize, scored: usize) -> Vec<CandidateDraft> {
+        (0..count)
+            .map(|i| {
+                let mut d = CandidateDraft {
+                    start: i as f64 * 30.0,
+                    end: i as f64 * 30.0 + 30.0,
+                    score: 0.9 - (i as f64 * 0.05),
+                    hook: format!("Hook {}", i + 1),
+                    rationale: format!("Rationale {}", i + 1),
+                    ..Default::default()
+                };
+                if i < scored {
+                    d.score_source = Some("llm".to_string());
+                } else {
+                    d.score_source = Some("fallback".to_string());
+                    d.score = 0.0;
+                }
+                d.scoring_id = Some(format!("cand-{:04}", i));
+                d
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_replace_with_selection_exact_ranks_and_flags() {
+        let db = Database::open(&std::path::Path::new(":memory:")).expect("open db");
+        let project = db
+            .create_project("/tmp/topn.mp4", "local", "preset_viral_bold", "original", Some(600.0))
+            .expect("create project");
+        let drafts = autoclip_drafts(8, 8);
+        db.replace_candidates_with_selection(&project.id, &drafts, 3)
+            .expect("persist with selection");
+
+        let reloaded = db.list_candidates(&project.id).expect("reload");
+        assert_eq!(reloaded.len(), 8);
+        for (idx, c) in reloaded.iter().enumerate() {
+            assert_eq!(c.rank, (idx + 1) as i64, "rank = index + 1");
+            assert_eq!(c.selected, idx < 3, "selected = index < selected_count");
+        }
+        // Not Selected alternatives remain persisted with their scores.
+        assert_eq!(selected_ranks(&db, &project.id), vec![1, 2, 3]);
+        assert!((reloaded[7].score - 0.55).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_replace_with_selection_count_capped_by_pool_size() {
+        let db = Database::open(&std::path::Path::new(":memory:")).expect("open db");
+        let project = db
+            .create_project("/tmp/topn.mp4", "local", "preset_viral_bold", "original", Some(600.0))
+            .expect("create project");
+        // Fewer eligible candidates than N: select every eligible one, no more.
+        let drafts = autoclip_drafts(5, 5);
+        db.replace_candidates_with_selection(&project.id, &drafts, 12)
+            .expect("persist");
+        assert_eq!(selected_ranks(&db, &project.id), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_replace_with_selection_zero_and_none_eligible() {
+        let db = Database::open(&std::path::Path::new(":memory:")).expect("open db");
+        let project = db
+            .create_project("/tmp/topn.mp4", "local", "preset_viral_bold", "original", Some(600.0))
+            .expect("create project");
+        // All-unscored pool: selected_count 0 → nothing selected, but every
+        // candidate record is retained as an explicit unscored alternative.
+        let drafts = autoclip_drafts(4, 0);
+        db.replace_candidates_with_selection(&project.id, &drafts, 0)
+            .expect("persist");
+        assert_eq!(selected_ranks(&db, &project.id), Vec::<i64>::new());
+        assert_eq!(db.list_candidates(&project.id).expect("reload").len(), 4);
+    }
+
+    #[test]
+    fn test_replace_with_selection_preserves_provenance_roundtrip() {
+        let db = Database::open(&std::path::Path::new(":memory:")).expect("open db");
+        let project = db
+            .create_project("/tmp/topn.mp4", "local", "preset_viral_bold", "original", Some(600.0))
+            .expect("create project");
+        let drafts = autoclip_drafts(6, 6);
+        let persisted = db
+            .replace_candidates_with_selection(&project.id, &drafts, 6)
+            .expect("persist");
+
+        // score_source + scoring_id ride in metadata_json and survive reload.
+        for (idx, c) in persisted.iter().enumerate() {
+            let meta = c.metadata_json.as_ref().expect("metadata persisted");
+            let parsed: serde_json::Value = serde_json::from_str(meta).expect("valid json");
+            assert_eq!(parsed["scoreSource"], "llm");
+            assert_eq!(parsed["scoringId"], format!("cand-{:04}", idx));
+            let draft = c.try_metadata_draft().expect("draft roundtrip");
+            assert_eq!(draft.score_source.as_deref(), Some("llm"));
+            assert_eq!(draft.scoring_id, Some(format!("cand-{:04}", idx)));
+        }
+        let reloaded = db.list_candidates(&project.id).expect("reload");
+        assert_eq!(reloaded.len(), 6);
+        for c in &reloaded {
+            let draft = c.try_metadata_draft().expect("reload roundtrip");
+            assert_eq!(draft.score_source.as_deref(), Some("llm"));
+        }
+    }
+
+    #[test]
+    fn test_legacy_replace_candidates_cutoff_unchanged() {
+        let db = Database::open(&std::path::Path::new(":memory:")).expect("open db");
+        let project = db
+            .create_project("/tmp/legacy.mp4", "local", "preset_viral_bold", "original", Some(600.0))
+            .expect("create project");
+        // 20 drafts → legacy cutoff = min(20,12).max(3).min(20) = 12.
+        let drafts: Vec<CandidateDraft> = (0..20)
+            .map(|i| CandidateDraft {
+                start: i as f64 * 30.0,
+                end: i as f64 * 30.0 + 30.0,
+                score: 0.9,
+                hook: format!("Hook {}", i + 1),
+                rationale: format!("Rationale {}", i + 1),
+                ..Default::default()
+            })
+            .collect();
+        db.replace_candidates(&project.id, &drafts).expect("persist");
+        assert_eq!(
+            selected_ranks(&db, &project.id),
+            (1..=12).collect::<Vec<i64>>()
+        );
+        // 2 drafts → both selected (cutoff clamped to pool size).
+        let small: Vec<CandidateDraft> = drafts[..2].to_vec();
+        db.replace_candidates(&project.id, &small).expect("persist");
+        assert_eq!(selected_ranks(&db, &project.id), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_replace_with_selection_repeated_changes() {
+        let db = Database::open(&std::path::Path::new(":memory:")).expect("open db");
+        let project = db
+            .create_project("/tmp/topn.mp4", "local", "preset_viral_bold", "original", Some(600.0))
+            .expect("create project");
+        let drafts = autoclip_drafts(10, 10);
+        db.replace_candidates_with_selection(&project.id, &drafts, 12)
+            .expect("initial persist");
+        // Repeated selection changes through the backend command agree with
+        // database ground truth after every change (capped at pool size 10).
+        for n in [3usize, 5, 12, 1] {
+            let _ = db
+                .set_selected_clip_count(&project.id, n)
+                .expect("set count");
+            let capped = n.min(10) as i64;
+            let expected: Vec<i64> = (1..=capped).collect();
+            assert_eq!(selected_ranks(&db, &project.id), expected, "N={n}");
+        }
+        // Restore a known rank range afterwards.
+        db.set_selected_rank_range(&project.id, 1, 5).expect("range");
+        assert_eq!(selected_ranks(&db, &project.id), vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -1957,6 +2144,8 @@ mod tests {
             vlm_scored_at: None,
             vlm_evidence: None,
             reactions_json: None,
+            score_source: None,
+            scoring_id: None,
         };
 
         // 1. Verify replace_candidates returns candidate with metadata_json and try_metadata_draft succeeds
