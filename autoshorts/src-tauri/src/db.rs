@@ -797,6 +797,21 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_project_style(
+        &self,
+        project_id: &str,
+        caption_style: Option<&str>,
+        framing_mode: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE projects SET caption_style = COALESCE(?1, caption_style), framing_mode = COALESCE(?2, framing_mode), updated_at = ?3 WHERE id = ?4",
+            params![caption_style, framing_mode, now, project_id],
+        )?;
+        Ok(())
+    }
+
     // ─── Phase 2: Speaker Intelligence Queries ────────────────────────────────
 
     /// Save or update a speaker diarization result for a project.

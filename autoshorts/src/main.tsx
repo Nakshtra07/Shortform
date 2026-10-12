@@ -8,6 +8,7 @@ import {
   BadgeCheck,
   Captions,
   Check,
+  ChevronLeft,
   ChevronRight,
   Clapperboard,
   Download,
@@ -24,6 +25,27 @@ import {
   Cloud,
   Youtube,
   AlertTriangle,
+  Search,
+  Clock,
+  Calendar,
+  ArrowUpDown,
+  Upload,
+  FolderOpen,
+  Film,
+  ArrowLeft,
+  ArrowRight,
+  Crop,
+  Smartphone,
+  ShieldCheck,
+  Cpu,
+  Key,
+  Info,
+  Lock,
+  Zap,
+  Layers,
+  RotateCcw,
+  X,
+  Palette,
 } from "lucide-react";
 import "./styles.css";
 
@@ -53,6 +75,7 @@ type Project = {
   status: string;
   transcriptionMode: string;
   captionStyle?: string | null;
+  framingMode?: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -104,6 +127,15 @@ function candidateScoreSource(candidate: Candidate): string | null {
   }
 }
 
+function formatTimestamp(seconds: number | null | undefined): string {
+  if (typeof seconds !== "number" || isNaN(seconds)) return "00:00:00";
+  const total = Math.max(0, Math.floor(seconds));
+  const hrs = Math.floor(total / 3600);
+  const mins = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  return `${hrs.toString().padStart(2, "0")}:${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+}
+
 type ProjectDetail = {
   project: Project;
   transcript: Transcript | null;
@@ -132,6 +164,16 @@ type BusyState =
   | "clipCount"
   | "cut";
 
+const CAPTION_PRESETS = [
+  { id: "preset_minimal_capsule", name: "Minimal Capsule", family: "clean" },
+  { id: "preset_viral_bold", name: "Hormozi Viral", family: "bold" },
+  { id: "preset_mrbeast_pop", name: "Narrative Pop", family: "highlight" },
+  { id: "preset_cinematic_vlog", name: "Cinematic Vlog", family: "clean" },
+  { id: "preset_dynamic_editorial", name: "Dynamic Editorial", family: "highlight" },
+  { id: "preset_t7", name: "T7 Rhythm", family: "highlight" },
+  { id: "preset_bhaukal_caption", name: "Bhaukal Caption", family: "bold" },
+] as const;
+
 function App() {
   const [environment, setEnvironment] = useState<EnvironmentStatus | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -141,8 +183,8 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [renderingCandidateId, setRenderingCandidateId] = useState<string | null>(null);
   const [showStyleModal, setShowStyleModal] = useState(false);
-  const [selectedStyle, setSelectedStyle] = useState<string | null>(null);
-  const [selectedFramingMode, setSelectedFramingMode] = useState<string>("original");
+  const [selectedStyle, setSelectedStyle] = useState<string>("preset_minimal_capsule");
+  const [selectedFramingMode, setSelectedFramingMode] = useState<string>("adaptive");
   // Candidate discovery engine for "Find Viral Moments": "timestamp_generation"
   // is the production default; "window_scoring" (REZE) is the experimental
   // opt-in. Per generation call — flip and re-run to compare on the same project.
@@ -158,12 +200,33 @@ function App() {
     return (localStorage.getItem("autoshorts_scoring_mode") as "legacy" | "autoclip") || "legacy";
   });
   const [mediaPathToImport, setMediaPathToImport] = useState<string | null>(null);
+  const mediaFilename = useMemo(() => {
+    if (!mediaPathToImport) return "";
+    const parts = mediaPathToImport.split(/[\\/]/);
+    return parts[parts.length - 1] || mediaPathToImport;
+  }, [mediaPathToImport]);
 
   const [youtubeModalOpen, setYoutubeModalOpen] = useState(false);
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [youtubeStatus, setYoutubeStatus] = useState<"idle" | "checking" | "warning" | "downloading">("idle");
   const [youtubeWarningLicense, setYoutubeWarningLicense] = useState<string | null>(null);
   const [youtubeError, setYoutubeError] = useState<string | null>(null);
+
+  // Style Studio Drawer State (Screen D & E)
+  const [styleStudioOpen, setStyleStudioOpen] = useState(false);
+  const [styleStudioTargetCandidateId, setStyleStudioTargetCandidateId] = useState<string | null>(null);
+  const [styleStudioFraming, setStyleStudioFraming] = useState<"adaptive" | "original">("adaptive");
+  const [styleStudioCaption, setStyleStudioCaption] = useState<string>("preset_minimal_capsule");
+  const [styleStudioScope, setStyleStudioScope] = useState<"target" | "selected" | "all">("target");
+  const [previousRenderHistory, setPreviousRenderHistory] = useState<Map<string, string>>(new Map());
+
+  // Screen A Discovery & Dashboard Filter State
+  const [projectSearch, setProjectSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | "ready" | "processing" | "failed">("all");
+  const [sortOption, setSortOption] = useState<"recent" | "date" | "duration">("recent");
+
+  // Screen B Transcript Search State
+  const [transcriptSearch, setTranscriptSearch] = useState("");
 
   // Synchronous in-flight guards against rapid duplicate clicks / concurrent triggers
   const isCuttingRef = useRef(false);
@@ -239,6 +302,87 @@ function App() {
   // Transient Top-N input state (the backend response is authoritative).
   const [topNValue, setTopNValue] = useState("");
 
+  function getProjectNormalizedStatus(status: string): "ready" | "processing" | "failed" {
+    const s = (status || "").toLowerCase();
+    if (s === "ready" || s === "done" || s === "completed") return "ready";
+    if (s === "failed" || s === "error") return "failed";
+    return "processing";
+  }
+
+  function getProjectStatusLabel(status: string): string {
+    const norm = getProjectNormalizedStatus(status);
+    if (norm === "ready") return "Ready";
+    if (norm === "failed") return "Failed";
+    const s = (status || "").toLowerCase();
+    if (s === "transcribing") return "Transcribing";
+    if (s === "analyzing") return "Analyzing";
+    if (s === "ingest") return "Ingesting";
+    return "Processing";
+  }
+
+  const projectCounts = useMemo(() => {
+    let ready = 0;
+    let processing = 0;
+    let failed = 0;
+    for (const p of projects) {
+      const cat = getProjectNormalizedStatus(p.status);
+      if (cat === "ready") ready++;
+      else if (cat === "processing") processing++;
+      else if (cat === "failed") failed++;
+    }
+    return {
+      all: projects.length,
+      ready,
+      processing,
+      failed,
+    };
+  }, [projects]);
+
+  const recentProjects = useMemo(() => {
+    return [...projects]
+      .sort((a, b) => {
+        const timeB = new Date(b.updatedAt || b.createdAt).getTime() || 0;
+        const timeA = new Date(a.updatedAt || a.createdAt).getTime() || 0;
+        return timeB - timeA;
+      })
+      .slice(0, 5);
+  }, [projects]);
+
+  const filteredProjects = useMemo(() => {
+    let list = [...projects];
+
+    if (projectSearch.trim()) {
+      const query = projectSearch.toLowerCase();
+      list = list.filter((p) => {
+        const title = (p.name || fileName(p.sourcePath)).toLowerCase();
+        return title.includes(query);
+      });
+    }
+
+    if (statusFilter !== "all") {
+      list = list.filter((p) => getProjectNormalizedStatus(p.status) === statusFilter);
+    }
+
+    list.sort((a, b) => {
+      if (sortOption === "recent") {
+        const timeB = new Date(b.updatedAt || b.createdAt).getTime() || 0;
+        const timeA = new Date(a.updatedAt || a.createdAt).getTime() || 0;
+        return timeB - timeA;
+      }
+      if (sortOption === "date") {
+        const timeB = new Date(b.createdAt).getTime() || 0;
+        const timeA = new Date(a.createdAt).getTime() || 0;
+        return timeB - timeA;
+      }
+      if (sortOption === "duration") {
+        return (b.sourceDuration || 0) - (a.sourceDuration || 0);
+      }
+      return 0;
+    });
+
+    return list;
+  }, [projects, projectSearch, statusFilter, sortOption]);
+
   const transcript = useMemo(() => {
     if (!detail?.transcript) return null;
     try {
@@ -286,6 +430,51 @@ function App() {
     const clip = clipByCandidate.get(candidate.id);
     return clip?.status === "done" && Boolean(clip.captionAssPath);
   }).length;
+
+  const targetCandidate = useMemo(() => {
+    if (!detail || !styleStudioTargetCandidateId) return null;
+    return detail.candidates.find((c) => c.id === styleStudioTargetCandidateId) || null;
+  }, [detail, styleStudioTargetCandidateId]);
+
+  const targetCandidateIds = useMemo(() => {
+    if (!detail) return [];
+    if (styleStudioScope === "target" && styleStudioTargetCandidateId) {
+      return [styleStudioTargetCandidateId];
+    }
+    if (styleStudioScope === "selected") {
+      const ids = selectedCandidates.map((c) => c.id);
+      if (ids.length > 0) return ids;
+      return styleStudioTargetCandidateId ? [styleStudioTargetCandidateId] : [];
+    }
+    if (styleStudioScope === "all") {
+      return detail.candidates.map((c) => c.id);
+    }
+    return styleStudioTargetCandidateId ? [styleStudioTargetCandidateId] : [];
+  }, [detail, styleStudioScope, styleStudioTargetCandidateId, selectedCandidates]);
+
+  const hasPreviousVersion = useMemo(() => {
+    return targetCandidateIds.some((id) => previousRenderHistory.has(id));
+  }, [targetCandidateIds, previousRenderHistory]);
+
+  const filteredTranscriptSegments = useMemo(() => {
+    if (!transcript) return [];
+    if (!transcriptSearch.trim()) return transcript.segments;
+    const q = transcriptSearch.toLowerCase().trim();
+    return transcript.segments.filter(
+      (seg) =>
+        seg.text.toLowerCase().includes(q) ||
+        (seg.speaker && seg.speaker.toLowerCase().includes(q))
+    );
+  }, [transcript, transcriptSearch]);
+
+  const activePipelineStep = useMemo(() => {
+    if (!detail) return "Transcript";
+    if (!detail.transcript) return "Transcript";
+    if (detail.candidates.length === 0) return "Moments";
+    if (selectedCount === 0 || selectedCutCount < selectedCount) return "Cut";
+    if (selectedCaptionsCount < selectedCount) return "Captions";
+    return "Export";
+  }, [detail, selectedCount, selectedCutCount, selectedCaptionsCount]);
   const canUseCloudKey = environment?.hasDeepgramKey || deepgramKey.trim().length > 0;
   const canUseClaude = environment?.hasAnthropicKey || anthropicKey.trim().length > 0;
   const canUseDeepseek = environment?.hasDeepseekKey || deepseekKey.trim().length > 0;
@@ -340,6 +529,10 @@ function App() {
     setRangeFromValue(String(from));
     setRangeToValue(to === candidates.length ? null : String(to));
   }, [detail?.candidates]);
+
+  useEffect(() => {
+    setTranscriptSearch("");
+  }, [detail?.project.id]);
 
   useEffect(() => {
     void refresh();
@@ -491,7 +684,8 @@ function App() {
       ],
     });
     if (typeof selected !== "string") return;
-    setSelectedStyle(null);
+    setSelectedStyle("preset_minimal_capsule");
+    setSelectedFramingMode("adaptive");
     setMediaPathToImport(selected);
     setShowStyleModal(true);
   }
@@ -541,7 +735,8 @@ function App() {
       setYoutubeStatus("idle");
       setYoutubeWarningLicense(null);
       setYoutubeError(null);
-      setSelectedStyle(null);
+      setSelectedStyle("preset_minimal_capsule");
+      setSelectedFramingMode("adaptive");
       setMediaPathToImport(downloadedPath);
       setShowStyleModal(true);
     } catch (err: any) {
@@ -558,9 +753,8 @@ function App() {
     const selected = mediaPathToImport;
     const chosenStyle = style;
     const chosenFramingMode = framingMode;
+    const chosenScoringMode = scoringMode;
     setMediaPathToImport(null);
-    setSelectedStyle(null);
-    setSelectedFramingMode("original");
     setShowStyleModal(false);
 
     let newProjectId: string | null = null;
@@ -576,19 +770,20 @@ function App() {
     });
 
     if (newProjectId) {
-      await runAutoPipeline(newProjectId);
+      await runAutoPipeline(newProjectId, chosenScoringMode);
     }
   }
 
-  async function runAutoPipeline(projectId: string) {
+  async function runAutoPipeline(projectId: string, overrideScoringMode?: "legacy" | "autoclip") {
     setError(null);
+    const activeScoringMode = overrideScoringMode || scoringMode;
     const env = await invoke<EnvironmentStatus>("environment_status");
 
     // AutoClip Scoring requires the NVIDIA key BEFORE any billable work
     // (transcription included). The backend would hard-error at the start of
     // generate_candidates anyway; failing fast here avoids spending the
     // transcription call. Never silently falls back to Legacy Scoring.
-    if (scoringMode === "autoclip" && !env.hasNvidiaKey) {
+    if (activeScoringMode === "autoclip" && !env.hasNvidiaKey) {
       setError("Import successful. AutoClip Scoring (NVIDIA) is selected but NVIDIA_API_KEY is missing. Configure the key in your .env or environment, or switch the scoring mode to Legacy Scoring.");
       return;
     }
@@ -683,8 +878,8 @@ function App() {
         discovery_mode: discoveryMode,
         rezeProvider: isReze ? (rezeProvider || "nvidia_diffusiongemma") : undefined,
         reze_provider: isReze ? (rezeProvider || "nvidia_diffusiongemma") : undefined,
-        scoringMode,
-        scoring_mode: scoringMode,
+        scoringMode: activeScoringMode,
+        scoring_mode: activeScoringMode,
       });
       await refresh(projectId);
     } catch (err) {
@@ -869,6 +1064,36 @@ function App() {
     });
   }
 
+  // Individual candidate checkbox toggle: safely leverages updateSelectionRange or updateTopN(0)
+  // ensuring the backend database remains 100% authoritative.
+  function toggleCandidateSelection(candidate: Candidate) {
+    if (candidate.selected) {
+      if (selectedCount === 1) {
+        void updateTopN(0);
+      } else if (candidate.rank === rangeFrom && rangeTo !== null && rangeTo > rangeFrom) {
+        void updateSelectionRange(rangeFrom + 1, rangeToValue === null ? null : rangeTo);
+      } else if (candidate.rank === rangeTo && rangeTo !== null && rangeTo > rangeFrom) {
+        void updateSelectionRange(rangeFrom, rangeTo - 1);
+      } else {
+        void updateTopN(0);
+      }
+    } else {
+      if (selectedCount === 0) {
+        void updateSelectionRange(candidate.rank, candidate.rank);
+      } else {
+        const newFrom = Math.min(
+          candidate.rank,
+          Number.isInteger(rangeFrom) && rangeFrom >= 1 ? rangeFrom : candidate.rank
+        );
+        const newTo = Math.max(
+          candidate.rank,
+          Number.isInteger(rangeTo) && rangeTo >= 1 ? rangeTo : candidate.rank
+        );
+        void updateSelectionRange(newFrom, rangeToValue === null ? null : newTo);
+      }
+    }
+  }
+
   async function cutCandidate(candidateId: string) {
     if (!detail) return;
     // Immediate synchronous re-entrancy check: cannot start if batch cut is running or candidate is already in-flight
@@ -923,6 +1148,115 @@ function App() {
     }
   }
 
+  function openSingleClipStyleStudio(candidateId: string) {
+    setStyleStudioTargetCandidateId(candidateId);
+    setStyleStudioScope("target");
+    const currentFraming = (detail?.project.framingMode as "adaptive" | "original") || "adaptive";
+    setStyleStudioFraming(currentFraming === "original" ? "original" : "adaptive");
+    setStyleStudioCaption(detail?.project.captionStyle || "preset_minimal_capsule");
+    setStyleStudioOpen(true);
+  }
+
+  function openBulkStyleStudio() {
+    setStyleStudioTargetCandidateId(null);
+    setStyleStudioScope("selected");
+    const currentFraming = (detail?.project.framingMode as "adaptive" | "original") || "adaptive";
+    setStyleStudioFraming(currentFraming === "original" ? "original" : "adaptive");
+    setStyleStudioCaption(detail?.project.captionStyle || "preset_minimal_capsule");
+    setStyleStudioOpen(true);
+  }
+
+  async function applyStyleStudioAndRerender() {
+    if (!detail) return;
+    if (targetCandidateIds.length === 0) return;
+
+    // 1. Snapshot current output paths into previousRenderHistory for reversion
+    const nextHistory = new Map(previousRenderHistory);
+    for (const cid of targetCandidateIds) {
+      const clip = clipByCandidate.get(cid);
+      if (clip?.outputPath) {
+        nextHistory.set(cid, clip.outputPath);
+      }
+    }
+    setPreviousRenderHistory(nextHistory);
+
+    // 2. Persist updated framing and caption style to backend DB
+    try {
+      await invoke("update_project_style", {
+        projectId: detail.project.id,
+        captionStyle: styleStudioCaption,
+        framingMode: styleStudioFraming,
+      });
+    } catch (err) {
+      console.warn("[Style Studio] Failed to update project style in DB:", err);
+    }
+
+    // 3. Close Style Studio drawer immediately as required
+    setStyleStudioOpen(false);
+
+    // 4. Trigger rendering for target candidates
+    if (targetCandidateIds.length === 1) {
+      await cutCandidate(targetCandidateIds[0]);
+    } else {
+      if (isCuttingRef.current) {
+        console.warn("[Style Studio Guard] Batch cut operation already in progress. Ignoring duplicate invocation.");
+        return;
+      }
+      isCuttingRef.current = true;
+      setBusy("cut");
+      setError(null);
+      try {
+        for (const cid of targetCandidateIds) {
+          setRenderingCandidateId(cid);
+          activeCuttingCandidatesRef.current.add(cid);
+          try {
+            await invoke<string>("render_flat_clip_for_candidate", { candidateId: cid });
+          } finally {
+            activeCuttingCandidatesRef.current.delete(cid);
+          }
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        isCuttingRef.current = false;
+        activeCuttingCandidatesRef.current.clear();
+        setRenderingCandidateId(null);
+        setBusy("idle");
+        await refresh(detail.project.id);
+      }
+    }
+  }
+
+  async function restorePreviousVersion() {
+    if (!detail) return;
+    const candidatesToRestore = targetCandidateIds.filter((id) => previousRenderHistory.has(id));
+    if (candidatesToRestore.length === 0) return;
+
+    setBusy("cut");
+    setError(null);
+    try {
+      for (const cid of candidatesToRestore) {
+        const prevPath = previousRenderHistory.get(cid);
+        if (prevPath) {
+          try {
+            await invoke("restore_clip_output_path", {
+              candidateId: cid,
+              outputPath: prevPath,
+            });
+          } catch (err) {
+            console.warn("[Style Studio] Failed to restore clip output path:", err);
+          }
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy("idle");
+      await refresh(detail.project.id);
+      setStyleStudioOpen(false);
+    }
+  }
+
   if (isOnboarded === null) {
     return (
       <div className="onboarding-loading" style={{ display: 'grid', placeItems: 'center', height: '100vh', background: 'var(--bg-base)' }}>
@@ -963,295 +1297,255 @@ function App() {
             title="Go to Home Dashboard"
           >
             <div className="brand-mark">
-              <Clapperboard size={20} />
+              <Scissors size={18} className="brand-icon" />
             </div>
-            <div>
-              <h1>AutoShorts</h1>
-              <p>Long recording in. Short clips out.</p>
+            <div className="brand-text">
+              <h1 className="brand-title">AutoShorts</h1>
+              <p className="brand-subtitle">AI Video Clipper</p>
             </div>
           </div>
 
-          <button className="primary-action" onClick={importMedia} disabled={busy !== "idle"}>
-            {busy === "import" ? <Loader2 className="spin" size={18} /> : <FileVideo size={18} />}
-            Import recording
-          </button>
-          <button 
-            className="secondary-action" 
-            onClick={() => setYoutubeModalOpen(true)} 
-            disabled={busy !== "idle" || !environment?.hasYtdlp}
-            title={!environment?.hasYtdlp ? "Please install yt-dlp to use this feature" : "Download a video from YouTube"}
-            style={{ width: "100%", padding: "0.75rem", borderRadius: "10px", marginTop: "0.5rem", display: "flex", gap: "0.5rem", alignItems: "center", justifyContent: "center", border: "1px solid var(--border)", background: "transparent", color: "var(--foreground)", cursor: "pointer", fontSize: "0.95rem" }}
-          >
-            <Youtube size={18} />
-            Import from YouTube
-          </button>
-
-          <section className="project-list" aria-label="Projects">
+          <nav className="sidebar-nav">
             <button
-              className={`project-row ${!detail ? "active" : ""}`}
+              type="button"
+              className={`nav-item ${detail === null ? "active" : ""}`}
               onClick={() => setDetail(null)}
+              title="All Projects Dashboard"
             >
-              <Clapperboard size={15} />
-              <span>All Projects</span>
-              <ChevronRight size={14} />
+              <FolderOpen size={16} className="nav-icon" />
+              <span className="nav-label">All Projects</span>
+              <span className="nav-count">{projects.length}</span>
             </button>
+          </nav>
 
-            {projects.map((project) => (
-              <button
-                key={project.id}
-                className={`project-row ${detail?.project.id === project.id ? "active" : ""}`}
-                onClick={() => void selectProject(project.id)}
-              >
-                <FileVideo size={15} />
-                <span>{project.name || fileName(project.sourcePath)}</span>
-                <ChevronRight size={14} />
-              </button>
-            ))}
-          </section>
+          <div className="sidebar-section-header">
+            <span className="sidebar-section-title">Recent</span>
+            {recentProjects.length > 0 && (
+              <span className="sidebar-section-count">{recentProjects.length}</span>
+            )}
+          </div>
+
+          <div className="recent-projects-list" aria-label="Recent Projects">
+            {recentProjects.map((project) => {
+              const isActive = detail?.project.id === project.id;
+              const name = project.name || fileName(project.sourcePath);
+              const dateObj = new Date(project.updatedAt || project.createdAt);
+              const dateStr = !isNaN(dateObj.getTime())
+                ? dateObj.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+                : "";
+
+              return (
+                <button
+                  key={project.id}
+                  type="button"
+                  className={`recent-project-item ${isActive ? "active" : ""}`}
+                  onClick={() => void selectProject(project.id)}
+                  title={name}
+                >
+                  <div className="recent-project-main">
+                    {isActive ? (
+                      <span className="active-dot" />
+                    ) : (
+                      <FileVideo size={13} className="recent-project-icon" />
+                    )}
+                    <span className="recent-project-name">{name}</span>
+                  </div>
+                  {dateStr && <span className="recent-project-time">{dateStr}</span>}
+                </button>
+              );
+            })}
+            {recentProjects.length === 0 && (
+              <div className="recent-projects-empty">No projects yet</div>
+            )}
+          </div>
+
+          <div className="sidebar-footer">
+            <div className="user-profile">
+              <div className="avatar-placeholder">AS</div>
+              <div className="user-details">
+                <span className="user-name">Local Studio</span>
+                <span className="user-status">v0.1.3 Desktop</span>
+              </div>
+            </div>
+            <button
+              type="button"
+              className={`sidebar-settings-btn ${showSettings ? "active" : ""}`}
+              onClick={() => setShowSettings(!showSettings)}
+              title="API & Model Settings"
+            >
+              <SlidersHorizontal size={15} />
+            </button>
+          </div>
         </aside>
 
         <section className="workspace">
           {detail ? (
             <>
-              <header className="topbar">
-                <div className="project-info">
-                  <div className="eyebrow">{detail.project.status}</div>
-                  <h2>{detail.project.name || fileName(detail.project.sourcePath)}</h2>
-                </div>
-                <div className="topbar-actions">
+              <header className="workspace-topbar">
+                <div className="workspace-topbar-left">
                   <button
+                    type="button"
+                    className="workspace-back-btn"
+                    onClick={() => setDetail(null)}
+                    title="Back to All Projects"
+                  >
+                    <ChevronLeft size={16} />
+                    <span>All Projects</span>
+                  </button>
+                  <div className="workspace-topbar-divider" />
+                  <div className="workspace-title-group">
+                    <h2 className="workspace-project-title">
+                      {detail.project.name || fileName(detail.project.sourcePath)}
+                    </h2>
+                    <span className={`status-chip status-${getProjectNormalizedStatus(detail.project.status)}`}>
+                      {getProjectStatusLabel(detail.project.status)}
+                    </span>
+                  </div>
+                </div>
+                <div className="workspace-topbar-actions">
+                  <button
+                    type="button"
                     className={`icon-button settings-toggle ${showSettings ? "active" : ""}`}
                     onClick={() => setShowSettings(!showSettings)}
                     title="API Settings"
                   >
-                    <SlidersHorizontal size={16} />
+                    <SlidersHorizontal size={15} />
                     <span>API Settings</span>
                   </button>
-                  <button className="icon-button" onClick={() => void refresh(detail.project.id)} title="Refresh">
-                    <RefreshCw size={18} />
+                  <button
+                    type="button"
+                    className="icon-button"
+                    onClick={() => void refresh(detail.project.id)}
+                    title="Refresh"
+                    disabled={busy !== "idle"}
+                  >
+                    <RefreshCw size={15} className={busy !== "idle" ? "spin" : ""} />
+                    <span>Refresh</span>
                   </button>
                 </div>
               </header>
 
               {showSettings && (
-                <div className="settings-panel">
-                  <div className="key-stack-horizontal">
-                    <label>
-                      <span>Transcription Engine</span>
-                      <select
-                        value={transcriptionEngine}
-                        onChange={(event) => setTranscriptionEngine(event.target.value as "deepgram" | "local")}
-                      >
-                        <option value="local">Local Whisper (Offline)</option>
-                        <option value="deepgram">Deepgram (Cloud)</option>
-                      </select>
-                      <span>LLM Engine</span>
-                      <select
-                        value={llmEngine}
-                        onChange={(event) => setLlmEngine(event.target.value as any)}
-                      >
-                        <option value="local">Ollama (Offline Local)</option>
-                        <option value="claude">Claude (Cloud)</option>
-                        <option value="deepseek">DeepSeek (Cloud)</option>
-                        <option value="gemini">Google Gemini (Cloud)</option>
-                        <option value="openai">OpenAI (Cloud)</option>
-                        <option value="openrouter">OpenRouter (Cloud)</option>
-                        <option value="groq">Groq (Cloud)</option>
-                      </select>
-                    </label>
-                    {transcriptionEngine === "deepgram" && (
-                      <label>
-                        <span>Deepgram API Key</span>
-                        <input
-                          value={deepgramKey}
-                          onChange={(event) => setDeepgramKey(event.target.value)}
-                          placeholder={environment?.hasDeepgramKey ? "Loaded from env" : "Optional (Deepgram API Key)"}
-                          type="password"
-                        />
-                      </label>
-                    )}
-                    {llmEngine === "claude" && (
-                      <label>
-                        <span>Claude API Key</span>
-                        <input
-                          value={anthropicKey}
-                          onChange={(event) => setAnthropicKey(event.target.value)}
-                          placeholder={environment?.hasAnthropicKey ? "Loaded from env" : "Optional (Claude API Key)"}
-                          type="password"
-                        />
-                      </label>
-                    )}
-                    {llmEngine === "deepseek" && (
-                      <>
-                        <label>
-                          <span>DeepSeek API Key</span>
-                          <input
-                            value={deepseekKey}
-                            onChange={(event) => setDeepseekKey(event.target.value)}
-                            placeholder={environment?.hasDeepseekKey ? "Loaded from env" : "Optional (DeepSeek API Key)"}
-                            type="password"
-                          />
-                        </label>
-                        <label>
-                          <span>DeepSeek Model</span>
-                          <input
-                            value={deepseekModel}
-                            onChange={(event) => setDeepseekModel(event.target.value)}
-                            placeholder="Optional (e.g. deepseek-chat, deepseek-v4-pro)"
-                            type="text"
-                          />
-                        </label>
-                      </>
-                    )}
-                    {llmEngine === "gemini" && (
-                      <label>
-                        <span>Gemini API Key</span>
-                        <input
-                          value={geminiKey}
-                          onChange={(event) => setGeminiKey(event.target.value)}
-                          placeholder={environment?.hasGeminiKey ? "Loaded from env" : "Optional (Gemini API Key)"}
-                          type="password"
-                        />
-                      </label>
-                    )}
-                    {llmEngine === "openai" && (
-                      <label>
-                        <span>OpenAI API Key</span>
-                        <input
-                          value={openaiKey}
-                          onChange={(event) => setOpenaiKey(event.target.value)}
-                          placeholder={environment?.hasOpenaiKey ? "Loaded from env" : "Optional (OpenAI API Key)"}
-                          type="password"
-                        />
-                      </label>
-                    )}
-                    {llmEngine === "openrouter" && (
-                      <>
-                        <label>
-                          <span>OpenRouter API Key</span>
-                          <input
-                            value={openrouterKey}
-                            onChange={(event) => setOpenrouterKey(event.target.value)}
-                            placeholder={environment?.hasOpenrouterKey ? "Loaded from env" : "Optional (OpenRouter API Key)"}
-                            type="password"
-                          />
-                        </label>
-                        <label>
-                          <span>OpenRouter Model</span>
-                          <input
-                            value={openrouterModel}
-                            onChange={(event) => setOpenrouterModel(event.target.value)}
-                            placeholder="Optional (e.g. google/gemini-2.5-flash, deepseek/deepseek-r1)"
-                            type="text"
-                          />
-                        </label>
-                      </>
-                    )}
-                    {llmEngine === "groq" && (
-                      <label>
-                        <span>Groq API Key</span>
-                        <input
-                          value={groqKey}
-                          onChange={(event) => setGroqKey(event.target.value)}
-                          placeholder={environment?.hasGroqKey ? "Loaded from env" : "Optional (Groq API Key)"}
-                          type="password"
-                        />
-                      </label>
-                    )}
-
-                    {llmEngine === "local" && (
-                      <label>
-                        <span>Ollama Model Name</span>
-                        <div style={{ display: 'flex', gap: '8px' }}>
-                          <input
-                            value={localLlmModel}
-                            onChange={(event) => setLocalLlmModel(event.target.value)}
-                            placeholder="e.g. llama3.2, qwen2.5:7b"
-                            type="text"
-                          />
-                          <button
-                            type="button"
-                            className="icon-button"
-                            style={{ minHeight: '36px', height: '36px' }}
-                            onClick={() => pullModelDirectly(localLlmModel)}
-                          >
-                            <Download size={14} /> Pull
-                          </button>
-                        </div>
-                      </label>
-                    )}
-
-                    <label>
-                      <span>YouTube Authentication Browser</span>
-                      <select
-                        value={youtubeBrowser}
-                        onChange={(event) => setYoutubeBrowser(event.target.value)}
-                      >
-                        <option value="auto">Auto (Try Unauthenticated, then Installed Browsers)</option>
-                        <option value="firefox">Firefox</option>
-                        <option value="chrome">Google Chrome</option>
-                        <option value="edge">Microsoft Edge</option>
-                        <option value="brave">Brave Browser</option>
-                        <option value="opera">Opera</option>
-                        <option value="safari">Safari (macOS)</option>
-                        <option value="none">None (Strictly Unauthenticated)</option>
-                        <option value="custom">Custom cookies.txt File</option>
-                      </select>
-                    </label>
-
-                    {youtubeBrowser === "custom" && (
-                      <label>
-                        <span>Custom cookies.txt Path</span>
-                        <input
-                          value={youtubeCookiesPath}
-                          onChange={(event) => setYoutubeCookiesPath(event.target.value)}
-                          placeholder="e.g. C:\Users\user\cookies.txt"
-                          type="text"
-                        />
-                      </label>
-                    )}
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '16px', borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
-                    <button
-                      type="button"
-                      className="icon-button"
-                      style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}
-                      onClick={() => {
-                        if (window.confirm("Are you sure you want to reset your configuration and restart onboarding from scratch?")) {
-                          localStorage.clear();
-                          window.location.reload();
-                        }
-                      }}
-                    >
-                      Reset App Configuration & Onboarding
-                    </button>
-                  </div>
-                </div>
+                <SettingsPanel
+                  transcriptionEngine={transcriptionEngine}
+                  setTranscriptionEngine={setTranscriptionEngine}
+                  llmEngine={llmEngine}
+                  setLlmEngine={setLlmEngine}
+                  deepgramKey={deepgramKey}
+                  setDeepgramKey={setDeepgramKey}
+                  anthropicKey={anthropicKey}
+                  setAnthropicKey={setAnthropicKey}
+                  deepseekKey={deepseekKey}
+                  setDeepseekKey={setDeepseekKey}
+                  deepseekModel={deepseekModel}
+                  setDeepseekModel={setDeepseekModel}
+                  geminiKey={geminiKey}
+                  setGeminiKey={setGeminiKey}
+                  openaiKey={openaiKey}
+                  setOpenaiKey={setOpenaiKey}
+                  openrouterKey={openrouterKey}
+                  setOpenrouterKey={setOpenrouterKey}
+                  openrouterModel={openrouterModel}
+                  setOpenrouterModel={setOpenrouterModel}
+                  groqKey={groqKey}
+                  setGroqKey={setGroqKey}
+                  localLlmModel={localLlmModel}
+                  setLocalLlmModel={setLocalLlmModel}
+                  pullModelDirectly={pullModelDirectly}
+                  youtubeBrowser={youtubeBrowser}
+                  setYoutubeBrowser={setYoutubeBrowser}
+                  youtubeCookiesPath={youtubeCookiesPath}
+                  setYoutubeCookiesPath={setYoutubeCookiesPath}
+                  environment={environment}
+                />
               )}
 
               {error && <div className="error-banner">{error}</div>}
 
-              <div className="pipeline-strip">
-                <PipelineStep icon={<AudioLines size={16} />} label="Transcript" done={Boolean(detail.transcript)} />
-                <PipelineStep icon={<Sparkles size={16} />} label="Moments" done={detail.candidates.length > 0} />
-                <PipelineStep icon={<Scissors size={16} />} label="Cut" done={selectedCount > 0 && selectedCutCount === selectedCount} />
-                <PipelineStep icon={<Captions size={16} />} label="Captions" done={selectedCount > 0 && selectedCaptionsCount === selectedCount} />
-                <PipelineStep icon={<Download size={16} />} label="Export" done={selectedCount > 0 && selectedCutCount === selectedCount} />
-              </div>
+              <nav className="workflow-nav" aria-label="Workflow Navigation">
+                <div className="workflow-nav-track">
+                  <div className={`workflow-pill ${detail.transcript ? "done" : ""} ${activePipelineStep === "Transcript" ? "active" : ""}`}>
+                    <span className="workflow-step-icon">
+                      {detail.transcript ? <Check size={13} strokeWidth={2.5} /> : <AudioLines size={14} />}
+                    </span>
+                    <span className="workflow-step-label">Transcript</span>
+                  </div>
+                  <div className="workflow-nav-arrow">→</div>
+                  <div className={`workflow-pill ${detail.candidates.length > 0 ? "done" : ""} ${activePipelineStep === "Moments" ? "active" : ""}`}>
+                    <span className="workflow-step-icon">
+                      {detail.candidates.length > 0 ? <Check size={13} strokeWidth={2.5} /> : <Sparkles size={14} />}
+                    </span>
+                    <span className="workflow-step-label">Moments</span>
+                  </div>
+                  <div className="workflow-nav-arrow">→</div>
+                  <div className={`workflow-pill ${selectedCount > 0 && selectedCutCount === selectedCount ? "done" : ""} ${activePipelineStep === "Cut" ? "active" : ""}`}>
+                    <span className="workflow-step-icon">
+                      {selectedCount > 0 && selectedCutCount === selectedCount ? <Check size={13} strokeWidth={2.5} /> : <Scissors size={14} />}
+                    </span>
+                    <span className="workflow-step-label">Cut</span>
+                  </div>
+                  <div className="workflow-nav-arrow">→</div>
+                  <div className={`workflow-pill ${selectedCount > 0 && selectedCaptionsCount === selectedCount ? "done" : ""} ${activePipelineStep === "Captions" ? "active" : ""}`}>
+                    <span className="workflow-step-icon">
+                      {selectedCount > 0 && selectedCaptionsCount === selectedCount ? <Check size={13} strokeWidth={2.5} /> : <Captions size={14} />}
+                    </span>
+                    <span className="workflow-step-label">Captions</span>
+                  </div>
+                  <div className="workflow-nav-arrow">→</div>
+                  <div className={`workflow-pill ${selectedCount > 0 && selectedCutCount === selectedCount && selectedCaptionsCount === selectedCount ? "done" : ""} ${activePipelineStep === "Export" ? "active" : ""}`}>
+                    <span className="workflow-step-icon">
+                      {selectedCount > 0 && selectedCutCount === selectedCount && selectedCaptionsCount === selectedCount ? <Check size={13} strokeWidth={2.5} /> : <Download size={14} />}
+                    </span>
+                    <span className="workflow-step-label">Export</span>
+                  </div>
+                </div>
+              </nav>
 
               <div className="work-grid">
                 <section className="panel transcript-panel">
-                  <div className="panel-heading">
-                    <div>
-                      <h3>Transcript</h3>
-                      <p>{transcript ? `${transcript.segments.length} segments` : "No transcript"}</p>
+                  <div className="panel-heading transcript-panel-heading">
+                    <div className="transcript-heading-info">
+                      <div className="transcript-title-row">
+                        <h3>Transcript</h3>
+                        <span className="transcript-count-chip">
+                          {transcript
+                            ? `${filteredTranscriptSegments.length}${transcriptSearch ? ` of ${transcript.segments.length}` : ""} segments`
+                            : "No transcript"}
+                        </span>
+                      </div>
+                      {transcript && (
+                        <div className="transcript-search-wrap">
+                          <Search size={13} className="transcript-search-icon" />
+                          <input
+                            type="text"
+                            placeholder="Search transcript..."
+                            value={transcriptSearch}
+                            onChange={(e) => setTranscriptSearch(e.target.value)}
+                            className="transcript-search-input"
+                          />
+                          {transcriptSearch && (
+                            <button
+                              type="button"
+                              className="transcript-search-clear"
+                              onClick={() => setTranscriptSearch("")}
+                              title="Clear search"
+                            >
+                              ×
+                            </button>
+                          )}
+                        </div>
+                      )}
                     </div>
-                    <div className="button-pair">
-                      <button onClick={transcribe} disabled={busy !== "idle" || !canTranscribe}>
-                        {busy === "transcribe" ? <Loader2 className="spin" size={16} /> : <AudioLines size={16} />}
-                        Transcribe
-                      </button>
-                    </div>
+                    <button
+                      type="button"
+                      className="transcribe-btn"
+                      onClick={transcribe}
+                      disabled={busy !== "idle" || !canTranscribe}
+                      title="Transcribe Audio"
+                    >
+                      {busy === "transcribe" ? <Loader2 className="spin" size={14} /> : <AudioLines size={14} />}
+                      <span>Transcribe</span>
+                    </button>
                   </div>
 
                   {!canTranscribe && (
@@ -1263,106 +1557,51 @@ function App() {
                   )}
 
                   <div className="transcript-list">
-                    {transcript?.segments.map((segment, index) => (
-                      <article key={`${segment.start}-${index}`} className="segment-row">
-                        <span>{formatTime(segment.start)}</span>
-                        <p>{segment.text}</p>
-                      </article>
-                    )) ?? <EmptyState icon={<AudioLines size={28} />} label="Transcript pending" />}
+                    {transcript ? (
+                      filteredTranscriptSegments.length > 0 ? (
+                        filteredTranscriptSegments.map((segment, index) => {
+                          const isSegmentSelected = selectedCandidates.some(
+                            (c) => segment.start < c.endSec && segment.end > c.startSec
+                          );
+                          return (
+                            <article
+                              key={`${segment.start}-${index}`}
+                              className={`segment-row ${isSegmentSelected ? "highlighted" : ""}`}
+                            >
+                              <div className="segment-meta">
+                                <span className="segment-timestamp">{formatTimestamp(segment.start)}</span>
+                                {segment.speaker && (
+                                  <span className="segment-speaker">{segment.speaker}</span>
+                                )}
+                              </div>
+                              <p className="segment-text">{segment.text}</p>
+                            </article>
+                          );
+                        })
+                      ) : (
+                        <EmptyState
+                          icon={<Search size={24} />}
+                          label={`No segments matching "${transcriptSearch}"`}
+                        />
+                      )
+                    ) : (
+                      <EmptyState icon={<AudioLines size={28} />} label="Transcript pending" />
+                    )}
                   </div>
                 </section>
 
                 <section className="panel candidate-panel">
-                  <div className="panel-heading">
-                    <div>
-                      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <div className="panel-heading candidate-panel-heading">
+                    <div className="candidate-heading-left">
+                      <div className="candidate-title-row">
                         <h3>Clip Candidates</h3>
-                        <span style={{ fontSize: "0.75rem", padding: "2px 8px", borderRadius: "12px", background: "rgba(142, 230, 199, 0.15)", color: "var(--accent-primary)", border: "1px solid rgba(142, 230, 199, 0.3)", fontWeight: 600 }}>
-                          v9.3 Multimodal (Visual ✅ | Audio ✅ | Temporal ✅)
-                        </span>
+                        <div className="candidate-count-chips">
+                          <span className="count-chip-selected">{selectedCount} Selected</span>
+                          <span className="count-chip-pool">{poolCount} Pool</span>
+                        </div>
                       </div>
-                      <p>
-                        {totalCandidateCount > 0
-                          ? `ALL CANDIDATES: ${totalCandidateCount} | SELECTED: ${selectedCount} | POOL: ${poolCount}`
-                          : "No candidates"}
-                      </p>
                     </div>
-                    <div className="button-pair">
-                      <select
-                        value={discoveryMode}
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          setDiscoveryMode(val);
-                          if (val === "window_scoring") {
-                            setRezeProvider("nvidia_diffusiongemma");
-                          } else {
-                            setRezeProvider("");
-                          }
-                        }}
-                        disabled={busy !== "idle"}
-                        title="Candidate discovery engine: Timestamp Generation is the production default; REZE Window Scoring is the experimental alternative. Re-run Find Viral Moments to compare."
-                        style={{
-                          fontSize: "0.8rem",
-                          padding: "6px 8px",
-                          borderRadius: "8px",
-                          border: "1px solid var(--border-color, #333)",
-                          background: "var(--bg-secondary, #1a1a1a)",
-                          color: "inherit",
-                        }}
-                      >
-                        <option value="timestamp_generation">Discovery: Timestamp Generation</option>
-                        <option value="window_scoring">Discovery: REZE Window Scoring</option>
-                      </select>
-                      <select
-                        value={scoringMode}
-                        onChange={(e) => setScoringMode(e.target.value as "legacy" | "autoclip")}
-                        disabled={busy !== "idle"}
-                        title="Scoring mode for candidate ranking & Top-N: Legacy keeps the multimodal composite score authoritative; AutoClip (NVIDIA) makes the holistic final_score authoritative (requires NVIDIA_API_KEY). Re-run Find Viral Moments to apply."
-                        style={{
-                          fontSize: "0.8rem",
-                          padding: "6px 8px",
-                          borderRadius: "8px",
-                          border: scoringMode === "autoclip" ? "1px solid rgba(94, 160, 255, 0.5)" : "1px solid var(--border-color, #333)",
-                          background: "var(--bg-secondary, #1a1a1a)",
-                          color: "inherit",
-                        }}
-                      >
-                        <option value="legacy">Scoring: Legacy</option>
-                        <option value="autoclip">Scoring: AutoClip (NVIDIA)</option>
-                      </select>
-                      <button onClick={cutSelected} disabled={busy !== "idle" || selectedCount === 0 || !environment?.hasFfmpeg}>
-                        {busy === "cut" ? <Loader2 className="spin" size={16} /> : <Scissors size={16} />}
-                        Cut Selected ({selectedCount})
-                      </button>
-                      <button onClick={() => void moments(false)} disabled={busy !== "idle" || !detail.transcript || !canUseDiscoveryLlm}>
-                        {busy === "moments" ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
-                        Find Viral Moments
-                      </button>
-                    </div>
-                  </div>
-
-                  {scoringMode === "autoclip" && environment !== null && !environment.hasNvidiaKey && (
-                    <div className="api-warning">
-                      ⚠️ AutoClip Scoring (NVIDIA) is the active scoring mode but NVIDIA_API_KEY is missing. Find Viral Moments will report a configuration error — it will not silently fall back to Legacy Scoring. Configure the key or switch the scoring mode back to Legacy.
-                    </div>
-                  )}
-
-                  {!canUseDiscoveryLlm && (
-                    <div className="api-warning">
-                      {isRezeMode
-                        ? "⚠️ NVIDIA API Key is required for REZE Window Scoring (DiffusionGemma). Please ensure NVIDIA_API_KEY is configured in your .env or environment."
-                        : (effectiveTimestampEngine === "local"
-                            ? "⚠️ Ollama local server is not running at http://localhost:11434. Moment detection will not work."
-                            : `⚠️ ${effectiveTimestampEngine === "claude" ? "Claude" :
-                              effectiveTimestampEngine === "gemini" ? "Gemini" :
-                              effectiveTimestampEngine === "openai" ? "OpenAI" :
-                              effectiveTimestampEngine === "groq" ? "Groq" : "DeepSeek"
-                            } API Key is missing. Viral moment identification will not work. Please add your key in API Settings.`)}
-                    </div>
-                  )}
-
-                  {totalCandidateCount > 0 && (
-                    <div className="candidate-toolbar">
+                    <div className="candidate-heading-actions">
                       <div className="candidate-filter-tabs">
                         <button
                           type="button"
@@ -1387,20 +1626,51 @@ function App() {
                         </button>
                       </div>
 
-                      <div className="range-control">
+                      {selectedCutCount > 0 && (
+                        <button
+                          type="button"
+                          className="restyle-selected-btn"
+                          onClick={openBulkStyleStudio}
+                          disabled={busy !== "idle"}
+                          title="Restyle selected clips in Style Studio"
+                        >
+                          <SlidersHorizontal size={14} />
+                          <span>Restyle Selected ({selectedCutCount})</span>
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        className="cut-selected-btn"
+                        onClick={cutSelected}
+                        disabled={busy !== "idle" || selectedCount === 0 || !environment?.hasFfmpeg}
+                        title="Cut Selected"
+                      >
+                        {busy === "cut" ? <Loader2 className="spin" size={14} /> : <Scissors size={14} />}
+                        <span>Cut Selected ({selectedCount})</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Secondary Controls Row */}
+                  <div className="candidate-controls-row">
+                    <div className="candidate-controls-left">
+                      <div className="range-control-group">
                         <label className="range-field">
                           <span>From</span>
                           <input
                             type="number"
                             min="1"
-                            max={totalCandidateCount}
+                            max={totalCandidateCount || 1}
                             value={rangeFromValue}
                             onChange={(event) => {
                               setRangeFromValue(event.target.value);
-                              void updateSelectionRange(Number.parseInt(event.target.value, 10), rangeToValue === null ? null : Number.parseInt(rangeToValue, 10));
+                              void updateSelectionRange(
+                                Number.parseInt(event.target.value, 10),
+                                rangeToValue === null ? null : Number.parseInt(rangeToValue, 10)
+                              );
                             }}
                             onBlur={(event) => {
-                              // Clamp out-of-range / empty input on blur
                               const parsed = Number.parseInt(event.target.value, 10);
                               if (!Number.isInteger(parsed) || parsed < 1) {
                                 setRangeFromValue("1");
@@ -1418,16 +1688,18 @@ function App() {
                           <input
                             type="number"
                             min="1"
-                            max={totalCandidateCount}
+                            max={totalCandidateCount || 1}
                             value={rangeToValue ?? ""}
                             placeholder="Last"
                             onChange={(event) => {
                               const raw = event.target.value;
                               setRangeToValue(raw === "" ? null : raw);
-                              void updateSelectionRange(Number.parseInt(rangeFromValue, 10), raw === "" ? null : Number.parseInt(raw, 10));
+                              void updateSelectionRange(
+                                Number.parseInt(rangeFromValue, 10),
+                                raw === "" ? null : Number.parseInt(raw, 10)
+                              );
                             }}
                             onBlur={(event) => {
-                              // Clamp out-of-range input on blur; empty stays "Last"
                               const parsed = Number.parseInt(event.target.value, 10);
                               if (Number.isInteger(parsed) && parsed > totalCandidateCount) {
                                 setRangeToValue(String(totalCandidateCount));
@@ -1449,12 +1721,15 @@ function App() {
                         >
                           Last
                         </button>
+                      </div>
+
+                      <div className="topn-control-group">
                         <label className="range-field">
                           <span>Top N</span>
                           <input
                             type="number"
                             min="0"
-                            max={totalCandidateCount}
+                            max={totalCandidateCount || 1}
                             value={topNValue}
                             placeholder="—"
                             onChange={(event) => {
@@ -1477,13 +1752,59 @@ function App() {
                             title="Select the top N candidates by rank (backend-authoritative; 0 clears the selection)"
                           />
                         </label>
-                        <span
-                          className={`range-count ${rangeInputsValid ? "" : "invalid"}`}
-                          title="Derived selection count: end - start + 1"
-                        >
-                          {rangeInputsValid ? rangeSelectedCount : "—"}
-                        </span>
                       </div>
+                    </div>
+
+                    <div className="candidate-controls-right">
+                      <select
+                        value={discoveryMode}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setDiscoveryMode(val);
+                          if (val === "window_scoring") {
+                            setRezeProvider("nvidia_diffusiongemma");
+                          } else {
+                            setRezeProvider("");
+                          }
+                        }}
+                        disabled={busy !== "idle"}
+                        title="Candidate discovery engine: Timestamp Generation is the production default; REZE Window Scoring is the experimental alternative."
+                        className="discovery-mode-select"
+                      >
+                        <option value="timestamp_generation">Discovery: Timestamp</option>
+                        <option value="window_scoring">Discovery: REZE Window</option>
+                      </select>
+
+                      <button
+                        type="button"
+                        className="find-moments-btn"
+                        onClick={() => void moments(false)}
+                        disabled={busy !== "idle" || !detail.transcript || !canUseDiscoveryLlm}
+                        title="Find Viral Moments"
+                      >
+                        {busy === "moments" ? <Loader2 className="spin" size={14} /> : <Sparkles size={14} />}
+                        <span>Find Viral Moments</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {scoringMode === "autoclip" && environment !== null && !environment.hasNvidiaKey && (
+                    <div className="api-warning">
+                      ⚠️ AutoClip Scoring (NVIDIA) is the active scoring mode but NVIDIA_API_KEY is missing. Find Viral Moments will report a configuration error — it will not silently fall back to Legacy Scoring. Configure the key or switch the scoring mode back to Legacy.
+                    </div>
+                  )}
+
+                  {!canUseDiscoveryLlm && (
+                    <div className="api-warning">
+                      {isRezeMode
+                        ? "⚠️ NVIDIA API Key is required for REZE Window Scoring (DiffusionGemma). Please ensure NVIDIA_API_KEY is configured in your .env or environment."
+                        : (effectiveTimestampEngine === "local"
+                            ? "⚠️ Ollama local server is not running at http://localhost:11434. Moment detection will not work."
+                            : `⚠️ ${effectiveTimestampEngine === "claude" ? "Claude" :
+                              effectiveTimestampEngine === "gemini" ? "Gemini" :
+                              effectiveTimestampEngine === "openai" ? "OpenAI" :
+                              effectiveTimestampEngine === "groq" ? "Groq" : "DeepSeek"
+                            } API Key is missing. Viral moment identification will not work. Please add your key in API Settings.`)}
                     </div>
                   )}
 
@@ -1492,137 +1813,107 @@ function App() {
                       const clip = clipByCandidate.get(candidate.id);
                       const isCut = clip?.status === "done" && Boolean(clip.outputPath);
                       return (
-                        <article key={candidate.id} className={`candidate-card ${candidate.selected ? "selected" : ""}`}>
-                          {/* 9:16 portrait mockup preview placeholder representing vertical formats */}
-                          <div className="portrait-preview-container">
-                            <div className="portrait-preview-mock">
-                              {isCut ? (
-                                <div className="mock-video-active">
-                                  <Play size={20} className="play-icon-mock" />
-                                </div>
-                              ) : (
-                                <div className="mock-video-inactive">
-                                  <span>9:16</span>
-                                </div>
+                        <article
+                          key={candidate.id}
+                          className={`candidate-card ${candidate.selected ? "selected" : ""}`}
+                        >
+                          <div className="candidate-card-header">
+                            <div className="candidate-card-header-left">
+                              <label
+                                className="candidate-checkbox-label"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <input
+                                  type="checkbox"
+                                  className="candidate-checkbox"
+                                  checked={candidate.selected}
+                                  onChange={() => toggleCandidateSelection(candidate)}
+                                  disabled={busy !== "idle" && busy !== "clipCount"}
+                                  title={candidate.selected ? "Deselect candidate" : "Select candidate"}
+                                />
+                                <span className="candidate-rank-badge">#{candidate.rank}</span>
+                              </label>
+                              <span className="candidate-timerange">
+                                {formatTimestamp(candidate.startSec)} – {formatTimestamp(candidate.endSec)}
+                              </span>
+                            </div>
+
+                            <div className="candidate-card-header-right">
+                              {(() => {
+                                const scoreSource = candidateScoreSource(candidate);
+                                if (scoreSource === "llm") {
+                                  return (
+                                    <span className="provenance-chip autoclip">
+                                      AutoClip Score
+                                    </span>
+                                  );
+                                }
+                                return (
+                                  <span className="provenance-chip multimodal">
+                                    Multimodal
+                                  </span>
+                                );
+                              })()}
+                              <span className="candidate-score-pct">
+                                {Math.round(candidate.score * 100)}% Match
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="candidate-card-body">
+                            <h4 className="candidate-hook">{candidate.hook}</h4>
+                            <p className="candidate-rationale">{candidate.rationale}</p>
+                          </div>
+
+                          <div className="candidate-card-footer">
+                            <div className="candidate-footer-status">
+                              <span className={`clip-status-indicator ${isCut ? "ready" : clip?.status === "error" ? "error" : "pending"}`}>
+                                <span className="status-dot" />
+                                {isCut ? "Cut ready" : clip?.status === "error" ? "Cut failed" : clip?.status === "rendering" ? "Rendering" : "Pending"}
+                              </span>
+                              {clip?.outputPath && (
+                                <span className="clip-output-path" title={clip.outputPath}>
+                                  {fileName(clip.outputPath)}
+                                </span>
                               )}
                             </div>
-                            <div className="candidate-rank">
-                              <span>#{candidate.rank}</span>
-                              {candidate.selected && <Check size={14} />}
-                            </div>
-                          </div>
 
-                          <div className="candidate-body">
-                            <div className="candidate-meta">
-                              <span>{formatTime(candidate.startSec)} - {formatTime(candidate.endSec)}</span>
-                              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                                {candidate.selected ? (
-                                  <span style={{ fontSize: "0.68rem", padding: "1px 6px", borderRadius: "8px", background: "rgba(142, 230, 199, 0.2)", color: "var(--accent-primary)", border: "1px solid rgba(142, 230, 199, 0.4)", fontWeight: 700 }}>
-                                    ★ Selected
-                                  </span>
-                                ) : (
-                                  <span style={{ fontSize: "0.68rem", padding: "1px 6px", borderRadius: "8px", background: "rgba(255, 255, 255, 0.05)", color: "var(--text-muted)", border: "1px solid rgba(255, 255, 255, 0.1)" }}>
-                                    Pool
-                                  </span>
-                                )}
-                                {candidate.rationale.includes("[v9.2 Fallback]") ? (
-                                  <span style={{ fontSize: "0.68rem", padding: "1px 6px", borderRadius: "8px", background: "rgba(255, 179, 71, 0.15)", color: "#ffb347", border: "1px solid rgba(255, 179, 71, 0.3)" }}>
-                                    v9.2 Fallback
-                                  </span>
-                                ) : (
-                                  <span style={{ fontSize: "0.68rem", padding: "1px 6px", borderRadius: "8px", background: "rgba(142, 230, 199, 0.15)", color: "var(--accent-primary)", border: "1px solid rgba(142, 230, 199, 0.3)" }}>
-                                    ✨ Multimodal
-                                  </span>
-                                )}
-                                {(() => {
-                                  const scoreSource = candidateScoreSource(candidate);
-                                  if (scoreSource === "llm") {
-                                    return (
-                                      <span style={{ fontSize: "0.68rem", padding: "1px 6px", borderRadius: "8px", background: "rgba(94, 160, 255, 0.15)", color: "#7fb0ff", border: "1px solid rgba(94, 160, 255, 0.35)" }}>
-                                        AutoClip Score
-                                      </span>
-                                    );
-                                  }
-                                  if (scoreSource === "fallback") {
-                                    return (
-                                      <span style={{ fontSize: "0.68rem", padding: "1px 6px", borderRadius: "8px", background: "rgba(255, 120, 120, 0.12)", color: "#ff8f8f", border: "1px solid rgba(255, 120, 120, 0.3)" }}>
-                                        Unscored (fallback)
-                                      </span>
-                                    );
-                                  }
-                                  return null;
-                                })()}
-                                <span className="candidate-score">{Math.round(candidate.score * 100)}% Match</span>
-                              </div>
-                            </div>
-                            <h4>{candidate.hook}</h4>
-                            <p className="candidate-rationale">{candidate.rationale}</p>
-
-                            <div className="candidate-actions">
-                              <span className={`clip-status ${isCut ? "ready" : clip?.status === "error" ? "error" : ""}`}>
-                                {isCut ? "Cut ready" : clip?.status === "error" ? "Cut failed" : clip?.status ?? "Pending"}
-                              </span>
+                            <div className="candidate-footer-actions">
+                              {isCut && (
+                                <button
+                                  type="button"
+                                  className="candidate-action-restyle-btn"
+                                  onClick={() => openSingleClipStyleStudio(candidate.id)}
+                                  disabled={busy !== "idle"}
+                                  title="Restyle this clip in Style Studio"
+                                >
+                                  <SlidersHorizontal size={13} />
+                                  <span>Restyle</span>
+                                </button>
+                              )}
                               <button
-                                className="cut-button"
+                                type="button"
+                                className={`candidate-action-cut-btn ${isCut ? "recut" : ""}`}
                                 onClick={() => void cutCandidate(candidate.id)}
                                 disabled={busy !== "idle" || !environment?.hasFfmpeg}
+                                title={isCut ? "Re-cut this clip" : "Cut clip"}
                               >
                                 {renderingCandidateId === candidate.id ? (
-                                  <Loader2 className="spin" size={14} />
+                                  <Loader2 className="spin" size={13} />
                                 ) : (
-                                  <Scissors size={14} />
+                                  <Scissors size={13} />
                                 )}
-                                {renderingCandidateId === candidate.id ? "Cutting..." : isCut ? "Re-cut" : "Cut"}
+                                <span>{renderingCandidateId === candidate.id ? "Cutting..." : isCut ? "Re-cut" : "Cut"}</span>
                               </button>
                             </div>
-                            {clip?.outputPath && <div className="output-path">{clip.outputPath}</div>}
-                            {clip?.captionAssPath && (
-                              <div className="output-path" style={{ background: "rgba(142, 230, 199, 0.05)", borderColor: "var(--accent-primary)", color: "var(--accent-primary)", marginTop: "4px" }}>
-                                Subtitles: {clip.captionAssPath}
-                              </div>
-                            )}
-                            {clip?.appliedFeatures && (() => {
-                              try {
-                                const f = JSON.parse(clip.appliedFeatures) as {
-                                  smartPacing?: boolean;
-                                  hookEndingOptimization?: boolean;
-                                  audioIntelligence?: boolean;
-                                  captionIntelligence?: boolean;
-                                };
-                                const badges: Array<{ label: string; color: string }> = [
-                                  f.hookEndingOptimization ? { label: "✂ Hook/End", color: "#7eb8f7" } : null,
-                                  f.smartPacing            ? { label: "⚡ Pacing",  color: "#f7c77e" } : null,
-                                  f.audioIntelligence      ? { label: "🎚 Audio",   color: "#8ee6c7" } : null,
-                                  f.captionIntelligence    ? { label: "💬 Caption Intelligence", color: "#c084fc" } : null,
-                                ].filter((b): b is { label: string; color: string } => b !== null);
-                                if (badges.length === 0) return null;
-                                return (
-                                  <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", marginTop: "6px" }}>
-                                    {badges.map((b) => (
-                                      <span
-                                        key={b.label}
-                                        title={`Feature applied to this clip: ${b.label}`}
-                                        style={{
-                                          fontSize: "0.68rem",
-                                          padding: "1px 7px",
-                                          borderRadius: "8px",
-                                          background: `${b.color}22`,
-                                          color: b.color,
-                                          border: `1px solid ${b.color}55`,
-                                          fontWeight: 600,
-                                        }}
-                                      >
-                                        {b.label}
-                                      </span>
-                                    ))}
-                                  </div>
-                                );
-                              } catch {
-                                return null;
-                              }
-                            })()}
-                            {clip?.renderLog && <div className="render-log">{clip.renderLog}</div>}
                           </div>
+
+                          {clip?.captionAssPath && (
+                            <div className="candidate-subtitles-info">
+                              Subtitles: {fileName(clip.captionAssPath)}
+                            </div>
+                          )}
+                          {clip?.renderLog && <div className="render-log">{clip.renderLog}</div>}
                         </article>
                       );
                     })}
@@ -1636,62 +1927,253 @@ function App() {
             </>
           ) : (
             <div className="home-dashboard">
+              {showSettings && (
+                <SettingsPanel
+                  transcriptionEngine={transcriptionEngine}
+                  setTranscriptionEngine={setTranscriptionEngine}
+                  llmEngine={llmEngine}
+                  setLlmEngine={setLlmEngine}
+                  deepgramKey={deepgramKey}
+                  setDeepgramKey={setDeepgramKey}
+                  anthropicKey={anthropicKey}
+                  setAnthropicKey={setAnthropicKey}
+                  deepseekKey={deepseekKey}
+                  setDeepseekKey={setDeepseekKey}
+                  deepseekModel={deepseekModel}
+                  setDeepseekModel={setDeepseekModel}
+                  geminiKey={geminiKey}
+                  setGeminiKey={setGeminiKey}
+                  openaiKey={openaiKey}
+                  setOpenaiKey={setOpenaiKey}
+                  openrouterKey={openrouterKey}
+                  setOpenrouterKey={setOpenrouterKey}
+                  openrouterModel={openrouterModel}
+                  setOpenrouterModel={setOpenrouterModel}
+                  groqKey={groqKey}
+                  setGroqKey={setGroqKey}
+                  localLlmModel={localLlmModel}
+                  setLocalLlmModel={setLocalLlmModel}
+                  pullModelDirectly={pullModelDirectly}
+                  youtubeBrowser={youtubeBrowser}
+                  setYoutubeBrowser={setYoutubeBrowser}
+                  youtubeCookiesPath={youtubeCookiesPath}
+                  setYoutubeCookiesPath={setYoutubeCookiesPath}
+                  environment={environment}
+                />
+              )}
+
+              {error && <div className="error-banner">{error}</div>}
+
               <header className="home-header">
-                <div>
-                  <h2>All Projects</h2>
-                  <p>Select a project below or import a new media file to get started.</p>
+                <div className="home-header-title-block">
+                  <h2 className="home-title">All Projects</h2>
+                  <p className="home-subtitle">Manage and open your video projects.</p>
                 </div>
-                <button className="primary-action compact" onClick={importMedia} disabled={busy !== "idle"}>
-                  {busy === "import" ? <Loader2 className="spin" size={18} /> : <FileVideo size={18} />}
-                  Import recording
-                </button>
-                <button 
-                  className="secondary-action compact" 
-                  onClick={() => setYoutubeModalOpen(true)} 
-                  disabled={busy !== "idle" || !environment?.hasYtdlp}
-                  title={!environment?.hasYtdlp ? "Please install yt-dlp to use this feature" : "Download a video from YouTube"}
-                  style={{ display: "flex", gap: "0.5rem", alignItems: "center", padding: "0.5rem 1rem", borderRadius: "8px", border: "1px solid var(--border)", background: "transparent", color: "var(--foreground)", cursor: "pointer", fontSize: "0.95rem", marginLeft: "1rem" }}
-                >
-                  <Youtube size={18} />
-                  Import from YouTube
-                </button>
+                <div className="home-header-actions">
+                  <button
+                    type="button"
+                    className="primary-action compact"
+                    onClick={importMedia}
+                    disabled={busy !== "idle"}
+                  >
+                    {busy === "import" ? <Loader2 className="spin" size={16} /> : <Upload size={16} />}
+                    <span>Import Recording</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-action-outlined compact"
+                    onClick={() => setYoutubeModalOpen(true)}
+                    disabled={busy !== "idle" || !environment?.hasYtdlp}
+                    title={!environment?.hasYtdlp ? "Please install yt-dlp to use this feature" : "Download a video from YouTube"}
+                  >
+                    <Youtube size={16} />
+                    <span>Import from YouTube</span>
+                  </button>
+                </div>
               </header>
 
-              {projects.length > 0 ? (
-                <div className="projects-grid">
-                  {projects.map((project) => {
-                    const name = project.name || fileName(project.sourcePath);
-                    return (
-                      <article key={project.id} className="project-card">
-                        <div className="project-card-header">
-                          <FileVideo size={24} className="project-card-icon" />
-                          <span className="project-card-status">{project.status}</span>
-                        </div>
-                        <h3 className="project-card-title">{name}</h3>
-                        <div className="project-card-meta">
-                          <span>Duration: {project.sourceDuration ? formatTime(project.sourceDuration) : "Probing..."}</span>
-                          <span>Created: {new Date(project.createdAt).toLocaleDateString()}</span>
-                        </div>
-                        <div className="project-card-actions">
-                          <button className="action-btn open-btn" onClick={() => void selectProject(project.id)}>
-                            Open
-                          </button>
-                          <button className="action-btn rename-btn" onClick={() => void renameProject(project.id)}>
-                            Rename
-                          </button>
-                          <button className="action-btn delete-btn" onClick={() => void deleteProject(project.id)}>
-                            Delete
-                          </button>
-                        </div>
-                      </article>
-                    );
-                  })}
+              <div className="dashboard-filter-bar">
+                <div className="search-input-wrapper">
+                  <Search size={15} className="search-icon-inline" />
+                  <input
+                    type="text"
+                    placeholder="Search projects..."
+                    value={projectSearch}
+                    onChange={(e) => setProjectSearch(e.target.value)}
+                  />
+                  {projectSearch && (
+                    <button
+                      type="button"
+                      className="clear-search-btn"
+                      onClick={() => setProjectSearch("")}
+                      title="Clear search"
+                    >
+                      ×
+                    </button>
+                  )}
                 </div>
+
+                <div className="pill-group" role="tablist">
+                  <button
+                    type="button"
+                    className={`pill-btn ${statusFilter === "all" ? "active" : ""}`}
+                    onClick={() => setStatusFilter("all")}
+                  >
+                    All <span className="pill-count">{projectCounts.all}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`pill-btn ${statusFilter === "ready" ? "active" : ""}`}
+                    onClick={() => setStatusFilter("ready")}
+                  >
+                    Ready <span className="pill-count">{projectCounts.ready}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`pill-btn ${statusFilter === "processing" ? "active" : ""}`}
+                    onClick={() => setStatusFilter("processing")}
+                  >
+                    Processing <span className="pill-count">{projectCounts.processing}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`pill-btn ${statusFilter === "failed" ? "active" : ""}`}
+                    onClick={() => setStatusFilter("failed")}
+                  >
+                    Failed <span className="pill-count">{projectCounts.failed}</span>
+                  </button>
+                </div>
+
+                <div className="sort-dropdown-wrapper">
+                  <ArrowUpDown size={14} className="sort-icon" />
+                  <select
+                    value={sortOption}
+                    onChange={(e) => setSortOption(e.target.value as "recent" | "date" | "duration")}
+                    className="sort-select"
+                  >
+                    <option value="recent">Recently Opened</option>
+                    <option value="date">Date Created</option>
+                    <option value="duration">Duration</option>
+                  </select>
+                </div>
+              </div>
+
+              {projects.length > 0 ? (
+                filteredProjects.length > 0 ? (
+                  <div className="projects-grid">
+                    {filteredProjects.map((project) => {
+                      const name = project.name || fileName(project.sourcePath);
+                      const statusCategory = getProjectNormalizedStatus(project.status);
+                      const statusLabel = getProjectStatusLabel(project.status);
+                      const createdDate = new Date(project.createdAt);
+                      const formattedDate = !isNaN(createdDate.getTime())
+                        ? createdDate.toLocaleDateString(undefined, {
+                            month: "short",
+                            day: "numeric",
+                            year: "numeric",
+                          })
+                        : "Unknown";
+
+                      return (
+                        <article key={project.id} className="project-card">
+                          <div
+                            className="project-card-thumbnail"
+                            onClick={() => void selectProject(project.id)}
+                            title={`Open ${name}`}
+                          >
+                            <div className="thumbnail-placeholder">
+                              <Film size={28} className="thumbnail-icon" />
+                            </div>
+                            <span className="duration-badge">
+                              {project.sourceDuration ? formatTime(project.sourceDuration) : "Probing..."}
+                            </span>
+                          </div>
+
+                          <div className="project-card-header">
+                            <h3
+                              className="project-card-title"
+                              onClick={() => void selectProject(project.id)}
+                              title={name}
+                            >
+                              {name}
+                            </h3>
+                            <span className={`status-chip ${statusCategory}`}>
+                              <span className="status-dot" />
+                              {statusLabel}
+                            </span>
+                          </div>
+
+                          <div className="project-card-meta">
+                            <span className="meta-item" title="Duration">
+                              <Clock size={12} />
+                              {project.sourceDuration ? formatTime(project.sourceDuration) : "Probing..."}
+                            </span>
+                            <span className="meta-item" title="Created date">
+                              <Calendar size={12} />
+                              {formattedDate}
+                            </span>
+                          </div>
+
+                          <div className="project-card-actions">
+                            <button
+                              type="button"
+                              className="action-btn open-btn"
+                              onClick={() => void selectProject(project.id)}
+                            >
+                              Open
+                            </button>
+                            <button
+                              type="button"
+                              className="action-btn rename-btn"
+                              onClick={() => void renameProject(project.id)}
+                            >
+                              Rename
+                            </button>
+                            <button
+                              type="button"
+                              className="action-btn delete-btn"
+                              onClick={() => void deleteProject(project.id)}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="empty-dashboard-state">
+                    <Search size={44} className="empty-state-icon" />
+                    <h3>No matching projects</h3>
+                    <p>No projects match your current search query or filter.</p>
+                    <button
+                      type="button"
+                      className="action-btn rename-btn"
+                      style={{ marginTop: "8px", padding: "0 16px" }}
+                      onClick={() => {
+                        setProjectSearch("");
+                        setStatusFilter("all");
+                      }}
+                    >
+                      Clear filters
+                    </button>
+                  </div>
+                )
               ) : (
                 <div className="empty-dashboard-state">
                   <Clapperboard size={48} className="empty-state-icon" />
                   <h3>No projects found</h3>
                   <p>Import your first recording to begin creating shorts.</p>
+                  <div style={{ marginTop: "12px", display: "flex", gap: "10px" }}>
+                    <button
+                      type="button"
+                      className="primary-action compact"
+                      onClick={importMedia}
+                      disabled={busy !== "idle"}
+                    >
+                      <Upload size={16} /> Import Recording
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -1717,161 +2199,617 @@ function App() {
         </div>
       </footer>
 
+      {styleStudioOpen && detail && (
+        <>
+          <div
+            className="style-studio-backdrop"
+            onClick={() => setStyleStudioOpen(false)}
+            title="Click to close Style Studio"
+          />
+          <aside className="style-studio-drawer" aria-label="Style Studio">
+            {/* Header */}
+            <div className="style-studio-header">
+              <div className="style-studio-header-left">
+                <h3 className="style-studio-title">Style Studio</h3>
+                <p className="style-studio-subtitle">
+                  Customize framing and captions without re-scoring.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="style-studio-close-btn"
+                onClick={() => setStyleStudioOpen(false)}
+                title="Close Style Studio"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Context Banner */}
+            <div className="style-studio-context-banner">
+              {styleStudioTargetCandidateId && targetCandidate ? (
+                <>
+                  <div className="style-studio-clip-badge">
+                    <span>Clip #{targetCandidate.rank} — {formatTimestamp(targetCandidate.startSec)}…{formatTimestamp(targetCandidate.endSec)}</span>
+                  </div>
+                  <div className="style-studio-hook-snippet" title={targetCandidate.hook}>
+                    {targetCandidate.hook}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="bulk-badge-row">
+                    <div className="bulk-count-badge">
+                      <Layers size={13} />
+                      <span>{targetCandidateIds.length} clips selected</span>
+                    </div>
+                  </div>
+                  <div className="bulk-ranks-list" title={targetCandidateIds.map(id => {
+                    const c = detail.candidates.find(cand => cand.id === id);
+                    return c ? `#${c.rank}` : null;
+                  }).filter(Boolean).join(", ")}>
+                    Clips {targetCandidateIds.map(id => {
+                      const c = detail.candidates.find(cand => cand.id === id);
+                      return c ? `#${c.rank}` : null;
+                    }).filter(Boolean).sort((a,b) => parseInt(a!.slice(1)) - parseInt(b!.slice(1))).join(", ")}
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* Scrollable Body */}
+            <div className="style-studio-body">
+              {/* Section 1: Framing */}
+              <section className="style-studio-section">
+                <h4 className="style-studio-section-title">Framing</h4>
+                <div className="style-studio-framing-grid">
+                  <div
+                    className={`style-studio-framing-card ${styleStudioFraming === "adaptive" ? "selected" : ""}`}
+                    onClick={() => setStyleStudioFraming("adaptive")}
+                  >
+                    <div className="style-studio-framing-top">
+                      <div className="framing-icon-box mint">
+                        <Crop size={16} />
+                      </div>
+                      <div className="card-indicator">
+                        {styleStudioFraming === "adaptive" ? (
+                          <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
+                        ) : (
+                          <div className="indicator-empty" />
+                        )}
+                      </div>
+                    </div>
+                    <span className="style-studio-card-title">Adaptive Framing</span>
+                    <p className="style-studio-card-desc">Dynamic speaker tracking and isolation</p>
+                  </div>
+
+                  <div
+                    className={`style-studio-framing-card ${styleStudioFraming === "original" ? "selected" : ""}`}
+                    onClick={() => setStyleStudioFraming("original")}
+                  >
+                    <div className="style-studio-framing-top">
+                      <div className="framing-icon-box">
+                        <Smartphone size={16} />
+                      </div>
+                      <div className="card-indicator">
+                        {styleStudioFraming === "original" ? (
+                          <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
+                        ) : (
+                          <div className="indicator-empty" />
+                        )}
+                      </div>
+                    </div>
+                    <span className="style-studio-card-title">Original 9:16</span>
+                    <p className="style-studio-card-desc">Fixed portrait framing, DualFrame where supported</p>
+                  </div>
+                </div>
+              </section>
+
+              {/* Section 2: Caption Style */}
+              <section className="style-studio-section">
+                <h4 className="style-studio-section-title">Caption Style</h4>
+                <div className="style-studio-caption-grid">
+                  {/* Clean */}
+                  <div
+                    className={`style-studio-caption-card ${
+                      styleStudioCaption === "preset_minimal_capsule" || styleStudioCaption === "preset_cinematic_vlog"
+                        ? "selected"
+                        : ""
+                    }`}
+                    onClick={() => setStyleStudioCaption("preset_minimal_capsule")}
+                  >
+                    <div className="style-studio-preview-box">
+                      <div className="preview-pill-clean">How sleep affects cortisol</div>
+                    </div>
+                    <span className="style-studio-card-title">Clean</span>
+                    <p className="style-studio-card-desc">Minimal centered</p>
+                  </div>
+
+                  {/* Bold */}
+                  <div
+                    className={`style-studio-caption-card ${
+                      styleStudioCaption === "preset_viral_bold" || styleStudioCaption === "preset_bhaukal_caption"
+                        ? "selected"
+                        : ""
+                    }`}
+                    onClick={() => setStyleStudioCaption("preset_viral_bold")}
+                  >
+                    <div className="style-studio-preview-box">
+                      <div className="preview-text-bold">HORMOZI VIRAL</div>
+                    </div>
+                    <span className="style-studio-card-title">Bold</span>
+                    <p className="style-studio-card-desc">Punchy uppercase</p>
+                  </div>
+
+                  {/* Word Highlight */}
+                  <div
+                    className={`style-studio-caption-card ${
+                      styleStudioCaption === "preset_mrbeast_pop" ||
+                      styleStudioCaption === "preset_dynamic_editorial" ||
+                      styleStudioCaption === "preset_t7"
+                        ? "selected"
+                        : ""
+                    }`}
+                    onClick={() => setStyleStudioCaption("preset_mrbeast_pop")}
+                  >
+                    <div className="style-studio-preview-box">
+                      <div className="preview-text-highlight">
+                        Morning <span className="word-accent">cortisol</span>
+                      </div>
+                    </div>
+                    <span className="style-studio-card-title">Highlight</span>
+                    <p className="style-studio-card-desc">Word accent</p>
+                  </div>
+                </div>
+
+                {/* Preset Chips */}
+                <div className="style-studio-presets-row">
+                  <span className="style-studio-presets-label">Preset Selector:</span>
+                  <div className="style-studio-presets-list">
+                    {CAPTION_PRESETS.map((preset) => (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        className={`style-studio-preset-chip ${styleStudioCaption === preset.id ? "active" : ""}`}
+                        onClick={() => setStyleStudioCaption(preset.id)}
+                      >
+                        {preset.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </section>
+
+              {/* Section 3: Scope Selection */}
+              <section className="style-studio-section">
+                <h4 className="style-studio-section-title">Apply To</h4>
+                <div className="style-studio-scope-row">
+                  {styleStudioTargetCandidateId && (
+                    <button
+                      type="button"
+                      className={`style-studio-scope-pill ${styleStudioScope === "target" ? "active" : ""}`}
+                      onClick={() => setStyleStudioScope("target")}
+                    >
+                      This clip
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className={`style-studio-scope-pill ${styleStudioScope === "selected" ? "active" : ""}`}
+                    onClick={() => setStyleStudioScope("selected")}
+                  >
+                    Selected clips ({selectedCandidates.length})
+                  </button>
+                  <button
+                    type="button"
+                    className={`style-studio-scope-pill ${styleStudioScope === "all" ? "active" : ""}`}
+                    onClick={() => setStyleStudioScope("all")}
+                  >
+                    All clips ({detail.candidates.length})
+                  </button>
+                </div>
+
+                {/* Warning note */}
+                <div className="style-studio-warning-box">
+                  <AlertTriangle size={15} />
+                  <span>
+                    Changes will affect rendered output. The previous successful render is retained until the new render completes.
+                  </span>
+                </div>
+              </section>
+
+              {/* Section 4: Summary & Recommendation */}
+              <section className="style-studio-section">
+                <h4 className="style-studio-section-title">Summary</h4>
+                <div className="style-studio-summary-card">
+                  <div className="style-studio-summary-row">
+                    <span className="style-studio-summary-label">Applying to</span>
+                    <span className="style-studio-summary-value">
+                      {styleStudioScope === "target" && targetCandidate
+                        ? `Clip #${targetCandidate.rank}`
+                        : styleStudioScope === "selected"
+                        ? `${targetCandidateIds.length} selected clips`
+                        : `All ${targetCandidateIds.length} clips in project`}
+                    </span>
+                  </div>
+                  <div className="style-studio-summary-row">
+                    <span className="style-studio-summary-label">Framing</span>
+                    <span className="style-studio-summary-value">
+                      {styleStudioFraming === "adaptive" ? "Adaptive Framing" : "Original 9:16"}
+                    </span>
+                  </div>
+                  <div className="style-studio-summary-row">
+                    <span className="style-studio-summary-label">Captions</span>
+                    <span className="style-studio-summary-value">
+                      {CAPTION_PRESETS.find(p => p.id === styleStudioCaption)?.name || styleStudioCaption}
+                    </span>
+                  </div>
+                  <div className="style-studio-summary-row">
+                    <span className="style-studio-summary-label">Estimated renders</span>
+                    <span className="style-studio-summary-value">
+                      {targetCandidateIds.length} {targetCandidateIds.length === 1 ? "clip" : "clips"}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="style-studio-recommendation-card">
+                  <Sparkles size={15} />
+                  <span>
+                    AI Recommendation: Adaptive Framing with high-contrast captions delivers highest completion rate on short-form platforms.
+                  </span>
+                </div>
+              </section>
+            </div>
+
+            {/* Footer */}
+            <div className="style-studio-footer">
+              <div className="style-studio-footer-actions">
+                <button
+                  type="button"
+                  className="style-studio-btn-restore"
+                  onClick={restorePreviousVersion}
+                  disabled={!hasPreviousVersion || busy !== "idle"}
+                  title={hasPreviousVersion ? "Restore previous render version" : "No previous render version stored"}
+                >
+                  <RotateCcw size={13} />
+                  <span>Restore Previous</span>
+                </button>
+                <button
+                  type="button"
+                  className="style-studio-btn-apply"
+                  onClick={applyStyleStudioAndRerender}
+                  disabled={busy !== "idle" || targetCandidateIds.length === 0 || !environment?.hasFfmpeg}
+                  title="Apply styles and re-render target clips"
+                >
+                  <span>Apply &amp; Re-render{targetCandidateIds.length > 1 ? ` (${targetCandidateIds.length})` : ""}</span>
+                  <ArrowRight size={14} />
+                </button>
+              </div>
+              <p className="style-studio-disclaimer">
+                Restyling changes caption appearance and framing only. Scoring, candidate ranking, and transcript are unchanged.
+              </p>
+            </div>
+          </aside>
+        </>
+      )}
+
       {showStyleModal && (
         <div className="style-modal-overlay">
           <div className="style-modal">
+            {/* Modal Header */}
             <div className="style-modal-header">
-              <h3>Choose Caption Style</h3>
-              <p>Select how your automated captions should look on the portrait short-form video clips.</p>
-            </div>
-
-            <div className="framing-section">
-              <div className="framing-section-title">Framing Mode</div>
-              <div className="framing-grid">
-                <div
-                  className={`framing-card ${selectedFramingMode === "original" ? "selected" : ""}`}
-                  onClick={() => setSelectedFramingMode("original")}
+              <div className="modal-header-left">
+                <button
+                  type="button"
+                  className="modal-back-btn"
+                  onClick={() => {
+                    setShowStyleModal(false);
+                    setMediaPathToImport(null);
+                  }}
+                  aria-label="Go back"
+                  title="Cancel and close"
                 >
-                  <div className="framing-card-title">Original 9:16</div>
-                  <div className="framing-card-desc">The unchanged pipeline — center-cropped 9:16 with DualFrame split-screen when two speakers appear close together.</div>
-                </div>
-                <div
-                  className={`framing-card ${selectedFramingMode === "adaptive" ? "selected" : ""}`}
-                  onClick={() => setSelectedFramingMode("adaptive")}
-                >
-                  <div className="framing-card-title">Adaptive Framing</div>
-                  <div className="framing-card-desc">Composition derived from the real footage — never split-screen. Two people who fit comfortably stay in one natural shot; subjects far apart get an active-speaker focus. Final canvas stays 9:16.</div>
+                  <ArrowLeft size={18} />
+                </button>
+                <div className="modal-header-text">
+                  <h1 className="style-modal-title">Configure &amp; Start Processing</h1>
+                  <p className="style-modal-subtitle">
+                    Choose your framing, captions, and scoring settings before AutoShorts processes this video.
+                  </p>
                 </div>
               </div>
-            </div>
-
-            <div className="framing-section">
-              <div className="framing-section-title">Scoring Mode</div>
-              <div className="framing-grid">
-                <div
-                  className={`framing-card ${scoringMode === "legacy" ? "selected" : ""}`}
-                  onClick={() => setScoringMode("legacy")}
-                >
-                  <div className="framing-card-title">Legacy Scoring</div>
-                  <div className="framing-card-desc">The original multimodal composite score stays authoritative for ranking and Top-N selection. No NVIDIA key required.</div>
-                </div>
-                <div
-                  className={`framing-card ${scoringMode === "autoclip" ? "selected" : ""}`}
-                  onClick={() => setScoringMode("autoclip")}
-                >
-                  <div className="framing-card-title">AutoClip Scoring (NVIDIA)</div>
-                  <div className="framing-card-desc">NVIDIA holistic final_score is authoritative: eligibility gate (≥ 0.65 by default), deterministic ranking and Top-N selection. Requires NVIDIA_API_KEY; failures show a clear error and never silently fall back to legacy.</div>
-                </div>
-              </div>
-              {scoringMode === "autoclip" && environment !== null && !environment.hasNvidiaKey && (
-                <div className="api-warning">
-                  ⚠️ AutoClip Scoring (NVIDIA) is selected but NVIDIA_API_KEY is missing. Configure it in your .env or environment, or switch back to Legacy Scoring — moment finding will report this error instead of falling back.
+              {mediaFilename && (
+                <div className="modal-media-chip" title={mediaPathToImport || ""}>
+                  <Film size={14} className="modal-media-chip-icon" />
+                  <span className="modal-media-chip-text">{mediaFilename}</span>
                 </div>
               )}
             </div>
 
-            <div className="style-grid">
-              <div
-                className={`style-card ${selectedStyle === "preset_viral_bold" ? "selected" : ""}`}
-                onClick={() => setSelectedStyle("preset_viral_bold")}
-              >
-                <div className="style-preview-box">
-                  <span className="preview-text-viral-bold">
-                    <span className="preview-word-highlight">HORMOZI</span> VIRAL
-                  </span>
+            {/* Scrollable Modal Body */}
+            <div className="style-modal-body">
+              {/* Section 1: Framing */}
+              <section className="modal-section">
+                <div className="modal-section-header">
+                  <h2 className="modal-section-title">Framing</h2>
+                  <span className="modal-section-step">Step 1 of 3</span>
                 </div>
-                <div className="style-card-title">Hormozi Viral</div>
-                <div className="style-card-desc">Bold uppercase font with high-impact neon green & yellow scale pop (Hormozi style).</div>
-              </div>
+                <div className="framing-grid">
+                  <div
+                    className={`framing-card ${selectedFramingMode === "adaptive" ? "selected" : ""}`}
+                    onClick={() => setSelectedFramingMode("adaptive")}
+                  >
+                    <div className="card-top-row">
+                      <div className="card-icon-box mint">
+                        <Crop size={18} />
+                      </div>
+                      <div className="card-indicator">
+                        {selectedFramingMode === "adaptive" ? (
+                          <div className="indicator-check"><Check size={13} strokeWidth={3} /></div>
+                        ) : (
+                          <div className="indicator-empty" />
+                        )}
+                      </div>
+                    </div>
+                    <div className="card-title-row">
+                      <span className="card-title">Adaptive Framing</span>
+                      <span className="card-badge mint">SMART</span>
+                    </div>
+                    <p className="card-desc">
+                      AutoShorts dynamically tracks and reframes speakers, isolating the active speaker when two or more are present.
+                    </p>
+                  </div>
 
-              <div
-                className={`style-card ${selectedStyle === "preset_mrbeast_pop" ? "selected" : ""}`}
-                onClick={() => setSelectedStyle("preset_mrbeast_pop")}
-              >
-                <div className="style-preview-box">
-                  <span className="preview-text-narrative-pop">
-                    <span className="preview-word-pop">Narrative</span> pop stories
-                  </span>
+                  <div
+                    className={`framing-card ${selectedFramingMode === "original" ? "selected" : ""}`}
+                    onClick={() => setSelectedFramingMode("original")}
+                  >
+                    <div className="card-top-row">
+                      <div className="card-icon-box">
+                        <Smartphone size={18} />
+                      </div>
+                      <div className="card-indicator">
+                        {selectedFramingMode === "original" ? (
+                          <div className="indicator-check"><Check size={13} strokeWidth={3} /></div>
+                        ) : (
+                          <div className="indicator-empty" />
+                        )}
+                      </div>
+                    </div>
+                    <div className="card-title-row">
+                      <span className="card-title">Original 9:16</span>
+                    </div>
+                    <p className="card-desc">
+                      Preserves original recording framing at 9:16 aspect ratio. Includes DualFrame layout when multiple speakers are detected.
+                    </p>
+                  </div>
                 </div>
-                <div className="style-card-title">Narrative Pop</div>
-                <div className="style-card-desc">Dynamic two-line sentence phrasing with punchy yellow progressive karaoke bounce.</div>
-              </div>
+              </section>
 
-              <div
-                className={`style-card ${selectedStyle === "preset_minimal_capsule" ? "selected" : ""}`}
-                onClick={() => setSelectedStyle("preset_minimal_capsule")}
-              >
-                <div className="style-preview-box">
-                  <span className="preview-text-minimal-capsule">
-                    <span className="preview-word-active">Minimal</span> <span className="preview-word-inactive">capsule reveal</span>
-                  </span>
+              {/* Section 2: Caption Style */}
+              <section className="modal-section">
+                <div className="modal-section-header">
+                  <h2 className="modal-section-title">Caption Style</h2>
+                  <span className="modal-section-step">Step 2 of 3 · Live On-screen Rendering</span>
                 </div>
-                <div className="style-card-title">Minimal Capsule</div>
-                <div className="style-card-desc">Clean aesthetic text with smooth word-by-word opacity reveal inside a semi-transparent capsule box.</div>
-              </div>
+                <div className="style-grid-c">
+                  {/* Clean */}
+                  <div
+                    className={`style-card-c ${selectedStyle === "preset_minimal_capsule" || selectedStyle === "preset_cinematic_vlog" ? "selected" : ""}`}
+                    onClick={() => setSelectedStyle("preset_minimal_capsule")}
+                  >
+                    <div className="style-preview-box-c">
+                      <div className="preview-dots">
+                        <span /><span />
+                      </div>
+                      <div className="preview-badge-clean">
+                        How sleep affects cortisol
+                      </div>
+                    </div>
+                    <div className="card-info-row">
+                      <div className="card-info">
+                        <span className="card-title">Clean</span>
+                        <p className="card-desc-compact">Minimal, centered captions.</p>
+                      </div>
+                      <div className="card-indicator">
+                        {selectedStyle === "preset_minimal_capsule" || selectedStyle === "preset_cinematic_vlog" ? (
+                          <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
+                        ) : (
+                          <div className="indicator-empty" />
+                        )}
+                      </div>
+                    </div>
+                  </div>
 
-              <div
-                className={`style-card ${selectedStyle === "preset_cinematic_vlog" ? "selected" : ""}`}
-                onClick={() => setSelectedStyle("preset_cinematic_vlog")}
-              >
-                <div className="style-preview-box">
-                  <span className="preview-text-cinematic-vlog">Cinematic vlog subtitles</span>
-                </div>
-                <div className="style-card-title">Cinematic Vlog</div>
-                <div className="style-card-desc">Understated lower-third typography with soft drop shadow and smooth fade-in for documentary & vlog storytelling.</div>
-              </div>
+                  {/* Bold */}
+                  <div
+                    className={`style-card-c ${selectedStyle === "preset_viral_bold" || selectedStyle === "preset_bhaukal_caption" ? "selected" : ""}`}
+                    onClick={() => setSelectedStyle("preset_viral_bold")}
+                  >
+                    <div className="style-preview-box-c">
+                      <div className="preview-text-bold">
+                        HORMOZI VIRAL
+                      </div>
+                    </div>
+                    <div className="card-info-row">
+                      <div className="card-info">
+                        <span className="card-title">Bold</span>
+                        <p className="card-desc-compact">High-contrast, punchy captions.</p>
+                      </div>
+                      <div className="card-indicator">
+                        {selectedStyle === "preset_viral_bold" || selectedStyle === "preset_bhaukal_caption" ? (
+                          <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
+                        ) : (
+                          <div className="indicator-empty" />
+                        )}
+                      </div>
+                    </div>
+                  </div>
 
-              <div
-                className={`style-card ${selectedStyle === "preset_dynamic_editorial" ? "selected" : ""}`}
-                onClick={() => setSelectedStyle("preset_dynamic_editorial")}
-              >
-                <div className="style-preview-box">
-                  <span className="preview-text-dynamic-editorial">
-                    <span className="preview-word-emphasis">DYNAMIC</span> <span className="preview-word-editorial">editorial</span>
-                  </span>
+                  {/* Word Highlight */}
+                  <div
+                    className={`style-card-c ${selectedStyle === "preset_mrbeast_pop" || selectedStyle === "preset_dynamic_editorial" || selectedStyle === "preset_t7" ? "selected" : ""}`}
+                    onClick={() => setSelectedStyle("preset_mrbeast_pop")}
+                  >
+                    <div className="style-preview-box-c">
+                      <div className="preview-text-highlight">
+                        The morning <span className="word-accent">cortisol</span> surge
+                      </div>
+                    </div>
+                    <div className="card-info-row">
+                      <div className="card-info">
+                        <span className="card-title">Word Highlight</span>
+                        <p className="card-desc-compact">Word-by-word accented karaoke.</p>
+                      </div>
+                      <div className="card-indicator">
+                        {selectedStyle === "preset_mrbeast_pop" || selectedStyle === "preset_dynamic_editorial" || selectedStyle === "preset_t7" ? (
+                          <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
+                        ) : (
+                          <div className="indicator-empty" />
+                        )}
+                      </div>
+                    </div>
+                  </div>
                 </div>
-                <div className="style-card-title">Dynamic Editorial Kinetic</div>
-                <div className="style-card-desc">Multi-object kinetic typography with multi-directional entrance motion, mixed typography lockups, and synchronized group exit fades.</div>
-              </div>
 
-              <div
-                className={`style-card ${selectedStyle === "preset_bhaukal_caption" ? "selected" : ""}`}
-                onClick={() => setSelectedStyle("preset_bhaukal_caption")}
-              >
-                <div className="style-preview-box">
-                  <span className="preview-text-bhaukal">
-                    <span className="preview-word-context">you will</span> <span className="preview-word-hero">Believe</span>
-                  </span>
+                {/* Secondary row for specific presets */}
+                <div className="style-presets-row">
+                  <span className="presets-row-label">Specific Preset:</span>
+                  <div className="preset-pills-list">
+                    {CAPTION_PRESETS.map((preset) => (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        className={`preset-pill-chip ${selectedStyle === preset.id ? "active" : ""}`}
+                        onClick={() => setSelectedStyle(preset.id)}
+                      >
+                        {preset.name}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-                <div className="style-card-title">Bhaukal caption</div>
-                <div className="style-card-desc">Editorial dual-typography with progressive phrase builds, white monochrome scale hierarchy, hero metrics, and a persistent hook strip.</div>
-              </div>
+              </section>
 
-              <div
-                className={`style-card ${selectedStyle === "preset_t7" ? "selected" : ""}`}
-                onClick={() => setSelectedStyle("preset_t7")}
-              >
-                <div className="style-preview-box">
-                  <span className="preview-text-t7">
-                    <span className="preview-word-t7-normal">believe in</span> <span className="preview-word-t7-emph">yourself</span>
-                  </span>
+              {/* Section 3: Scoring Backend */}
+              <section className="modal-section">
+                <div className="modal-section-header">
+                  <div className="title-with-info">
+                    <h2 className="modal-section-title">Scoring Backend</h2>
+                    <span
+                      className="info-tooltip-wrap"
+                      title="Determines how viral moments, speech hooks, and retention peaks are identified."
+                    >
+                      <Info size={14} />
+                    </span>
+                  </div>
+                  <span className="modal-section-step">Step 3 of 3 · Model Engine</span>
                 </div>
-                <div className="style-card-title">T7 Reference Style</div>
-                <div className="style-card-desc">Phrase-chunked rolling captions driven by speech rhythm: short 1-3 word chunks appear as stable units, previous chunk in plain white above the newly arrived solid-yellow chunk, Matt Bold, no stroke or box, fixed lower position.</div>
-              </div>
+                <div className="scoring-stack">
+                  {/* Legacy Scoring */}
+                  <div
+                    className={`scoring-card ${scoringMode === "legacy" ? "selected" : ""}`}
+                    onClick={() => setScoringMode("legacy")}
+                  >
+                    <div className="scoring-card-left">
+                      <div className="card-icon-box mint">
+                        <ShieldCheck size={20} />
+                      </div>
+                      <div className="scoring-card-content">
+                        <div className="card-title-row">
+                          <span className="card-title">Legacy Scoring — Recommended</span>
+                          <span className="card-badge default">DEFAULT</span>
+                        </div>
+                        <p className="card-desc">
+                          Fast, offline composite scoring. No external API required. Recommended for all users.
+                        </p>
+                        <div className="card-meta-chips">
+                          <span className="meta-chip mint"><Zap size={12} /> ~45s Processing</span>
+                          <span className="meta-dot">•</span>
+                          <span className="meta-chip mint"><Lock size={12} /> 100% On-device Privacy</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="card-indicator">
+                      {scoringMode === "legacy" ? (
+                        <div className="indicator-check"><Check size={13} strokeWidth={3} /></div>
+                      ) : (
+                        <div className="indicator-empty" />
+                      )}
+                    </div>
+                  </div>
+
+                  {/* AutoClip Holistic Scoring */}
+                  <div
+                    className={`scoring-card ${scoringMode === "autoclip" ? "selected" : ""}`}
+                    onClick={() => setScoringMode("autoclip")}
+                  >
+                    <div className="scoring-card-left">
+                      <div className="card-icon-box slate">
+                        <Cpu size={20} />
+                      </div>
+                      <div className="scoring-card-content">
+                        <div className="card-title-row">
+                          <span className="card-title">AutoClip Holistic Scoring — NVIDIA</span>
+                          <span className="card-badge amber">
+                            <Key size={11} /> External API · API Key Required
+                          </span>
+                        </div>
+                        <p className="card-desc">
+                          Multi-dimensional editorial scoring via NVIDIA NIM external API. Requires a configured NVIDIA API key and may incur API usage costs.
+                        </p>
+                        <div className="card-meta-chips">
+                          <span className="meta-chip"><Cloud size={12} /> Requires Internet</span>
+                          <span className="meta-dot">•</span>
+                          <span className="meta-chip"><SlidersHorizontal size={12} /> Deep Nuance Extraction</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="card-indicator">
+                      {scoringMode === "autoclip" ? (
+                        <div className="indicator-check"><Check size={13} strokeWidth={3} /></div>
+                      ) : (
+                        <div className="indicator-empty" />
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {scoringMode === "autoclip" && environment !== null && !environment.hasNvidiaKey && (
+                  <div className="api-warning">
+                    ⚠️ AutoClip Scoring (NVIDIA) is selected but NVIDIA_API_KEY is missing. Configure it in your .env or environment, or switch back to Legacy Scoring — moment finding will report this error instead of falling back.
+                  </div>
+                )}
+              </section>
             </div>
 
-            <div className="style-modal-actions">
-              <button className="btn-cancel" onClick={() => { setShowStyleModal(false); setMediaPathToImport(null); setSelectedStyle(null); }}>
+            {/* Modal Footer */}
+            <div className="style-modal-footer">
+              <button
+                type="button"
+                className="btn-modal-cancel"
+                onClick={() => {
+                  setShowStyleModal(false);
+                  setMediaPathToImport(null);
+                }}
+              >
                 Cancel
               </button>
-              <button
-                className="btn-confirm"
-                disabled={!selectedStyle}
-                onClick={() => { if (selectedStyle) confirmImport(selectedStyle, selectedFramingMode); }}
-              >
-                Confirm & Import
-              </button>
+              <div className="footer-right-group">
+                <span className="footer-helper-note">
+                  This will begin transcription and analysis.
+                </span>
+                <button
+                  type="button"
+                  className="btn-modal-confirm"
+                  disabled={!selectedStyle}
+                  onClick={() => {
+                    if (selectedStyle) confirmImport(selectedStyle, selectedFramingMode);
+                  }}
+                >
+                  <span>Start Processing</span>
+                  <ArrowRight size={16} />
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -1975,6 +2913,268 @@ function App() {
         </div>
       )}
 
+    </div>
+  );
+}
+
+interface SettingsPanelProps {
+  transcriptionEngine: "deepgram" | "local";
+  setTranscriptionEngine: (engine: "deepgram" | "local") => void;
+  llmEngine: "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq";
+  setLlmEngine: (engine: "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq") => void;
+  deepgramKey: string;
+  setDeepgramKey: (key: string) => void;
+  anthropicKey: string;
+  setAnthropicKey: (key: string) => void;
+  deepseekKey: string;
+  setDeepseekKey: (key: string) => void;
+  deepseekModel: string;
+  setDeepseekModel: (m: string) => void;
+  geminiKey: string;
+  setGeminiKey: (key: string) => void;
+  openaiKey: string;
+  setOpenaiKey: (key: string) => void;
+  openrouterKey: string;
+  setOpenrouterKey: (key: string) => void;
+  openrouterModel: string;
+  setOpenrouterModel: (m: string) => void;
+  groqKey: string;
+  setGroqKey: (key: string) => void;
+  localLlmModel: string;
+  setLocalLlmModel: (m: string) => void;
+  pullModelDirectly: (model: string) => Promise<void>;
+  youtubeBrowser: string;
+  setYoutubeBrowser: (b: string) => void;
+  youtubeCookiesPath: string;
+  setYoutubeCookiesPath: (p: string) => void;
+  environment: EnvironmentStatus | null;
+}
+
+function SettingsPanel({
+  transcriptionEngine,
+  setTranscriptionEngine,
+  llmEngine,
+  setLlmEngine,
+  deepgramKey,
+  setDeepgramKey,
+  anthropicKey,
+  setAnthropicKey,
+  deepseekKey,
+  setDeepseekKey,
+  deepseekModel,
+  setDeepseekModel,
+  geminiKey,
+  setGeminiKey,
+  openaiKey,
+  setOpenaiKey,
+  openrouterKey,
+  setOpenrouterKey,
+  openrouterModel,
+  setOpenrouterModel,
+  groqKey,
+  setGroqKey,
+  localLlmModel,
+  setLocalLlmModel,
+  pullModelDirectly,
+  youtubeBrowser,
+  setYoutubeBrowser,
+  youtubeCookiesPath,
+  setYoutubeCookiesPath,
+  environment,
+}: SettingsPanelProps) {
+  return (
+    <div className="settings-panel">
+      <div className="key-stack-horizontal">
+        <label>
+          <span>Transcription Engine</span>
+          <select
+            value={transcriptionEngine}
+            onChange={(event) => setTranscriptionEngine(event.target.value as "deepgram" | "local")}
+          >
+            <option value="local">Local Whisper (Offline)</option>
+            <option value="deepgram">Deepgram (Cloud)</option>
+          </select>
+          <span>LLM Engine</span>
+          <select
+            value={llmEngine}
+            onChange={(event) => setLlmEngine(event.target.value as any)}
+          >
+            <option value="local">Ollama (Offline Local)</option>
+            <option value="claude">Claude (Cloud)</option>
+            <option value="deepseek">DeepSeek (Cloud)</option>
+            <option value="gemini">Google Gemini (Cloud)</option>
+            <option value="openai">OpenAI (Cloud)</option>
+            <option value="openrouter">OpenRouter (Cloud)</option>
+            <option value="groq">Groq (Cloud)</option>
+          </select>
+        </label>
+        {transcriptionEngine === "deepgram" && (
+          <label>
+            <span>Deepgram API Key</span>
+            <input
+              value={deepgramKey}
+              onChange={(event) => setDeepgramKey(event.target.value)}
+              placeholder={environment?.hasDeepgramKey ? "Loaded from env" : "Optional (Deepgram API Key)"}
+              type="password"
+            />
+          </label>
+        )}
+        {llmEngine === "claude" && (
+          <label>
+            <span>Claude API Key</span>
+            <input
+              value={anthropicKey}
+              onChange={(event) => setAnthropicKey(event.target.value)}
+              placeholder={environment?.hasAnthropicKey ? "Loaded from env" : "Optional (Claude API Key)"}
+              type="password"
+            />
+          </label>
+        )}
+        {llmEngine === "deepseek" && (
+          <>
+            <label>
+              <span>DeepSeek API Key</span>
+              <input
+                value={deepseekKey}
+                onChange={(event) => setDeepseekKey(event.target.value)}
+                placeholder={environment?.hasDeepseekKey ? "Loaded from env" : "Optional (DeepSeek API Key)"}
+                type="password"
+              />
+            </label>
+            <label>
+              <span>DeepSeek Model</span>
+              <input
+                value={deepseekModel}
+                onChange={(event) => setDeepseekModel(event.target.value)}
+                placeholder="Optional (e.g. deepseek-chat, deepseek-v4-pro)"
+                type="text"
+              />
+            </label>
+          </>
+        )}
+        {llmEngine === "gemini" && (
+          <label>
+            <span>Gemini API Key</span>
+            <input
+              value={geminiKey}
+              onChange={(event) => setGeminiKey(event.target.value)}
+              placeholder={environment?.hasGeminiKey ? "Loaded from env" : "Optional (Gemini API Key)"}
+              type="password"
+            />
+          </label>
+        )}
+        {llmEngine === "openai" && (
+          <label>
+            <span>OpenAI API Key</span>
+            <input
+              value={openaiKey}
+              onChange={(event) => setOpenaiKey(event.target.value)}
+              placeholder={environment?.hasOpenaiKey ? "Loaded from env" : "Optional (OpenAI API Key)"}
+              type="password"
+            />
+          </label>
+        )}
+        {llmEngine === "openrouter" && (
+          <>
+            <label>
+              <span>OpenRouter API Key</span>
+              <input
+                value={openrouterKey}
+                onChange={(event) => setOpenrouterKey(event.target.value)}
+                placeholder={environment?.hasOpenrouterKey ? "Loaded from env" : "Optional (OpenRouter API Key)"}
+                type="password"
+              />
+            </label>
+            <label>
+              <span>OpenRouter Model</span>
+              <input
+                value={openrouterModel}
+                onChange={(event) => setOpenrouterModel(event.target.value)}
+                placeholder="Optional (e.g. google/gemini-2.5-flash, deepseek/deepseek-r1)"
+                type="text"
+              />
+            </label>
+          </>
+        )}
+        {llmEngine === "groq" && (
+          <label>
+            <span>Groq API Key</span>
+            <input
+              value={groqKey}
+              onChange={(event) => setGroqKey(event.target.value)}
+              placeholder={environment?.hasGroqKey ? "Loaded from env" : "Optional (Groq API Key)"}
+              type="password"
+            />
+          </label>
+        )}
+
+        {llmEngine === "local" && (
+          <label>
+            <span>Ollama Model Name</span>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <input
+                value={localLlmModel}
+                onChange={(event) => setLocalLlmModel(event.target.value)}
+                placeholder="e.g. llama3.2, qwen2.5:7b"
+                type="text"
+              />
+              <button
+                type="button"
+                className="icon-button"
+                style={{ minHeight: '36px', height: '36px' }}
+                onClick={() => pullModelDirectly(localLlmModel)}
+              >
+                <Download size={14} /> Pull
+              </button>
+            </div>
+          </label>
+        )}
+
+        <label>
+          <span>YouTube Authentication Browser</span>
+          <select
+            value={youtubeBrowser}
+            onChange={(event) => setYoutubeBrowser(event.target.value)}
+          >
+            <option value="auto">Auto (Try Unauthenticated, then Installed Browsers)</option>
+            <option value="firefox">Firefox</option>
+            <option value="chrome">Google Chrome</option>
+            <option value="edge">Microsoft Edge</option>
+            <option value="brave">Brave Browser</option>
+            <option value="opera">Opera</option>
+            <option value="safari">Safari (macOS)</option>
+            <option value="none">None (Strictly Unauthenticated)</option>
+            <option value="custom">Custom cookies.txt File</option>
+          </select>
+        </label>
+
+        {youtubeBrowser === "custom" && (
+          <label>
+            <span>Custom cookies.txt Path</span>
+            <input
+              value={youtubeCookiesPath}
+              onChange={(event) => setYoutubeCookiesPath(event.target.value)}
+              placeholder="e.g. C:\Users\user\cookies.txt"
+              type="text"
+            />
+          </label>
+        )}
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '16px', borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
+        <button
+          type="button"
+          className="icon-button"
+          style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}
+          onClick={() => {
+            if (window.confirm("Are you sure you want to reset your configuration and restart onboarding from scratch?")) {
+              localStorage.clear();
+              window.location.reload();
+            }
+          }}
+        >
+          Reset App Configuration & Onboarding
+        </button>
+      </div>
     </div>
   );
 }

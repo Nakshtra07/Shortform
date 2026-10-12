@@ -3059,6 +3059,42 @@ fn rename_project(
         .map_err(to_command_error)
 }
 
+#[tauri::command]
+fn update_project_style(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    caption_style: Option<String>,
+    framing_mode: Option<String>,
+) -> Result<(), String> {
+    state
+        .db
+        .update_project_style(
+            &project_id,
+            caption_style.as_deref(),
+            framing_mode.as_deref(),
+        )
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
+fn restore_clip_output_path(
+    state: tauri::State<'_, AppState>,
+    candidate_id: String,
+    output_path: String,
+) -> Result<(), String> {
+    state
+        .db
+        .update_clip_for_candidate(
+            &candidate_id,
+            "done",
+            Some(&output_path),
+            None,
+            None,
+            None,
+        )
+        .map_err(to_command_error)
+}
+
 pub fn run() {
     let _ = dotenvy::dotenv();
     let _ = dotenvy::from_filename("../.env");
@@ -3099,6 +3135,8 @@ pub fn run() {
             render_flat_clip_for_candidate,
             delete_project,
             rename_project,
+            update_project_style,
+            restore_clip_output_path,
             check_youtube_copyright,
             download_youtube_video
         ])

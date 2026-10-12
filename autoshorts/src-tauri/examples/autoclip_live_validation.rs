@@ -29,7 +29,9 @@ use autoshorts_lib::models::{CandidateDraft, NormalizedTranscript};
 use autoshorts_lib::scoring;
 use std::time::Instant;
 
-fn reset_to_fresh_pool(candidates: &[autoshorts_lib::models::Candidate]) -> Result<Vec<CandidateDraft>> {
+fn reset_to_fresh_pool(
+    candidates: &[autoshorts_lib::models::Candidate],
+) -> Result<Vec<CandidateDraft>> {
     let mut drafts: Vec<CandidateDraft> = candidates
         .iter()
         .map(|c| c.try_metadata_draft())
@@ -82,10 +84,8 @@ async fn main() -> Result<()> {
     if key.trim().is_empty() {
         bail!("NVIDIA_API_KEY is not configured; live validation impossible");
     }
-    let backend =
-        scoring::resolve_scoring_backend().map_err(anyhow::Error::msg)?;
-    let threshold =
-        scoring::resolve_recommend_threshold().map_err(anyhow::Error::msg)?;
+    let backend = scoring::resolve_scoring_backend().map_err(anyhow::Error::msg)?;
+    let threshold = scoring::resolve_recommend_threshold().map_err(anyhow::Error::msg)?;
     let top_n = scoring::resolve_top_n().map_err(anyhow::Error::msg)?;
     println!(
         "[Validation] AUTOSHORTS_SCORING_BACKEND={:?} threshold={:.2} top_n={:?}",
@@ -151,14 +151,10 @@ async fn main() -> Result<()> {
     let mut drafts = original_drafts.clone();
     let source_identity = compute_transcript_source_identity(&normalized);
     let t0 = Instant::now();
-    let summary = scoring::run_autoclip_scoring(
-        &source_identity,
-        &mut drafts,
-        &normalized.words,
-        &key,
-    )
-    .await
-    .map_err(|f| anyhow!("live scoring failed: {f}"))?;
+    let summary =
+        scoring::run_autoclip_scoring(&source_identity, &mut drafts, &normalized.words, &key)
+            .await
+            .map_err(|f| anyhow!("live scoring failed: {f}"))?;
     println!(
         "[Validation] live run #1 finished in {:.1}s: entered={} cache_hits={} cache_misses={} \
          valid={} unscored={} invalid={} ambiguous={} unknown={} failed_batches={}",
@@ -236,8 +232,7 @@ async fn main() -> Result<()> {
     }
     let after_gate = drafts.len();
 
-    let ranked =
-        deduplicate_and_rank_all_candidates_autoclip(drafts, normalized.duration, 12);
+    let ranked = deduplicate_and_rank_all_candidates_autoclip(drafts, normalized.duration, 12);
     let eligible_count = ranked
         .iter()
         .filter(|d| scoring::is_autoclip_eligible(d, threshold))
@@ -262,7 +257,11 @@ async fn main() -> Result<()> {
     assert_eq!(reloaded.len(), ranked.len(), "pool size must roundtrip");
     for (idx, c) in reloaded.iter().enumerate() {
         assert_eq!(c.rank, (idx + 1) as i64, "rank = index + 1");
-        assert_eq!(c.selected, idx < selected_count, "selected = index < selected_count");
+        assert_eq!(
+            c.selected,
+            idx < selected_count,
+            "selected = index < selected_count"
+        );
         let meta = c
             .metadata_json
             .as_ref()
@@ -276,7 +275,10 @@ async fn main() -> Result<()> {
         );
     }
     let selected_total: usize = reloaded.iter().filter(|c| c.selected).count();
-    assert_eq!(selected_total, selected_count, "exactly selected_count selected");
+    assert_eq!(
+        selected_total, selected_count,
+        "exactly selected_count selected"
+    );
     println!(
         "[Validation] persistence verified: {} persisted, {} selected, {} Not Selected alternatives retained",
         reloaded.len(),
@@ -293,14 +295,10 @@ async fn main() -> Result<()> {
     if !skip_second_run {
         let mut drafts2 = original_drafts;
         let t1 = Instant::now();
-        let summary2 = scoring::run_autoclip_scoring(
-            &source_identity,
-            &mut drafts2,
-            &normalized.words,
-            &key,
-        )
-        .await
-        .map_err(|f| anyhow!("second run failed: {f}"))?;
+        let summary2 =
+            scoring::run_autoclip_scoring(&source_identity, &mut drafts2, &normalized.words, &key)
+                .await
+                .map_err(|f| anyhow!("second run failed: {f}"))?;
         println!(
             "[Validation] run #2 (cache attribution) in {:.1}s: cache_hits={} cache_misses={} valid={}",
             t1.elapsed().as_secs_f64(),
@@ -321,8 +319,10 @@ async fn main() -> Result<()> {
             summary2.cache_hits,
             run1_llm_count
         );
-        let run2_by_id: std::collections::HashMap<&Option<String>, &autoshorts_lib::models::CandidateDraft> =
-            drafts2.iter().map(|d| (&d.scoring_id, d)).collect();
+        let run2_by_id: std::collections::HashMap<
+            &Option<String>,
+            &autoshorts_lib::models::CandidateDraft,
+        > = drafts2.iter().map(|d| (&d.scoring_id, d)).collect();
         for (run1_id, score, source, rationale) in &run1_scores {
             if source.as_deref() == Some(scoring::SCORE_SOURCE_LLM) {
                 let run2 = run2_by_id

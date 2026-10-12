@@ -364,7 +364,10 @@ pub fn collect_evidence(draft: &CandidateDraft) -> Vec<String> {
 
 /// Build the scoring input list for the whole pool, assigning each candidate
 /// its transient identity by pool position.
-pub fn build_scoring_inputs(drafts: &[CandidateDraft], words: &[TranscriptWord]) -> Vec<ScoringCandidateInput> {
+pub fn build_scoring_inputs(
+    drafts: &[CandidateDraft],
+    words: &[TranscriptWord],
+) -> Vec<ScoringCandidateInput> {
     drafts
         .iter()
         .enumerate()
@@ -374,7 +377,12 @@ pub fn build_scoring_inputs(drafts: &[CandidateDraft], words: &[TranscriptWord])
             context: draft.rationale.clone(),
             start_seconds: draft.start,
             end_seconds: draft.end,
-            transcript: transcript_excerpt(words, draft.start, draft.end, MAX_TRANSCRIPT_EXCERPT_CHARS),
+            transcript: transcript_excerpt(
+                words,
+                draft.start,
+                draft.end,
+                MAX_TRANSCRIPT_EXCERPT_CHARS,
+            ),
             evidence: collect_evidence(draft),
         })
         .collect()
@@ -492,13 +500,18 @@ pub fn parse_scoring_response_text(text: &str) -> Result<Vec<ScoringResultRaw>, 
         .ok_or_else(|| "[AutoClip Scoring] Parsed JSON was not an array".to_string())?;
     let mut results = Vec::new();
     for element in elements {
-        let Some(obj) = element.as_object() else { continue };
+        let Some(obj) = element.as_object() else {
+            continue;
+        };
         let Some(id) = obj.get("id").and_then(|v| v.as_str()).map(str::to_string) else {
             continue;
         };
         results.push(ScoringResultRaw {
             id,
-            final_score: obj.get("final_score").cloned().unwrap_or(serde_json::Value::Null),
+            final_score: obj
+                .get("final_score")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
             recommend_reason: obj
                 .get("recommend_reason")
                 .and_then(|v| v.as_str())
@@ -636,10 +649,7 @@ pub fn align_final_scores(
 
     let mut summary = AlignmentSummary::default();
     summary.ambiguous_ids = ambiguous.len();
-    summary.unknown_ids = by_id
-        .keys()
-        .filter(|id| !known.contains(**id))
-        .count();
+    summary.unknown_ids = by_id.keys().filter(|id| !known.contains(**id)).count();
 
     let outcomes = inputs
         .iter()
@@ -716,7 +726,11 @@ impl FinalScoreCache {
     /// prompt version. The TRANSIENT scoring id is deliberately NOT part of
     /// the key (it is pool-position-based): caching must be stable across
     /// re-runs and pool reordering, not position-sensitive.
-    pub fn compute_key(input: &ScoringCandidateInput, source_identity: &str, model: &str) -> String {
+    pub fn compute_key(
+        input: &ScoringCandidateInput,
+        source_identity: &str,
+        model: &str,
+    ) -> String {
         let mut hasher = Sha256::new();
         hasher.update(source_identity.as_bytes());
         hasher.update([0]);
@@ -760,7 +774,10 @@ impl FinalScoreCache {
         std::fs::create_dir_all(&self.dir)?;
         let final_path = self.path_for(key);
         let tmp_path = final_path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, serde_json::to_string_pretty(value).unwrap_or_default())?;
+        std::fs::write(
+            &tmp_path,
+            serde_json::to_string_pretty(value).unwrap_or_default(),
+        )?;
         std::fs::rename(&tmp_path, &final_path)
     }
 }
@@ -870,7 +887,9 @@ async fn request_final_scores(
                         ScoringFailure::RateLimit | ScoringFailure::Transient(_) => {
                             eprintln!(
                                 "[AutoClip Scoring] Batch request failed ({}), retry {}/{}",
-                                failure, attempt + 1, MAX_SCORING_RETRIES
+                                failure,
+                                attempt + 1,
+                                MAX_SCORING_RETRIES
                             );
                             last_failure = Some(failure);
                             continue;
@@ -901,7 +920,8 @@ async fn request_final_scores(
                 if e.is_timeout() {
                     eprintln!(
                         "[AutoClip Scoring] Batch request timed out, retry {}/{}",
-                        attempt + 1, MAX_SCORING_RETRIES
+                        attempt + 1,
+                        MAX_SCORING_RETRIES
                     );
                     last_failure = Some(ScoringFailure::Timeout);
                     continue;
@@ -915,9 +935,7 @@ async fn request_final_scores(
             }
         }
     }
-    Err(last_failure.unwrap_or(ScoringFailure::Transient(
-        "retries exhausted".to_string(),
-    )))
+    Err(last_failure.unwrap_or(ScoringFailure::Transient("retries exhausted".to_string())))
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,8 +1059,7 @@ pub async fn run_autoclip_scoring(
                 batch_inputs.len(),
                 prompt.len()
             );
-            let result =
-                request_final_scores(&client, &config, &api_key, &prompt).await;
+            let result = request_final_scores(&client, &config, &api_key, &prompt).await;
             (batch_inputs, result)
         }));
     }
@@ -1081,17 +1098,11 @@ pub async fn run_autoclip_scoring(
                         if let AlignedOutcome::Scored { score, reason } = outcome {
                             drafts[pool_idx].score = *score;
                             drafts[pool_idx].score_source = Some(SCORE_SOURCE_LLM.to_string());
-                            if let Some(reason) = reason
-                                .as_ref()
-                                .filter(|r| !r.trim().is_empty())
-                            {
+                            if let Some(reason) = reason.as_ref().filter(|r| !r.trim().is_empty()) {
                                 drafts[pool_idx].rationale = reason.clone();
                             }
-                            let key = FinalScoreCache::compute_key(
-                                input,
-                                source_identity,
-                                &config.model,
-                            );
+                            let key =
+                                FinalScoreCache::compute_key(input, source_identity, &config.model);
                             let cached = CachedFinalScore {
                                 score: *score,
                                 recommend_reason: reason.clone(),
@@ -1336,9 +1347,11 @@ mod tests {
     fn scorer_credential_gate_legacy_needs_no_credential() {
         let _env = lock_scorer_env();
         std::env::remove_var("NVIDIA_API_KEY");
-        assert_eq!(resolve_scorer_credential(ScoringBackend::Legacy).unwrap(), None);
-        let (backend, credential) =
-            resolve_scoring_authority_for_call(Some("legacy")).unwrap();
+        assert_eq!(
+            resolve_scorer_credential(ScoringBackend::Legacy).unwrap(),
+            None
+        );
+        let (backend, credential) = resolve_scoring_authority_for_call(Some("legacy")).unwrap();
         assert_eq!(backend, ScoringBackend::Legacy);
         assert_eq!(credential, None);
     }
@@ -1347,8 +1360,7 @@ mod tests {
     fn scorer_credential_gate_autoclip_with_key_returns_verified_credential() {
         let _env = lock_scorer_env();
         std::env::set_var("NVIDIA_API_KEY", "nvapi-test-selector-key");
-        let (backend, credential) =
-            resolve_scoring_authority_for_call(Some("autoclip")).unwrap();
+        let (backend, credential) = resolve_scoring_authority_for_call(Some("autoclip")).unwrap();
         assert_eq!(backend, ScoringBackend::AutoClip);
         assert_eq!(credential.as_deref(), Some("nvapi-test-selector-key"));
         std::env::remove_var("NVIDIA_API_KEY");
@@ -1393,10 +1405,7 @@ mod tests {
             "https://example.test/v1/chat/completions",
         );
         let config = AutoClipScorerConfig::from_env();
-        assert_eq!(
-            config.endpoint,
-            "https://example.test/v1/chat/completions"
-        );
+        assert_eq!(config.endpoint, "https://example.test/v1/chat/completions");
         std::env::remove_var("NVIDIA_SCORER_BASE_URL");
     }
 
@@ -1660,7 +1669,10 @@ mod tests {
     fn alignment_is_by_id_not_position() {
         let inputs = two_inputs();
         // Response order deliberately reversed relative to input order.
-        let results = vec![result("cand-0001", serde_json::json!(0.4)), result("cand-0000", serde_json::json!(0.9))];
+        let results = vec![
+            result("cand-0001", serde_json::json!(0.4)),
+            result("cand-0000", serde_json::json!(0.9)),
+        ];
         let (outcomes, summary) = align_final_scores(&inputs, &results);
         assert_eq!(summary.aligned, 2);
         assert!(matches!(
@@ -1716,9 +1728,7 @@ mod tests {
         ];
         let (outcomes, summary) = align_final_scores(&inputs, &results);
         assert_eq!(summary.invalid_score, 2);
-        assert!(outcomes
-            .iter()
-            .all(|o| *o == AlignedOutcome::InvalidScore));
+        assert!(outcomes.iter().all(|o| *o == AlignedOutcome::InvalidScore));
     }
 
     #[test]
@@ -1731,7 +1741,12 @@ mod tests {
 
     // ---------------- Cache ----------------
 
-    fn cache_input(id: &str, hook: &str, transcript: &str, evidence: Vec<String>) -> ScoringCandidateInput {
+    fn cache_input(
+        id: &str,
+        hook: &str,
+        transcript: &str,
+        evidence: Vec<String>,
+    ) -> ScoringCandidateInput {
         ScoringCandidateInput {
             id: id.to_string(),
             hook: hook.to_string(),
@@ -1753,7 +1768,12 @@ mod tests {
     }
 
     fn base_input() -> ScoringCandidateInput {
-        cache_input("cand-0000", "hook", "transcript words", vec!["ev1".to_string()])
+        cache_input(
+            "cand-0000",
+            "hook",
+            "transcript words",
+            vec!["ev1".to_string()],
+        )
     }
 
     #[test]
@@ -1785,7 +1805,10 @@ mod tests {
         other.evidence = vec!["changed".to_string()];
         assert_ne!(key, FinalScoreCache::compute_key(&other, "src", "model-a"));
 
-        assert_ne!(key, FinalScoreCache::compute_key(&base, "other-src", "model-a"));
+        assert_ne!(
+            key,
+            FinalScoreCache::compute_key(&base, "other-src", "model-a")
+        );
         assert_ne!(key, FinalScoreCache::compute_key(&base, "src", "model-b"));
     }
 
@@ -1931,7 +1954,10 @@ mod tests {
             scored_draft(7.0, 8.0, 0.9, Some("cand-0000")),
         ];
         pool.sort_by(|a, b| autoclip_rank_cmp(a, b));
-        let ids: Vec<&str> = pool.iter().map(|d| d.scoring_id.as_deref().unwrap()).collect();
+        let ids: Vec<&str> = pool
+            .iter()
+            .map(|d| d.scoring_id.as_deref().unwrap())
+            .collect();
         // Equal scores: start asc (7.0 last), then end asc, then id asc.
         assert_eq!(ids, ["cand-0003", "cand-0002", "cand-0001", "cand-0000"]);
 
@@ -1942,7 +1968,10 @@ mod tests {
             let n = shuffled.len();
             shuffled.rotate_left(seed % n);
             shuffled.sort_by(|a, b| autoclip_rank_cmp(a, b));
-            let got: Vec<&str> = shuffled.iter().map(|d| d.scoring_id.as_deref().unwrap()).collect();
+            let got: Vec<&str> = shuffled
+                .iter()
+                .map(|d| d.scoring_id.as_deref().unwrap())
+                .collect();
             assert_eq!(got, ids, "seed {seed}");
         }
     }
@@ -1997,7 +2026,9 @@ mod tests {
     #[tokio::test]
     async fn empty_pool_is_a_clean_noop() {
         let _env = lock_scorer_env();
-        let summary = run_autoclip_scoring("src", &mut [], &[], "key").await.unwrap();
+        let summary = run_autoclip_scoring("src", &mut [], &[], "key")
+            .await
+            .unwrap();
         assert_eq!(summary.candidates_entering, 0);
     }
 }
