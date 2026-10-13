@@ -78,7 +78,7 @@ fn verify_schema(conn: &Connection) -> Result<()> {
 
     let proj_cols = get_table_columns(conn, "projects")?;
     for col in &[
-        "id", "name", "source_path", "source_duration", "status", "transcription_mode", "caption_style", "framing_mode", "created_at", "updated_at",
+        "id", "name", "source_path", "source_duration", "status", "transcription_mode", "caption_style", "framing_mode", "created_at", "updated_at", "presentation_mode", "presentation_config",
     ] {
         if !proj_cols.contains(&col.to_ascii_lowercase()) {
             bail!("Schema verification failed: projects missing column {}", col);
@@ -151,7 +151,9 @@ impl Database {
                     caption_style TEXT,
                     framing_mode TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    presentation_mode TEXT DEFAULT 'autoshorts',
+                    presentation_config TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS transcripts (
@@ -258,6 +260,8 @@ impl Database {
             ensure_column(&conn, "projects", "name", "TEXT")?;
             ensure_column(&conn, "projects", "caption_style", "TEXT")?;
             ensure_column(&conn, "projects", "framing_mode", "TEXT")?;
+            ensure_column(&conn, "projects", "presentation_mode", "TEXT DEFAULT 'autoshorts'")?;
+            ensure_column(&conn, "projects", "presentation_config", "TEXT")?;
 
             ensure_column(&conn, "candidates", "hook_start_sec", "REAL")?;
             ensure_column(&conn, "candidates", "hook_end_sec", "REAL")?;
@@ -283,6 +287,8 @@ impl Database {
             conn.execute(&format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION), [])?;
         } else {
             // Verify schema even when user_version is already current (user refinement 1)
+            ensure_column(&conn, "projects", "presentation_mode", "TEXT DEFAULT 'autoshorts'")?;
+            ensure_column(&conn, "projects", "presentation_config", "TEXT")?;
             verify_schema(&conn)?;
         }
 
@@ -297,7 +303,29 @@ impl Database {
         framing_mode: &str,
         source_duration: Option<f64>,
     ) -> Result<Project> {
+        self.create_project_with_presentation(
+            source_path,
+            transcription_mode,
+            caption_style,
+            framing_mode,
+            source_duration,
+            None,
+            None,
+        )
+    }
+
+    pub fn create_project_with_presentation(
+        &self,
+        source_path: &str,
+        transcription_mode: &str,
+        caption_style: &str,
+        framing_mode: &str,
+        source_duration: Option<f64>,
+        presentation_mode: Option<&str>,
+        presentation_config: Option<&str>,
+    ) -> Result<Project> {
         let now = Utc::now().to_rfc3339();
+        let mode = presentation_mode.unwrap_or("autoshorts");
         let project = Project {
             id: Uuid::new_v4().to_string(),
             name: None,
@@ -309,12 +337,14 @@ impl Database {
             framing_mode: Some(framing_mode.to_string()),
             created_at: now.clone(),
             updated_at: now,
+            presentation_mode: Some(mode.to_string()),
+            presentation_config: presentation_config.map(|s| s.to_string()),
         };
 
         let conn = self.conn.lock().expect("database mutex poisoned");
         conn.execute(
-            "INSERT INTO projects (id, name, source_path, source_duration, status, transcription_mode, caption_style, framing_mode, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO projects (id, name, source_path, source_duration, status, transcription_mode, caption_style, framing_mode, created_at, updated_at, presentation_mode, presentation_config)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 project.id,
                 project.name,
@@ -325,7 +355,9 @@ impl Database {
                 project.caption_style,
                 project.framing_mode,
                 project.created_at,
-                project.updated_at
+                project.updated_at,
+                project.presentation_mode,
+                project.presentation_config,
             ],
         )?;
 
@@ -335,7 +367,7 @@ impl Database {
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style, framing_mode
+            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style, framing_mode, presentation_mode, presentation_config
              FROM projects ORDER BY updated_at DESC",
         )?;
 
@@ -347,7 +379,7 @@ impl Database {
     pub fn get_project(&self, project_id: &str) -> Result<Project> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         conn.query_row(
-            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style, framing_mode
+            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style, framing_mode, presentation_mode, presentation_config
              FROM projects WHERE id = ?1",
             params![project_id],
             project_from_row,
@@ -584,7 +616,8 @@ impl Database {
                 candidates.payoff_text, candidates.payoff_start_sec, candidates.payoff_end_sec, candidates.payoff_score, candidates.payoff_completion,
                 candidates.metadata_json,
                 projects.id, projects.name, projects.source_path, projects.source_duration, projects.status,
-                projects.transcription_mode, projects.created_at, projects.updated_at, projects.caption_style, projects.framing_mode
+                projects.transcription_mode, projects.created_at, projects.updated_at, projects.caption_style, projects.framing_mode,
+                projects.presentation_mode, projects.presentation_config
              FROM candidates
              INNER JOIN projects ON projects.id = candidates.project_id
              WHERE candidates.id = ?1",
@@ -618,6 +651,10 @@ impl Database {
                     payoff_completion,
                     metadata_json: row.get(18)?,
                 };
+                let raw_mode: Option<String> = row.get(29)?;
+                let mode = raw_mode
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "autoshorts".to_string());
                 let project = Project {
                     id: row.get(19)?,
                     name: row.get(20)?,
@@ -629,6 +666,8 @@ impl Database {
                     updated_at: row.get(26)?,
                     caption_style: row.get(27)?,
                     framing_mode: row.get(28)?,
+                    presentation_mode: Some(mode),
+                    presentation_config: row.get(30)?,
                 };
                 Ok((candidate, project))
             },
@@ -802,14 +841,31 @@ impl Database {
         project_id: &str,
         caption_style: Option<&str>,
         framing_mode: Option<&str>,
+        presentation_mode: Option<&str>,
+        presentation_config: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE projects SET caption_style = COALESCE(?1, caption_style), framing_mode = COALESCE(?2, framing_mode), updated_at = ?3 WHERE id = ?4",
-            params![caption_style, framing_mode, now, project_id],
+            "UPDATE projects SET
+                caption_style = COALESCE(?1, caption_style),
+                framing_mode = COALESCE(?2, framing_mode),
+                presentation_mode = COALESCE(?3, presentation_mode),
+                presentation_config = COALESCE(?4, presentation_config),
+                updated_at = ?5
+             WHERE id = ?6",
+            params![caption_style, framing_mode, presentation_mode, presentation_config, now, project_id],
         )?;
         Ok(())
+    }
+
+    pub fn update_project_presentation(
+        &self,
+        project_id: &str,
+        presentation_mode: Option<&str>,
+        presentation_config: Option<&str>,
+    ) -> Result<()> {
+        self.update_project_style(project_id, None, None, presentation_mode, presentation_config)
     }
 
     // ─── Phase 2: Speaker Intelligence Queries ────────────────────────────────
@@ -1135,6 +1191,10 @@ impl Database {
 }
 
 fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+    let raw_mode: Option<String> = row.get(10)?;
+    let mode = raw_mode
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "autoshorts".to_string());
     Ok(Project {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -1146,6 +1206,8 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         updated_at: row.get(7)?,
         caption_style: row.get(8)?,
         framing_mode: row.get(9)?,
+        presentation_mode: Some(mode),
+        presentation_config: row.get(11)?,
     })
 }
 
@@ -2460,6 +2522,54 @@ mod tests {
         let user_ver2: i64 = db2.conn.lock().unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(user_ver2, CURRENT_SCHEMA_VERSION as i64);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn test_presentation_mode_persistence_and_defaults() {
+        let db_path = std::env::temp_dir().join(format!("test_pres_{}.db", Uuid::new_v4()));
+        let db = Database::open(&db_path).unwrap();
+
+        // 1. Default creation has mode = Some("autoshorts"), config = None
+        let p1 = db
+            .create_project("/tmp/test1.mp4", "local", "preset_viral_bold", "original", Some(30.0))
+            .unwrap();
+        assert_eq!(p1.presentation_mode, Some("autoshorts".to_string()));
+        assert_eq!(p1.presentation_config, None);
+
+        let retrieved1 = db.get_project(&p1.id).unwrap();
+        assert_eq!(retrieved1.presentation_mode, Some("autoshorts".to_string()));
+        assert_eq!(retrieved1.presentation_config, None);
+
+        // 2. Explicit autoclip mode creation
+        let cfg = r#"{"platform_strategy":"douyin","subtitle_style":"accent","title_style":"comic"}"#;
+        let p2 = db
+            .create_project_with_presentation(
+                "/tmp/test2.mp4",
+                "local",
+                "clean",
+                "adaptive",
+                Some(60.0),
+                Some("autoclip"),
+                Some(cfg),
+            )
+            .unwrap();
+        assert_eq!(p2.presentation_mode, Some("autoclip".to_string()));
+        assert_eq!(p2.presentation_config, Some(cfg.to_string()));
+
+        let retrieved2 = db.get_project(&p2.id).unwrap();
+        assert_eq!(retrieved2.presentation_mode, Some("autoclip".to_string()));
+        assert_eq!(retrieved2.presentation_config, Some(cfg.to_string()));
+
+        // 3. Update presentation mode & config
+        let updated_cfg = r#"{"platform_strategy":"tiktok","subtitle_style":"bold"}"#;
+        db.update_project_presentation(&p1.id, Some("autoclip"), Some(updated_cfg))
+            .unwrap();
+
+        let updated_p1 = db.get_project(&p1.id).unwrap();
+        assert_eq!(updated_p1.presentation_mode, Some("autoclip".to_string()));
+        assert_eq!(updated_p1.presentation_config, Some(updated_cfg.to_string()));
+
         let _ = std::fs::remove_file(db_path);
     }
 }

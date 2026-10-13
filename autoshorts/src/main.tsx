@@ -76,9 +76,17 @@ type Project = {
   transcriptionMode: string;
   captionStyle?: string | null;
   framingMode?: string | null;
+  presentationMode?: string | null;
+  presentationConfig?: string | null;
   createdAt: string;
   updatedAt: string;
 };
+
+type PresentationEngineMode = "autoshorts" | "autoclip";
+type AutoClipPlatformStrategy = "douyin" | "tiktok" | "youtube_shorts" | "bilibili" | "xiaohongshu";
+type AutoClipSubtitleLook = "clean" | "bold" | "box" | "accent";
+type AutoClipTitleStyle = "comic" | "neon" | "arena" | "editorial" | "pixel" | "frosted" | "plain";
+type AutoClipTemplate = "interview_zh" | "podcast_en";
 
 type Transcript = {
   id: string;
@@ -185,6 +193,13 @@ function App() {
   const [showStyleModal, setShowStyleModal] = useState(false);
   const [selectedStyle, setSelectedStyle] = useState<string>("preset_minimal_capsule");
   const [selectedFramingMode, setSelectedFramingMode] = useState<string>("adaptive");
+  // Initial Setup Modal Presentation Engine & Mode 2 Configuration State
+  const [selectedPresentationMode, setSelectedPresentationMode] = useState<PresentationEngineMode>("autoshorts");
+  const [platformStrategy, setPlatformStrategy] = useState<AutoClipPlatformStrategy>("douyin");
+  const [subtitleLook, setSubtitleLook] = useState<AutoClipSubtitleLook>("accent");
+  const [titleStyle, setTitleStyle] = useState<AutoClipTitleStyle>("comic");
+  const [titleMotion, setTitleMotion] = useState<boolean>(true);
+  const [template, setTemplate] = useState<AutoClipTemplate>("interview_zh");
   // Candidate discovery engine for "Find Viral Moments": "timestamp_generation"
   // is the production default; "window_scoring" (REZE) is the experimental
   // opt-in. Per generation call — flip and re-run to compare on the same project.
@@ -217,6 +232,12 @@ function App() {
   const [styleStudioTargetCandidateId, setStyleStudioTargetCandidateId] = useState<string | null>(null);
   const [styleStudioFraming, setStyleStudioFraming] = useState<"adaptive" | "original">("adaptive");
   const [styleStudioCaption, setStyleStudioCaption] = useState<string>("preset_minimal_capsule");
+  const [styleStudioPresentationMode, setStyleStudioPresentationMode] = useState<PresentationEngineMode>("autoshorts");
+  const [styleStudioPlatformStrategy, setStyleStudioPlatformStrategy] = useState<AutoClipPlatformStrategy>("douyin");
+  const [styleStudioSubtitleLook, setStyleStudioSubtitleLook] = useState<AutoClipSubtitleLook>("accent");
+  const [styleStudioTitleStyle, setStyleStudioTitleStyle] = useState<AutoClipTitleStyle>("comic");
+  const [styleStudioTitleMotion, setStyleStudioTitleMotion] = useState<boolean>(true);
+  const [styleStudioTemplate, setStyleStudioTemplate] = useState<AutoClipTemplate>("interview_zh");
   const [styleStudioScope, setStyleStudioScope] = useState<"target" | "selected" | "all">("target");
   const [previousRenderHistory, setPreviousRenderHistory] = useState<Map<string, string>>(new Map());
 
@@ -686,6 +707,12 @@ function App() {
     if (typeof selected !== "string") return;
     setSelectedStyle("preset_minimal_capsule");
     setSelectedFramingMode("adaptive");
+    setSelectedPresentationMode("autoshorts");
+    setPlatformStrategy("douyin");
+    setSubtitleLook("accent");
+    setTitleStyle("comic");
+    setTitleMotion(true);
+    setTemplate("interview_zh");
     setMediaPathToImport(selected);
     setShowStyleModal(true);
   }
@@ -737,6 +764,12 @@ function App() {
       setYoutubeError(null);
       setSelectedStyle("preset_minimal_capsule");
       setSelectedFramingMode("adaptive");
+      setSelectedPresentationMode("autoshorts");
+      setPlatformStrategy("douyin");
+      setSubtitleLook("accent");
+      setTitleStyle("comic");
+      setTitleMotion(true);
+      setTemplate("interview_zh");
       setMediaPathToImport(downloadedPath);
       setShowStyleModal(true);
     } catch (err: any) {
@@ -749,11 +782,23 @@ function App() {
   }
 
   async function confirmImport(style: string | null, framingMode: string) {
-    if (!mediaPathToImport || !style) return;
+    if (!mediaPathToImport) return;
     const selected = mediaPathToImport;
-    const chosenStyle = style;
+    const chosenStyle = style || "preset_minimal_capsule";
     const chosenFramingMode = framingMode;
     const chosenScoringMode = scoringMode;
+    const chosenPresentationMode = selectedPresentationMode;
+    const chosenPresentationConfig = JSON.stringify({
+      platform_strategy: platformStrategy,
+      platformStrategy: platformStrategy,
+      subtitle_style: subtitleLook,
+      subtitleLook: subtitleLook,
+      title_style: titleStyle,
+      titleStyle: titleStyle,
+      title_motion: titleMotion,
+      titleMotion: titleMotion,
+      template: template,
+    });
     setMediaPathToImport(null);
     setShowStyleModal(false);
 
@@ -764,6 +809,8 @@ function App() {
         transcriptionMode: transcriptionEngine === "local" ? "local" : "cloud",
         captionStyle: chosenStyle,
         framingMode: chosenFramingMode,
+        presentationMode: chosenPresentationMode,
+        presentationConfig: chosenPresentationConfig,
       });
       newProjectId = project.id;
       await refresh(project.id);
@@ -1148,22 +1195,65 @@ function App() {
     }
   }
 
-  function openSingleClipStyleStudio(candidateId: string) {
-    setStyleStudioTargetCandidateId(candidateId);
-    setStyleStudioScope("target");
-    const currentFraming = (detail?.project.framingMode as "adaptive" | "original") || "adaptive";
+  function openStyleStudio(targetCandidateId: string | null, scope: "target" | "selected") {
+    setStyleStudioTargetCandidateId(targetCandidateId);
+    setStyleStudioScope(scope);
+
+    const project = detail?.project;
+    const currentFraming = (project?.framingMode as "adaptive" | "original") || "adaptive";
     setStyleStudioFraming(currentFraming === "original" ? "original" : "adaptive");
-    setStyleStudioCaption(detail?.project.captionStyle || "preset_minimal_capsule");
+    setStyleStudioCaption(project?.captionStyle || "preset_minimal_capsule");
+
+    const currentMode = project?.presentationMode === "autoclip" ? "autoclip" : "autoshorts";
+    setStyleStudioPresentationMode(currentMode);
+
+    if (project?.presentationConfig) {
+      try {
+        const cfg = JSON.parse(project.presentationConfig);
+        setStyleStudioPlatformStrategy(
+          cfg.platform_strategy || cfg.platformStrategy || "douyin"
+        );
+        setStyleStudioSubtitleLook(
+          cfg.subtitle_style || cfg.subtitleLook || "accent"
+        );
+        setStyleStudioTitleStyle(
+          cfg.title_style || cfg.titleStyle || "comic"
+        );
+        setStyleStudioTitleMotion(
+          cfg.title_motion !== undefined
+            ? Boolean(cfg.title_motion)
+            : cfg.titleMotion !== undefined
+            ? Boolean(cfg.titleMotion)
+            : true
+        );
+        setStyleStudioTemplate(
+          cfg.template || "interview_zh"
+        );
+      } catch (err) {
+        console.warn("[Style Studio] Failed to parse project.presentationConfig:", err);
+        setStyleStudioPlatformStrategy("douyin");
+        setStyleStudioSubtitleLook("accent");
+        setStyleStudioTitleStyle("comic");
+        setStyleStudioTitleMotion(true);
+        setStyleStudioTemplate("interview_zh");
+      }
+    } else {
+      setStyleStudioPlatformStrategy("douyin");
+      setStyleStudioSubtitleLook("accent");
+      setStyleStudioTitleStyle("comic");
+      setStyleStudioTitleMotion(true);
+      setStyleStudioTemplate("interview_zh");
+    }
+
     setStyleStudioOpen(true);
   }
 
+  function openSingleClipStyleStudio(candidateId: string) {
+    openStyleStudio(candidateId, "target");
+  }
+
   function openBulkStyleStudio() {
-    setStyleStudioTargetCandidateId(null);
-    setStyleStudioScope("selected");
-    const currentFraming = (detail?.project.framingMode as "adaptive" | "original") || "adaptive";
-    setStyleStudioFraming(currentFraming === "original" ? "original" : "adaptive");
-    setStyleStudioCaption(detail?.project.captionStyle || "preset_minimal_capsule");
-    setStyleStudioOpen(true);
+    openStyleStudio(null, "selected");
   }
 
   async function applyStyleStudioAndRerender() {
@@ -1180,12 +1270,26 @@ function App() {
     }
     setPreviousRenderHistory(nextHistory);
 
-    // 2. Persist updated framing and caption style to backend DB
+    // 2. Persist updated framing, caption style, presentation mode, and presentation config to backend DB
+    const presentationConfig = JSON.stringify({
+      platform_strategy: styleStudioPlatformStrategy,
+      platformStrategy: styleStudioPlatformStrategy,
+      subtitle_style: styleStudioSubtitleLook,
+      subtitleLook: styleStudioSubtitleLook,
+      title_style: styleStudioTitleStyle,
+      titleStyle: styleStudioTitleStyle,
+      title_motion: styleStudioTitleMotion,
+      titleMotion: styleStudioTitleMotion,
+      template: styleStudioTemplate,
+    });
+
     try {
       await invoke("update_project_style", {
         projectId: detail.project.id,
         captionStyle: styleStudioCaption,
         framingMode: styleStudioFraming,
+        presentationMode: styleStudioPresentationMode,
+        presentationConfig,
       });
     } catch (err) {
       console.warn("[Style Studio] Failed to update project style in DB:", err);
@@ -2259,126 +2363,308 @@ function App() {
 
             {/* Scrollable Body */}
             <div className="style-studio-body">
-              {/* Section 1: Framing */}
+              {/* Section 1: Presentation Engine */}
               <section className="style-studio-section">
-                <h4 className="style-studio-section-title">Framing</h4>
+                <h4 className="style-studio-section-title">Presentation Engine</h4>
                 <div className="style-studio-framing-grid">
                   <div
-                    className={`style-studio-framing-card ${styleStudioFraming === "adaptive" ? "selected" : ""}`}
-                    onClick={() => setStyleStudioFraming("adaptive")}
+                    className={`style-studio-framing-card ${styleStudioPresentationMode === "autoshorts" ? "selected" : ""}`}
+                    onClick={() => setStyleStudioPresentationMode("autoshorts")}
                   >
                     <div className="style-studio-framing-top">
                       <div className="framing-icon-box mint">
                         <Crop size={16} />
                       </div>
                       <div className="card-indicator">
-                        {styleStudioFraming === "adaptive" ? (
+                        {styleStudioPresentationMode === "autoshorts" ? (
                           <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
                         ) : (
                           <div className="indicator-empty" />
                         )}
                       </div>
                     </div>
-                    <span className="style-studio-card-title">Adaptive Framing</span>
-                    <p className="style-studio-card-desc">Dynamic speaker tracking and isolation</p>
+                    <span className="style-studio-card-title">AutoShorts Native (Mode 1)</span>
+                    <p className="style-studio-card-desc">BoT-SORT tracking, 1:1 midpoint retention &amp; kinetic ASS</p>
                   </div>
 
                   <div
-                    className={`style-studio-framing-card ${styleStudioFraming === "original" ? "selected" : ""}`}
-                    onClick={() => setStyleStudioFraming("original")}
+                    className={`style-studio-framing-card ${styleStudioPresentationMode === "autoclip" ? "selected" : ""}`}
+                    onClick={() => setStyleStudioPresentationMode("autoclip")}
                   >
                     <div className="style-studio-framing-top">
-                      <div className="framing-icon-box">
-                        <Smartphone size={16} />
+                      <div className="framing-icon-box slate">
+                        <Clapperboard size={16} />
                       </div>
                       <div className="card-indicator">
-                        {styleStudioFraming === "original" ? (
+                        {styleStudioPresentationMode === "autoclip" ? (
                           <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
                         ) : (
                           <div className="indicator-empty" />
                         )}
                       </div>
                     </div>
-                    <span className="style-studio-card-title">Original 9:16</span>
-                    <p className="style-studio-card-desc">Fixed portrait framing, DualFrame where supported</p>
+                    <span className="style-studio-card-title">AutoClip Studio (Mode 2)</span>
+                    <p className="style-studio-card-desc">YuNet detector, hard cuts, mouth motion &amp; PIL TitleArt</p>
                   </div>
                 </div>
               </section>
 
-              {/* Section 2: Caption Style */}
-              <section className="style-studio-section">
-                <h4 className="style-studio-section-title">Caption Style</h4>
-                <div className="style-studio-caption-grid">
-                  {/* Clean */}
-                  <div
-                    className={`style-studio-caption-card ${
-                      styleStudioCaption === "preset_minimal_capsule" || styleStudioCaption === "preset_cinematic_vlog"
-                        ? "selected"
-                        : ""
-                    }`}
-                    onClick={() => setStyleStudioCaption("preset_minimal_capsule")}
-                  >
-                    <div className="style-studio-preview-box">
-                      <div className="preview-pill-clean">How sleep affects cortisol</div>
-                    </div>
-                    <span className="style-studio-card-title">Clean</span>
-                    <p className="style-studio-card-desc">Minimal centered</p>
-                  </div>
+              {styleStudioPresentationMode === "autoshorts" ? (
+                <>
+                  {/* Mode 1 - Section 2: Framing */}
+                  <section className="style-studio-section">
+                    <h4 className="style-studio-section-title">Framing</h4>
+                    <div className="style-studio-framing-grid">
+                      <div
+                        className={`style-studio-framing-card ${styleStudioFraming === "adaptive" ? "selected" : ""}`}
+                        onClick={() => setStyleStudioFraming("adaptive")}
+                      >
+                        <div className="style-studio-framing-top">
+                          <div className="framing-icon-box mint">
+                            <Crop size={16} />
+                          </div>
+                          <div className="card-indicator">
+                            {styleStudioFraming === "adaptive" ? (
+                              <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
+                            ) : (
+                              <div className="indicator-empty" />
+                            )}
+                          </div>
+                        </div>
+                        <span className="style-studio-card-title">Adaptive Framing</span>
+                        <p className="style-studio-card-desc">Dynamic speaker tracking and isolation</p>
+                      </div>
 
-                  {/* Bold */}
-                  <div
-                    className={`style-studio-caption-card ${
-                      styleStudioCaption === "preset_viral_bold" || styleStudioCaption === "preset_bhaukal_caption"
-                        ? "selected"
-                        : ""
-                    }`}
-                    onClick={() => setStyleStudioCaption("preset_viral_bold")}
-                  >
-                    <div className="style-studio-preview-box">
-                      <div className="preview-text-bold">HORMOZI VIRAL</div>
-                    </div>
-                    <span className="style-studio-card-title">Bold</span>
-                    <p className="style-studio-card-desc">Punchy uppercase</p>
-                  </div>
-
-                  {/* Word Highlight */}
-                  <div
-                    className={`style-studio-caption-card ${
-                      styleStudioCaption === "preset_mrbeast_pop" ||
-                      styleStudioCaption === "preset_dynamic_editorial" ||
-                      styleStudioCaption === "preset_t7"
-                        ? "selected"
-                        : ""
-                    }`}
-                    onClick={() => setStyleStudioCaption("preset_mrbeast_pop")}
-                  >
-                    <div className="style-studio-preview-box">
-                      <div className="preview-text-highlight">
-                        Morning <span className="word-accent">cortisol</span>
+                      <div
+                        className={`style-studio-framing-card ${styleStudioFraming === "original" ? "selected" : ""}`}
+                        onClick={() => setStyleStudioFraming("original")}
+                      >
+                        <div className="style-studio-framing-top">
+                          <div className="framing-icon-box">
+                            <Smartphone size={16} />
+                          </div>
+                          <div className="card-indicator">
+                            {styleStudioFraming === "original" ? (
+                              <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
+                            ) : (
+                              <div className="indicator-empty" />
+                            )}
+                          </div>
+                        </div>
+                        <span className="style-studio-card-title">Original 9:16</span>
+                        <p className="style-studio-card-desc">Fixed portrait framing, DualFrame where supported</p>
                       </div>
                     </div>
-                    <span className="style-studio-card-title">Highlight</span>
-                    <p className="style-studio-card-desc">Word accent</p>
-                  </div>
-                </div>
+                  </section>
 
-                {/* Preset Chips */}
-                <div className="style-studio-presets-row">
-                  <span className="style-studio-presets-label">Preset Selector:</span>
-                  <div className="style-studio-presets-list">
-                    {CAPTION_PRESETS.map((preset) => (
-                      <button
-                        key={preset.id}
-                        type="button"
-                        className={`style-studio-preset-chip ${styleStudioCaption === preset.id ? "active" : ""}`}
-                        onClick={() => setStyleStudioCaption(preset.id)}
+                  {/* Mode 1 - Section 3: Caption Style */}
+                  <section className="style-studio-section">
+                    <h4 className="style-studio-section-title">Caption Style</h4>
+                    <div className="style-studio-caption-grid">
+                      {/* Clean */}
+                      <div
+                        className={`style-studio-caption-card ${
+                          styleStudioCaption === "preset_minimal_capsule" || styleStudioCaption === "preset_cinematic_vlog"
+                            ? "selected"
+                            : ""
+                        }`}
+                        onClick={() => setStyleStudioCaption("preset_minimal_capsule")}
                       >
-                        {preset.name}
-                      </button>
-                    ))}
+                        <div className="style-studio-preview-box">
+                          <div className="preview-pill-clean">How sleep affects cortisol</div>
+                        </div>
+                        <span className="style-studio-card-title">Clean</span>
+                        <p className="style-studio-card-desc">Minimal centered</p>
+                      </div>
+
+                      {/* Bold */}
+                      <div
+                        className={`style-studio-caption-card ${
+                          styleStudioCaption === "preset_viral_bold" || styleStudioCaption === "preset_bhaukal_caption"
+                            ? "selected"
+                            : ""
+                        }`}
+                        onClick={() => setStyleStudioCaption("preset_viral_bold")}
+                      >
+                        <div className="style-studio-preview-box">
+                          <div className="preview-text-bold">HORMOZI VIRAL</div>
+                        </div>
+                        <span className="style-studio-card-title">Bold</span>
+                        <p className="style-studio-card-desc">Punchy uppercase</p>
+                      </div>
+
+                      {/* Word Highlight */}
+                      <div
+                        className={`style-studio-caption-card ${
+                          styleStudioCaption === "preset_mrbeast_pop" ||
+                          styleStudioCaption === "preset_dynamic_editorial" ||
+                          styleStudioCaption === "preset_t7"
+                            ? "selected"
+                            : ""
+                        }`}
+                        onClick={() => setStyleStudioCaption("preset_mrbeast_pop")}
+                      >
+                        <div className="style-studio-preview-box">
+                          <div className="preview-text-highlight">
+                            Morning <span className="word-accent">cortisol</span>
+                          </div>
+                        </div>
+                        <span className="style-studio-card-title">Highlight</span>
+                        <p className="style-studio-card-desc">Word accent</p>
+                      </div>
+                    </div>
+
+                    {/* Preset Chips */}
+                    <div className="style-studio-presets-row">
+                      <span className="style-studio-presets-label">Preset Selector:</span>
+                      <div className="style-studio-presets-list">
+                        {CAPTION_PRESETS.map((preset) => (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            className={`style-studio-preset-chip ${styleStudioCaption === preset.id ? "active" : ""}`}
+                            onClick={() => setStyleStudioCaption(preset.id)}
+                          >
+                            {preset.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </section>
+                </>
+              ) : (
+                /* Mode 2: AutoClip Studio Controls */
+                <section className="style-studio-section" style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+                  <h4 className="style-studio-section-title">AutoClip Studio Controls</h4>
+
+                  {/* Platform Strategy */}
+                  <div>
+                    <span className="style-studio-presets-label" style={{ display: "block", marginBottom: "6px" }}>
+                      Platform Strategy
+                    </span>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: "8px" }}>
+                      {[
+                        { id: "douyin", name: "抖音 9:16", desc: "9:16 Blur" },
+                        { id: "tiktok", name: "TikTok 9:16", desc: "9:16 Crop" },
+                        { id: "youtube_shorts", name: "YouTube Shorts", desc: "9:16 Crop" },
+                        { id: "bilibili", name: "Bilibili 16:9", desc: "16:9 Fit" },
+                        { id: "xiaohongshu", name: "小红书 9:16", desc: "9:16 Blur Box" },
+                      ].map((plat) => (
+                        <div
+                          key={plat.id}
+                          className={`style-studio-framing-card ${styleStudioPlatformStrategy === plat.id ? "selected" : ""}`}
+                          style={{ padding: "8px 10px" }}
+                          onClick={() => setStyleStudioPlatformStrategy(plat.id as AutoClipPlatformStrategy)}
+                        >
+                          <div className="style-studio-framing-top">
+                            <span className="style-studio-card-title" style={{ fontSize: "12px" }}>{plat.name}</span>
+                            <div className="card-indicator">
+                              {styleStudioPlatformStrategy === plat.id ? (
+                                <div className="indicator-check"><Check size={10} strokeWidth={3} /></div>
+                              ) : (
+                                <div className="indicator-empty" />
+                              )}
+                            </div>
+                          </div>
+                          <p className="style-studio-card-desc" style={{ fontSize: "10.5px" }}>{plat.desc}</p>
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              </section>
+
+                  {/* Subtitle Look */}
+                  <div>
+                    <span className="style-studio-presets-label" style={{ display: "block", marginBottom: "6px" }}>
+                      Subtitle Look (≤2 lines, CJK/Latin width-aware)
+                    </span>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "8px" }}>
+                      {[
+                        { id: "clean", name: "Clean", desc: "White text, 2px outline" },
+                        { id: "bold", name: "Bold", desc: "Large bold white, 3px outline" },
+                        { id: "box", name: "Box", desc: "Translucent dark card box" },
+                        { id: "accent", name: "Accent", desc: "Bold yellow, high contrast" },
+                      ].map((sub) => (
+                        <div
+                          key={sub.id}
+                          className={`style-studio-framing-card ${styleStudioSubtitleLook === sub.id ? "selected" : ""}`}
+                          style={{ padding: "8px 10px" }}
+                          onClick={() => setStyleStudioSubtitleLook(sub.id as AutoClipSubtitleLook)}
+                        >
+                          <div className="style-studio-framing-top">
+                            <span className="style-studio-card-title" style={{ fontSize: "12px" }}>{sub.name}</span>
+                            <div className="card-indicator">
+                              {styleStudioSubtitleLook === sub.id ? (
+                                <div className="indicator-check"><Check size={10} strokeWidth={3} /></div>
+                              ) : (
+                                <div className="indicator-empty" />
+                              )}
+                            </div>
+                          </div>
+                          <p className="style-studio-card-desc" style={{ fontSize: "10.5px" }}>{sub.desc}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Title Art Style */}
+                  <div>
+                    <span className="style-studio-presets-label" style={{ display: "block", marginBottom: "6px" }}>
+                      Title Art Style (PIL Artwork)
+                    </span>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                      {[
+                        { id: "comic", name: "Comic" },
+                        { id: "neon", name: "Neon" },
+                        { id: "arena", name: "Arena" },
+                        { id: "editorial", name: "Editorial" },
+                        { id: "pixel", name: "Pixel" },
+                        { id: "frosted", name: "Frosted" },
+                        { id: "plain", name: "Plain / None" },
+                      ].map((tit) => (
+                        <button
+                          key={tit.id}
+                          type="button"
+                          className={`style-studio-preset-chip ${styleStudioTitleStyle === tit.id ? "active" : ""}`}
+                          onClick={() => setStyleStudioTitleStyle(tit.id as AutoClipTitleStyle)}
+                        >
+                          {tit.name}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Title Motion Toggle & Template */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: "8px", padding: "10px", background: "var(--bg-surface)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-color)" }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", fontSize: "12px", fontWeight: 600 }}>
+                      <input
+                        type="checkbox"
+                        checked={styleStudioTitleMotion}
+                        onChange={(e) => setStyleStudioTitleMotion(e.target.checked)}
+                        style={{ width: "15px", height: "15px", cursor: "pointer" }}
+                      />
+                      <span>Enable Title Motion (Dynamic Zoom / Keyframe Overlays)</span>
+                    </label>
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "4px" }}>
+                      <span style={{ fontSize: "11.5px", color: "var(--text-secondary)" }}>Packaging Template:</span>
+                      <div style={{ display: "flex", gap: "6px" }}>
+                        {[
+                          { id: "interview_zh", label: "Interview (ZH)" },
+                          { id: "podcast_en", label: "Podcast (EN)" },
+                        ].map((tpl) => (
+                          <button
+                            key={tpl.id}
+                            type="button"
+                            className={`style-studio-preset-chip ${styleStudioTemplate === tpl.id ? "active" : ""}`}
+                            onClick={() => setStyleStudioTemplate(tpl.id as AutoClipTemplate)}
+                          >
+                            {tpl.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </section>
+              )}
 
               {/* Section 3: Scope Selection */}
               <section className="style-studio-section">
@@ -2433,17 +2719,54 @@ function App() {
                     </span>
                   </div>
                   <div className="style-studio-summary-row">
-                    <span className="style-studio-summary-label">Framing</span>
+                    <span className="style-studio-summary-label">Engine</span>
                     <span className="style-studio-summary-value">
-                      {styleStudioFraming === "adaptive" ? "Adaptive Framing" : "Original 9:16"}
+                      {styleStudioPresentationMode === "autoshorts" ? "AutoShorts Native (Mode 1)" : "AutoClip Studio (Mode 2)"}
                     </span>
                   </div>
-                  <div className="style-studio-summary-row">
-                    <span className="style-studio-summary-label">Captions</span>
-                    <span className="style-studio-summary-value">
-                      {CAPTION_PRESETS.find(p => p.id === styleStudioCaption)?.name || styleStudioCaption}
-                    </span>
-                  </div>
+                  {styleStudioPresentationMode === "autoshorts" ? (
+                    <>
+                      <div className="style-studio-summary-row">
+                        <span className="style-studio-summary-label">Framing</span>
+                        <span className="style-studio-summary-value">
+                          {styleStudioFraming === "adaptive" ? "Adaptive Framing" : "Original 9:16"}
+                        </span>
+                      </div>
+                      <div className="style-studio-summary-row">
+                        <span className="style-studio-summary-label">Captions</span>
+                        <span className="style-studio-summary-value">
+                          {CAPTION_PRESETS.find(p => p.id === styleStudioCaption)?.name || styleStudioCaption}
+                        </span>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="style-studio-summary-row">
+                        <span className="style-studio-summary-label">Platform</span>
+                        <span className="style-studio-summary-value" style={{ textTransform: "capitalize" }}>
+                          {styleStudioPlatformStrategy.replace("_", " ")}
+                        </span>
+                      </div>
+                      <div className="style-studio-summary-row">
+                        <span className="style-studio-summary-label">Subtitle Look</span>
+                        <span className="style-studio-summary-value" style={{ textTransform: "capitalize" }}>
+                          {styleStudioSubtitleLook}
+                        </span>
+                      </div>
+                      <div className="style-studio-summary-row">
+                        <span className="style-studio-summary-label">Title Art</span>
+                        <span className="style-studio-summary-value" style={{ textTransform: "capitalize" }}>
+                          {styleStudioTitleStyle} {styleStudioTitleMotion ? "(Motion)" : ""}
+                        </span>
+                      </div>
+                      <div className="style-studio-summary-row">
+                        <span className="style-studio-summary-label">Template</span>
+                        <span className="style-studio-summary-value">
+                          {styleStudioTemplate === "interview_zh" ? "Interview (ZH)" : "Podcast (EN)"}
+                        </span>
+                      </div>
+                    </>
+                  )}
                   <div className="style-studio-summary-row">
                     <span className="style-studio-summary-label">Estimated renders</span>
                     <span className="style-studio-summary-value">
@@ -2455,7 +2778,9 @@ function App() {
                 <div className="style-studio-recommendation-card">
                   <Sparkles size={15} />
                   <span>
-                    AI Recommendation: Adaptive Framing with high-contrast captions delivers highest completion rate on short-form platforms.
+                    {styleStudioPresentationMode === "autoshorts"
+                      ? "AI Recommendation: Adaptive Framing with high-contrast captions delivers highest completion rate on short-form platforms."
+                      : "AutoClip Studio: CJK 2-line subtitles, optical-flow mouth tracking, and platform packaging optimized for viral retention."}
                   </span>
                 </div>
               </section>
@@ -2528,23 +2853,24 @@ function App() {
 
             {/* Scrollable Modal Body */}
             <div className="style-modal-body">
-              {/* Section 1: Framing */}
+              {/* Section 1: Presentation Engine */}
               <section className="modal-section">
                 <div className="modal-section-header">
-                  <h2 className="modal-section-title">Framing</h2>
-                  <span className="modal-section-step">Step 1 of 3</span>
+                  <h2 className="modal-section-title">Presentation Engine</h2>
+                  <span className="modal-section-step">Step 1 of 3 · Engine Architecture</span>
                 </div>
                 <div className="framing-grid">
+                  {/* Mode 1: AutoShorts Native */}
                   <div
-                    className={`framing-card ${selectedFramingMode === "adaptive" ? "selected" : ""}`}
-                    onClick={() => setSelectedFramingMode("adaptive")}
+                    className={`framing-card ${selectedPresentationMode === "autoshorts" ? "selected" : ""}`}
+                    onClick={() => setSelectedPresentationMode("autoshorts")}
                   >
                     <div className="card-top-row">
                       <div className="card-icon-box mint">
                         <Crop size={18} />
                       </div>
                       <div className="card-indicator">
-                        {selectedFramingMode === "adaptive" ? (
+                        {selectedPresentationMode === "autoshorts" ? (
                           <div className="indicator-check"><Check size={13} strokeWidth={3} /></div>
                         ) : (
                           <div className="indicator-empty" />
@@ -2552,24 +2878,25 @@ function App() {
                       </div>
                     </div>
                     <div className="card-title-row">
-                      <span className="card-title">Adaptive Framing</span>
-                      <span className="card-badge mint">SMART</span>
+                      <span className="card-title">AutoShorts Native (Mode 1)</span>
+                      <span className="card-badge mint">DEFAULT</span>
                     </div>
                     <p className="card-desc">
-                      AutoShorts dynamically tracks and reframes speakers, isolating the active speaker when two or more are present.
+                      YOLOv8/11 + BoT-SORT continuous tracking, 1:1 midpoint retention, kinetic ASS subtitles.
                     </p>
                   </div>
 
+                  {/* Mode 2: AutoClip Studio */}
                   <div
-                    className={`framing-card ${selectedFramingMode === "original" ? "selected" : ""}`}
-                    onClick={() => setSelectedFramingMode("original")}
+                    className={`framing-card ${selectedPresentationMode === "autoclip" ? "selected" : ""}`}
+                    onClick={() => setSelectedPresentationMode("autoclip")}
                   >
                     <div className="card-top-row">
-                      <div className="card-icon-box">
-                        <Smartphone size={18} />
+                      <div className="card-icon-box slate">
+                        <Clapperboard size={18} />
                       </div>
                       <div className="card-indicator">
-                        {selectedFramingMode === "original" ? (
+                        {selectedPresentationMode === "autoclip" ? (
                           <div className="indicator-check"><Check size={13} strokeWidth={3} /></div>
                         ) : (
                           <div className="indicator-empty" />
@@ -2577,117 +2904,325 @@ function App() {
                       </div>
                     </div>
                     <div className="card-title-row">
-                      <span className="card-title">Original 9:16</span>
+                      <span className="card-title">AutoClip Studio (Mode 2)</span>
+                      <span className="card-badge slate">STUDIO</span>
                     </div>
                     <p className="card-desc">
-                      Preserves original recording framing at 9:16 aspect ratio. Includes DualFrame layout when multiple speakers are detected.
+                      OpenCV YuNet, hard cuts, mouth optical flow, hold-segment framing, blurred fit fallback, CJK 2-line subtitles, PIL TitleArt.
                     </p>
                   </div>
                 </div>
               </section>
 
-              {/* Section 2: Caption Style */}
+              {/* Section 2: Presentation Styling */}
               <section className="modal-section">
                 <div className="modal-section-header">
-                  <h2 className="modal-section-title">Caption Style</h2>
-                  <span className="modal-section-step">Step 2 of 3 · Live On-screen Rendering</span>
-                </div>
-                <div className="style-grid-c">
-                  {/* Clean */}
-                  <div
-                    className={`style-card-c ${selectedStyle === "preset_minimal_capsule" || selectedStyle === "preset_cinematic_vlog" ? "selected" : ""}`}
-                    onClick={() => setSelectedStyle("preset_minimal_capsule")}
-                  >
-                    <div className="style-preview-box-c">
-                      <div className="preview-dots">
-                        <span /><span />
-                      </div>
-                      <div className="preview-badge-clean">
-                        How sleep affects cortisol
-                      </div>
-                    </div>
-                    <div className="card-info-row">
-                      <div className="card-info">
-                        <span className="card-title">Clean</span>
-                        <p className="card-desc-compact">Minimal, centered captions.</p>
-                      </div>
-                      <div className="card-indicator">
-                        {selectedStyle === "preset_minimal_capsule" || selectedStyle === "preset_cinematic_vlog" ? (
-                          <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
-                        ) : (
-                          <div className="indicator-empty" />
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Bold */}
-                  <div
-                    className={`style-card-c ${selectedStyle === "preset_viral_bold" || selectedStyle === "preset_bhaukal_caption" ? "selected" : ""}`}
-                    onClick={() => setSelectedStyle("preset_viral_bold")}
-                  >
-                    <div className="style-preview-box-c">
-                      <div className="preview-text-bold">
-                        HORMOZI VIRAL
-                      </div>
-                    </div>
-                    <div className="card-info-row">
-                      <div className="card-info">
-                        <span className="card-title">Bold</span>
-                        <p className="card-desc-compact">High-contrast, punchy captions.</p>
-                      </div>
-                      <div className="card-indicator">
-                        {selectedStyle === "preset_viral_bold" || selectedStyle === "preset_bhaukal_caption" ? (
-                          <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
-                        ) : (
-                          <div className="indicator-empty" />
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Word Highlight */}
-                  <div
-                    className={`style-card-c ${selectedStyle === "preset_mrbeast_pop" || selectedStyle === "preset_dynamic_editorial" || selectedStyle === "preset_t7" ? "selected" : ""}`}
-                    onClick={() => setSelectedStyle("preset_mrbeast_pop")}
-                  >
-                    <div className="style-preview-box-c">
-                      <div className="preview-text-highlight">
-                        The morning <span className="word-accent">cortisol</span> surge
-                      </div>
-                    </div>
-                    <div className="card-info-row">
-                      <div className="card-info">
-                        <span className="card-title">Word Highlight</span>
-                        <p className="card-desc-compact">Word-by-word accented karaoke.</p>
-                      </div>
-                      <div className="card-indicator">
-                        {selectedStyle === "preset_mrbeast_pop" || selectedStyle === "preset_dynamic_editorial" || selectedStyle === "preset_t7" ? (
-                          <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
-                        ) : (
-                          <div className="indicator-empty" />
-                        )}
-                      </div>
-                    </div>
-                  </div>
+                  <h2 className="modal-section-title">
+                    {selectedPresentationMode === "autoshorts" ? "Presentation Styling" : "AutoClip Studio Styling"}
+                  </h2>
+                  <span className="modal-section-step">Step 2 of 3 · Visual &amp; Layout Styling</span>
                 </div>
 
-                {/* Secondary row for specific presets */}
-                <div className="style-presets-row">
-                  <span className="presets-row-label">Specific Preset:</span>
-                  <div className="preset-pills-list">
-                    {CAPTION_PRESETS.map((preset) => (
-                      <button
-                        key={preset.id}
-                        type="button"
-                        className={`preset-pill-chip ${selectedStyle === preset.id ? "active" : ""}`}
-                        onClick={() => setSelectedStyle(preset.id)}
+                {selectedPresentationMode === "autoshorts" ? (
+                  <>
+                    {/* Mode 1 Framing options */}
+                    <div style={{ marginBottom: "16px" }}>
+                      <span className="presets-row-label" style={{ display: "block", marginBottom: "8px", fontWeight: 600 }}>
+                        Framing Mode
+                      </span>
+                      <div className="framing-grid">
+                        <div
+                          className={`framing-card ${selectedFramingMode === "adaptive" ? "selected" : ""}`}
+                          onClick={() => setSelectedFramingMode("adaptive")}
+                        >
+                          <div className="card-top-row">
+                            <div className="card-icon-box mint">
+                              <Crop size={18} />
+                            </div>
+                            <div className="card-indicator">
+                              {selectedFramingMode === "adaptive" ? (
+                                <div className="indicator-check"><Check size={13} strokeWidth={3} /></div>
+                              ) : (
+                                <div className="indicator-empty" />
+                              )}
+                            </div>
+                          </div>
+                          <div className="card-title-row">
+                            <span className="card-title">Adaptive Framing</span>
+                            <span className="card-badge mint">SMART</span>
+                          </div>
+                          <p className="card-desc">
+                            AutoShorts dynamically tracks and reframes speakers, isolating the active speaker when two or more are present.
+                          </p>
+                        </div>
+
+                        <div
+                          className={`framing-card ${selectedFramingMode === "original" ? "selected" : ""}`}
+                          onClick={() => setSelectedFramingMode("original")}
+                        >
+                          <div className="card-top-row">
+                            <div className="card-icon-box">
+                              <Smartphone size={18} />
+                            </div>
+                            <div className="card-indicator">
+                              {selectedFramingMode === "original" ? (
+                                <div className="indicator-check"><Check size={13} strokeWidth={3} /></div>
+                              ) : (
+                                <div className="indicator-empty" />
+                              )}
+                            </div>
+                          </div>
+                          <div className="card-title-row">
+                            <span className="card-title">Original 9:16</span>
+                          </div>
+                          <p className="card-desc">
+                            Preserves original recording framing at 9:16 aspect ratio. Includes DualFrame layout when multiple speakers are detected.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Mode 1 Caption presets */}
+                    <span className="presets-row-label" style={{ display: "block", marginBottom: "8px", fontWeight: 600 }}>
+                      Caption Preset
+                    </span>
+                    <div className="style-grid-c">
+                      {/* Clean */}
+                      <div
+                        className={`style-card-c ${selectedStyle === "preset_minimal_capsule" || selectedStyle === "preset_cinematic_vlog" ? "selected" : ""}`}
+                        onClick={() => setSelectedStyle("preset_minimal_capsule")}
                       >
-                        {preset.name}
-                      </button>
-                    ))}
+                        <div className="style-preview-box-c">
+                          <div className="preview-dots">
+                            <span /><span />
+                          </div>
+                          <div className="preview-badge-clean">
+                            How sleep affects cortisol
+                          </div>
+                        </div>
+                        <div className="card-info-row">
+                          <div className="card-info">
+                            <span className="card-title">Clean</span>
+                            <p className="card-desc-compact">Minimal, centered captions.</p>
+                          </div>
+                          <div className="card-indicator">
+                            {selectedStyle === "preset_minimal_capsule" || selectedStyle === "preset_cinematic_vlog" ? (
+                              <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
+                            ) : (
+                              <div className="indicator-empty" />
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Bold */}
+                      <div
+                        className={`style-card-c ${selectedStyle === "preset_viral_bold" || selectedStyle === "preset_bhaukal_caption" ? "selected" : ""}`}
+                        onClick={() => setSelectedStyle("preset_viral_bold")}
+                      >
+                        <div className="style-preview-box-c">
+                          <div className="preview-text-bold">
+                            HORMOZI VIRAL
+                          </div>
+                        </div>
+                        <div className="card-info-row">
+                          <div className="card-info">
+                            <span className="card-title">Bold</span>
+                            <p className="card-desc-compact">High-contrast, punchy captions.</p>
+                          </div>
+                          <div className="card-indicator">
+                            {selectedStyle === "preset_viral_bold" || selectedStyle === "preset_bhaukal_caption" ? (
+                              <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
+                            ) : (
+                              <div className="indicator-empty" />
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Word Highlight */}
+                      <div
+                        className={`style-card-c ${selectedStyle === "preset_mrbeast_pop" || selectedStyle === "preset_dynamic_editorial" || selectedStyle === "preset_t7" ? "selected" : ""}`}
+                        onClick={() => setSelectedStyle("preset_mrbeast_pop")}
+                      >
+                        <div className="style-preview-box-c">
+                          <div className="preview-text-highlight">
+                            The morning <span className="word-accent">cortisol</span> surge
+                          </div>
+                        </div>
+                        <div className="card-info-row">
+                          <div className="card-info">
+                            <span className="card-title">Word Highlight</span>
+                            <p className="card-desc-compact">Word-by-word accented karaoke.</p>
+                          </div>
+                          <div className="card-indicator">
+                            {selectedStyle === "preset_mrbeast_pop" || selectedStyle === "preset_dynamic_editorial" || selectedStyle === "preset_t7" ? (
+                              <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
+                            ) : (
+                              <div className="indicator-empty" />
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Secondary row for specific presets */}
+                    <div className="style-presets-row">
+                      <span className="presets-row-label">Specific Preset:</span>
+                      <div className="preset-pills-list">
+                        {CAPTION_PRESETS.map((preset) => (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            className={`preset-pill-chip ${selectedStyle === preset.id ? "active" : ""}`}
+                            onClick={() => setSelectedStyle(preset.id)}
+                          >
+                            {preset.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  /* Mode 2: AutoClip Isolated Controls */
+                  <div className="autoclip-isolated-controls" style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                    {/* Platform Strategy */}
+                    <div>
+                      <span className="presets-row-label" style={{ display: "block", marginBottom: "8px", fontWeight: 600 }}>
+                        Platform Strategy
+                      </span>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "10px" }}>
+                        {[
+                          { id: "douyin", name: "抖音 9:16", desc: "9:16 Blur Backdrop" },
+                          { id: "tiktok", name: "TikTok 9:16", desc: "9:16 Tight Face Crop" },
+                          { id: "youtube_shorts", name: "YouTube Shorts", desc: "9:16 Portrait Crop" },
+                          { id: "bilibili", name: "Bilibili 16:9", desc: "16:9 Landscape Fit" },
+                          { id: "xiaohongshu", name: "小红书 9:16", desc: "9:16 Blur + Card" },
+                        ].map((plat) => (
+                          <div
+                            key={plat.id}
+                            className={`framing-card ${platformStrategy === plat.id ? "selected" : ""}`}
+                            style={{ padding: "10px" }}
+                            onClick={() => setPlatformStrategy(plat.id as AutoClipPlatformStrategy)}
+                          >
+                            <div className="card-top-row">
+                              <span className="card-title" style={{ fontSize: "13px" }}>{plat.name}</span>
+                              <div className="card-indicator">
+                                {platformStrategy === plat.id ? (
+                                  <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
+                                ) : (
+                                  <div className="indicator-empty" />
+                                )}
+                              </div>
+                            </div>
+                            <p className="card-desc" style={{ fontSize: "11px", margin: 0 }}>{plat.desc}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Subtitle Look */}
+                    <div>
+                      <span className="presets-row-label" style={{ display: "block", marginBottom: "8px", fontWeight: 600 }}>
+                        Subtitle Look (≤2 lines per screen, CJK/Latin width-aware)
+                      </span>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "10px" }}>
+                        {[
+                          { id: "clean", name: "Clean", desc: "White text, 2px outline" },
+                          { id: "bold", name: "Bold", desc: "Large bold white, 3px outline" },
+                          { id: "box", name: "Box", desc: "Translucent dark card box" },
+                          { id: "accent", name: "Accent", desc: "Bold yellow, high contrast" },
+                        ].map((sub) => (
+                          <div
+                            key={sub.id}
+                            className={`framing-card ${subtitleLook === sub.id ? "selected" : ""}`}
+                            style={{ padding: "10px" }}
+                            onClick={() => setSubtitleLook(sub.id as AutoClipSubtitleLook)}
+                          >
+                            <div className="card-top-row">
+                              <span className="card-title" style={{ fontSize: "13px" }}>{sub.name}</span>
+                              <div className="card-indicator">
+                                {subtitleLook === sub.id ? (
+                                  <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
+                                ) : (
+                                  <div className="indicator-empty" />
+                                )}
+                              </div>
+                            </div>
+                            <p className="card-desc" style={{ fontSize: "11px", margin: 0 }}>{sub.desc}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Title Art Style */}
+                    <div>
+                      <span className="presets-row-label" style={{ display: "block", marginBottom: "8px", fontWeight: 600 }}>
+                        Title Art Style (PIL Multi-Layer Artwork)
+                      </span>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: "8px" }}>
+                        {[
+                          { id: "comic", name: "Comic Punch" },
+                          { id: "neon", name: "Neon Glow" },
+                          { id: "arena", name: "Arena Slanted" },
+                          { id: "editorial", name: "Editorial Bold" },
+                          { id: "pixel", name: "Pixel Retro" },
+                          { id: "frosted", name: "Frosted Glass" },
+                          { id: "plain", name: "Plain / None" },
+                        ].map((tit) => (
+                          <div
+                            key={tit.id}
+                            className={`framing-card ${titleStyle === tit.id ? "selected" : ""}`}
+                            style={{ padding: "8px 10px" }}
+                            onClick={() => setTitleStyle(tit.id as AutoClipTitleStyle)}
+                          >
+                            <div className="card-top-row">
+                              <span className="card-title" style={{ fontSize: "12px" }}>{tit.name}</span>
+                              <div className="card-indicator">
+                                {titleStyle === tit.id ? (
+                                  <div className="indicator-check"><Check size={10} strokeWidth={3} /></div>
+                                ) : (
+                                  <div className="indicator-empty" />
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Title Motion Toggle & Template */}
+                    <div style={{ display: "flex", gap: "16px", alignItems: "center", flexWrap: "wrap", padding: "12px", background: "var(--bg-surface, #F8F9FA)", borderRadius: "8px", border: "1px solid var(--border-color, #E0E1E3)" }}>
+                      <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", fontSize: "13px", fontWeight: 600 }}>
+                        <input
+                          type="checkbox"
+                          checked={titleMotion}
+                          onChange={(e) => setTitleMotion(e.target.checked)}
+                          style={{ width: "16px", height: "16px", cursor: "pointer" }}
+                        />
+                        <span>Enable Title Motion (Dynamic Zoom / Keyframe Overlays)</span>
+                      </label>
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px", marginLeft: "auto" }}>
+                        <span style={{ fontSize: "12px", color: "var(--text-secondary, #666)" }}>Template:</span>
+                        <div style={{ display: "flex", gap: "6px" }}>
+                          {[
+                            { id: "interview_zh", label: "Interview (ZH)" },
+                            { id: "podcast_en", label: "Podcast (EN)" },
+                          ].map((tpl) => (
+                            <button
+                              key={tpl.id}
+                              type="button"
+                              className={`preset-pill-chip ${template === tpl.id ? "active" : ""}`}
+                              onClick={() => setTemplate(tpl.id as AutoClipTemplate)}
+                            >
+                              {tpl.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
                   </div>
-                </div>
+                )}
               </section>
 
               {/* Section 3: Scoring Backend */}
@@ -2801,9 +3336,9 @@ function App() {
                 <button
                   type="button"
                   className="btn-modal-confirm"
-                  disabled={!selectedStyle}
+                  disabled={selectedPresentationMode === "autoshorts" ? !selectedStyle : false}
                   onClick={() => {
-                    if (selectedStyle) confirmImport(selectedStyle, selectedFramingMode);
+                    confirmImport(selectedStyle, selectedFramingMode);
                   }}
                 >
                   <span>Start Processing</span>

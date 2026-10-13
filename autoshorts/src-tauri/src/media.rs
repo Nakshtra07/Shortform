@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::models::{CandidateDraft, MediaProbe, MultimodalStatus, TranscriptWord};
+use crate::models::{Candidate, CandidateDraft, MediaProbe, MultimodalStatus, TranscriptWord};
 
 pub fn find_ytdlp_cmd() -> Option<PathBuf> {
     // 1. Check environment variables
@@ -690,6 +690,55 @@ fn find_speaker_tracker_script() -> Option<PathBuf> {
 
     // Look for the speaker_tracker.py script relative to the binary or in common locations
     let script_name = "speaker_tracker.py";
+
+    // 1. Next to the executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidates = [
+                parent.join(script_name),
+                parent.join("scripts").join(script_name),
+                parent.join("../../scripts").join(script_name),
+                parent.join("../../../scripts").join(script_name),
+            ];
+            for c in &candidates {
+                if c.exists() {
+                    return Some(c.clone());
+                }
+            }
+        }
+    }
+
+    // 2. In the src-tauri/scripts dir during development
+    let dev_paths = [
+        PathBuf::from("autoshorts/src-tauri/scripts").join(script_name),
+        PathBuf::from("src-tauri/scripts").join(script_name),
+        PathBuf::from("scripts").join(script_name),
+        PathBuf::from("../src-tauri/scripts").join(script_name),
+        PathBuf::from("../../scripts").join(script_name),
+    ];
+    for p in &dev_paths {
+        if p.exists() {
+            return Some(p.clone());
+        }
+    }
+
+    None
+}
+
+pub fn find_autoclip_adapter_script() -> Option<PathBuf> {
+    if let Ok(override_path) = std::env::var("AUTOSHORTS_AUTOCLIP_ADAPTER_SCRIPT") {
+        let trimmed = override_path.trim();
+        if trimmed == "disabled" || trimmed == "none" || trimmed.is_empty() {
+            return None;
+        }
+        let p = PathBuf::from(trimmed);
+        if p.exists() {
+            return Some(p);
+        }
+        return None;
+    }
+
+    let script_name = "autoclip_adapter.py";
 
     // 1. Next to the executable
     if let Ok(exe) = std::env::current_exe() {
@@ -2686,6 +2735,138 @@ pub fn render_flat_clip(
     Ok(output_path.to_path_buf())
 }
 
+/// Renders a candidate clip using AutoClip Studio Presentation Mode 2 via `autoclip_adapter.py`.
+///
+/// Assembles the execution payload, invokes the adapter via Python subprocess,
+/// and enforces fail-closed semantics (reporting explicit errors without Mode 1 fallback).
+pub fn render_autoclip_clip(
+    project_id: &str,
+    video_path: &str,
+    output_path: &Path,
+    candidate: &Candidate,
+    transcript_words: Option<&[TranscriptWord]>,
+    presentation_config: Option<&str>,
+    data_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    let script_path = find_autoclip_adapter_script().ok_or_else(|| {
+        anyhow::anyhow!("AutoClip Studio render failed: autoclip_adapter.py script not found")
+    })?;
+
+    let python_cmd = find_python_cmd();
+
+    let temp_payload_path = std::env::temp_dir().join(format!(
+        "autoclip_payload_{}_{}.json",
+        candidate.id,
+        uuid::Uuid::new_v4()
+    ));
+
+    let presentation_config_val: Value = match presentation_config {
+        Some(s) if !s.trim().is_empty() => {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({}))
+        }
+        _ => serde_json::json!({}),
+    };
+
+    let candidate_val = serde_json::json!({
+        "id": candidate.id,
+        "start_sec": candidate.start_sec,
+        "end_sec": candidate.end_sec,
+        "hook": candidate.hook,
+        "score": candidate.score,
+    });
+
+    let transcript_words_val = match transcript_words {
+        Some(words) => serde_json::to_value(words).unwrap_or_else(|_| serde_json::json!([])),
+        None => serde_json::json!([]),
+    };
+
+    let payload = serde_json::json!({
+        "project_id": project_id,
+        "video_path": video_path,
+        "output_path": output_path.to_string_lossy(),
+        "candidate": candidate_val,
+        "transcript_words": transcript_words_val,
+        "presentation_config": presentation_config_val,
+    });
+
+    let payload_str = serde_json::to_string_pretty(&payload)
+        .context("Failed to serialize autoclip payload to JSON")?;
+    std::fs::write(&temp_payload_path, &payload_str)
+        .with_context(|| format!("Failed to write autoclip payload to {}", temp_payload_path.display()))?;
+
+    let mut cmd = Command::new(&python_cmd);
+    cmd.arg(&script_path)
+        .arg("--payload")
+        .arg(&temp_payload_path);
+
+    // Explicitly isolate AutoClip runtime data directory outside src-tauri
+    if let Some(dir) = data_dir {
+        let autoclip_data = dir.join("autoclip_data");
+        let _ = std::fs::create_dir_all(&autoclip_data);
+        cmd.env("AUTOCLIP_DATA_DIR", &autoclip_data);
+    } else if let Some(appdata) = dirs::data_dir() {
+        let autoclip_data = appdata.join("autoshorts").join("autoclip_data");
+        let _ = std::fs::create_dir_all(&autoclip_data);
+        cmd.env("AUTOCLIP_DATA_DIR", &autoclip_data);
+    }
+
+    let output_res = cmd.output();
+
+    // Clean up temporary payload file immediately after invocation
+    let _ = std::fs::remove_file(&temp_payload_path);
+
+    let output = match output_res {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(anyhow::anyhow!("AutoClip Studio render failed: could not execute Python process: {}", e));
+        }
+    };
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+
+    let res_json: Value = if let Ok(v) = serde_json::from_str(stdout_str.trim()) {
+        v
+    } else if let (Some(start), Some(end)) = (stdout_str.find('{'), stdout_str.rfind('}')) {
+        serde_json::from_str(&stdout_str[start..=end]).unwrap_or_else(|_| serde_json::json!({
+            "status": "error",
+            "error": format!("Could not parse adapter response JSON (stdout: {}, stderr: {})", stdout_str, stderr_str)
+        }))
+    } else {
+        serde_json::json!({
+            "status": "error",
+            "error": format!("No JSON output from adapter (exit code: {:?}, stdout: {}, stderr: {})", output.status.code(), stdout_str, stderr_str)
+        })
+    };
+
+    let status = res_json.get("status").and_then(|v| v.as_str()).unwrap_or("error");
+    if status == "success" && output.status.success() {
+        let out_file = res_json.get("output_path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| output_path.to_path_buf());
+
+        if !out_file.exists() {
+            return Err(anyhow::anyhow!(
+                "AutoClip Studio render failed: output file was not produced at {}",
+                out_file.display()
+            ));
+        }
+        Ok(out_file)
+    } else {
+        let err_msg = res_json.get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                if !stderr_str.trim().is_empty() {
+                    stderr_str.trim()
+                } else {
+                    "Adapter exited with failure"
+                }
+            });
+        Err(anyhow::anyhow!("AutoClip Studio render failed: {}", err_msg))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2789,6 +2970,13 @@ mod tests {
         let _guard = TRACKER_TEST_MUTEX.lock().unwrap();
         let script = find_speaker_tracker_script();
         assert!(script.is_some(), "speaker_tracker.py should be located");
+        assert!(script.unwrap().exists());
+    }
+
+    #[test]
+    fn test_find_autoclip_adapter_script_exists() {
+        let script = find_autoclip_adapter_script();
+        assert!(script.is_some(), "autoclip_adapter.py should be located");
         assert!(script.unwrap().exists());
     }
 

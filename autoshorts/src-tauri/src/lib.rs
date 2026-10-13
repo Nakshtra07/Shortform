@@ -493,13 +493,17 @@ fn create_project_from_path(
     transcription_mode: String,
     caption_style: String,
     framing_mode: String,
+    presentation_mode: Option<String>,
+    presentation_config: Option<String>,
 ) -> Result<Project, String> {
-    create_project_from_path_impl(
+    create_project_from_path_with_presentation_impl(
         &state.db,
         &path,
         &transcription_mode,
         &caption_style,
         &framing_mode,
+        presentation_mode.as_deref(),
+        presentation_config.as_deref(),
     )
 }
 
@@ -512,15 +516,37 @@ pub fn create_project_from_path_impl(
     caption_style: &str,
     framing_mode: &str,
 ) -> Result<Project, String> {
+    create_project_from_path_with_presentation_impl(
+        db,
+        path,
+        transcription_mode,
+        caption_style,
+        framing_mode,
+        None,
+        None,
+    )
+}
+
+pub fn create_project_from_path_with_presentation_impl(
+    db: &Database,
+    path: &str,
+    transcription_mode: &str,
+    caption_style: &str,
+    framing_mode: &str,
+    presentation_mode: Option<&str>,
+    presentation_config: Option<&str>,
+) -> Result<Project, String> {
     validate_media_extension(path).map_err(to_command_error)?;
     let probe = media::probe_media(path).ok();
 
-    db.create_project(
+    db.create_project_with_presentation(
         path,
         transcription_mode,
         caption_style,
         framing_mode,
         probe.and_then(|probe| probe.duration_sec),
+        presentation_mode,
+        presentation_config,
     )
     .map_err(to_command_error)
 }
@@ -2314,6 +2340,64 @@ pub async fn render_flat_clip_for_candidate_impl(
             .join("clips")
             .join(format!("clip-{:02}_flat.mp4", candidate.rank));
 
+        let mode = project.presentation_mode.as_deref().unwrap_or("autoshorts");
+        if mode == "autoclip" {
+            if let Some(parent) = output_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            let mut transcript_words: Option<Vec<TranscriptWord>> = None;
+            if let Ok(Some(transcript_record)) = db.latest_transcript(&project.id) {
+                if let Ok(normalized) = serde_json::from_str::<NormalizedTranscript>(&transcript_record.raw_json) {
+                    transcript_words = Some(normalized.words);
+                }
+            }
+
+            match media::render_autoclip_clip(
+                &project.id,
+                &project.source_path,
+                &output_path,
+                &candidate,
+                transcript_words.as_deref(),
+                project.presentation_config.as_deref(),
+                Some(&data_dir),
+            ) {
+                Ok(rendered_path) => {
+                    let path_string = rendered_path.to_string_lossy().to_string();
+                    let applied_features = serde_json::json!({
+                        "presentation_mode": "autoclip",
+                        "presentation_config": project.presentation_config,
+                        "engine": "autoclip_studio",
+                    });
+                    let applied_features_json = applied_features.to_string();
+                    db.update_clip_for_candidate(
+                        &candidate_id,
+                        "done",
+                        Some(&path_string),
+                        None,
+                        Some("AutoClip Studio presentation render succeeded"),
+                        Some(applied_features_json.as_str()),
+                    )
+                    .map_err(to_command_error)?;
+                    return Ok(path_string);
+                }
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    println!("[AutoClip Render Error] Mode 2 render failed: {}", err_msg);
+                    db.update_clip_for_candidate(
+                        &candidate_id,
+                        "error",
+                        None,
+                        None,
+                        Some(&err_msg),
+                        None,
+                    )
+                    .map_err(to_command_error)?;
+                    return Err(format!("AutoClip Studio render failed: {}", err_msg));
+                }
+            }
+        }
+
         let mut _srt_path = None;
         let mut ass_path = None;
         let mut drawtext_filters = None;
@@ -3065,6 +3149,8 @@ fn update_project_style(
     project_id: String,
     caption_style: Option<String>,
     framing_mode: Option<String>,
+    presentation_mode: Option<String>,
+    presentation_config: Option<String>,
 ) -> Result<(), String> {
     state
         .db
@@ -3072,6 +3158,8 @@ fn update_project_style(
             &project_id,
             caption_style.as_deref(),
             framing_mode.as_deref(),
+            presentation_mode.as_deref(),
+            presentation_config.as_deref(),
         )
         .map_err(to_command_error)
 }
