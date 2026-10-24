@@ -624,6 +624,14 @@ function App() {
     let isCancelled = false;
     let unlistenFn: (() => void) | null = null;
 
+    // Immediately provide a default idle status so the pill is ALWAYS visible without IPC delay
+    setSceneIntelStatus((prev) => (prev?.projectId === pid ? prev : {
+      projectId: pid,
+      status: "idle",
+      progress: 0,
+      sceneCount: 0,
+    }));
+
     // Hydrate initial status
     invoke<SceneIntelStatus>("get_scene_intelligence_status", { projectId: pid })
       .then((status) => {
@@ -2002,55 +2010,63 @@ function App() {
                         <option value="window_scoring">Discovery: REZE Window</option>
                       </select>
 
-                      {sceneIntelStatus && (
-                        <div
-                          className={`scene-intel-pill status-${sceneIntelStatus.status}`}
-                          onClick={() => {
-                            if (sceneIntelStatus.status === "idle" || sceneIntelStatus.status === "error") {
-                              invoke<SceneIntelStatus>("trigger_scene_intelligence", { projectId: detail.project.id })
-                                .then((status) => { if (status) setSceneIntelStatus(status); })
-                                .catch((err) => console.warn("[SceneIntel] Failed to trigger:", err));
+                      {(() => {
+                        const effectiveStatus: SceneIntelStatus = sceneIntelStatus ?? {
+                          projectId: detail.project.id,
+                          status: "idle",
+                          progress: 0,
+                          sceneCount: 0,
+                        };
+                        return (
+                          <div
+                            className={`scene-intel-pill status-${effectiveStatus.status}`}
+                            onClick={() => {
+                              if (effectiveStatus.status === "idle" || effectiveStatus.status === "error") {
+                                invoke<SceneIntelStatus>("trigger_scene_intelligence", { projectId: detail.project.id })
+                                  .then((status) => { if (status) setSceneIntelStatus(status); })
+                                  .catch((err) => console.warn("[SceneIntel] Failed to trigger:", err));
+                              }
+                            }}
+                            title={
+                              effectiveStatus.status === "running"
+                                ? "GPU Scene Intelligence is scanning video for camera cuts in the background."
+                                : effectiveStatus.status === "completed"
+                                ? `Full scene intelligence ready (${effectiveStatus.sceneCount} camera cuts cached).`
+                                : effectiveStatus.status === "idle"
+                                ? "Click to start GPU Scene Intelligence scan in background."
+                                : "Scene intelligence encountered an issue; click to retry."
                             }
-                          }}
-                          title={
-                            sceneIntelStatus.status === "running"
-                              ? "GPU Scene Intelligence is scanning video for camera cuts in the background."
-                              : sceneIntelStatus.status === "completed"
-                              ? `Full scene intelligence ready (${sceneIntelStatus.sceneCount} camera cuts cached).`
-                              : sceneIntelStatus.status === "idle"
-                              ? "Click to start GPU Scene Intelligence scan in background."
-                              : "Scene intelligence encountered an issue; click to retry."
-                          }
-                          style={{
-                            cursor: (sceneIntelStatus.status === "idle" || sceneIntelStatus.status === "error") ? "pointer" : "default"
-                          }}
-                        >
-                          {sceneIntelStatus.status === "running" && (
-                            <>
-                              <Loader2 className="spin" size={13} />
-                              <span>Scene Intel {sceneIntelStatus.progress > 0 ? `${sceneIntelStatus.progress}%` : "Scanning..."}</span>
-                            </>
-                          )}
-                          {sceneIntelStatus.status === "completed" && (
-                            <>
-                              <Check size={13} className="pill-check-icon" />
-                              <span>Scene Intel Ready ({sceneIntelStatus.sceneCount})</span>
-                            </>
-                          )}
-                          {sceneIntelStatus.status === "idle" && (
-                            <>
-                              <Sparkles size={13} className="pill-idle-icon" />
-                              <span>Scan Scenes (GPU)</span>
-                            </>
-                          )}
-                          {sceneIntelStatus.status === "error" && (
-                            <>
-                              <AlertCircle size={13} className="pill-error-icon" />
-                              <span>Retry Scene Intel</span>
-                            </>
-                          )}
-                        </div>
-                      )}
+                            style={{
+                              cursor: (effectiveStatus.status === "idle" || effectiveStatus.status === "error") ? "pointer" : "default"
+                            }}
+                          >
+                            {effectiveStatus.status === "running" && (
+                              <>
+                                <Loader2 className="spin" size={13} />
+                                <span>Scene Intel {effectiveStatus.progress > 0 ? `${effectiveStatus.progress}%` : "Scanning..."}</span>
+                              </>
+                            )}
+                            {effectiveStatus.status === "completed" && (
+                              <>
+                                <Check size={13} className="pill-check-icon" />
+                                <span>Scene Intel Ready ({effectiveStatus.sceneCount})</span>
+                              </>
+                            )}
+                            {effectiveStatus.status === "idle" && (
+                              <>
+                                <Sparkles size={13} className="pill-idle-icon" />
+                                <span>Scan Scenes (GPU)</span>
+                              </>
+                            )}
+                            {effectiveStatus.status === "error" && (
+                              <>
+                                <AlertCircle size={13} className="pill-error-icon" />
+                                <span>Retry Scene Intel</span>
+                              </>
+                            )}
+                          </div>
+                        );
+                      })()}
 
                       <button
                         type="button"
