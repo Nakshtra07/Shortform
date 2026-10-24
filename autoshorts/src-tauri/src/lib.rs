@@ -68,6 +68,93 @@ fn emit_scene_intel_status(
     }
 }
 
+fn trigger_scene_intel_prewarm(
+    app: Option<&tauri::AppHandle>,
+    registry: Option<&Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>>>,
+    project_id: String,
+    source_path: String,
+) {
+    if !scene_intelligence::scene_intelligence_enabled() {
+        return;
+    }
+    let app_clone = app.cloned().or_else(|| GLOBAL_APP_HANDLE.get().cloned());
+    let registry_clone = registry.cloned().or_else(|| GLOBAL_SCENE_INTEL_REGISTRY.get().cloned());
+    let source_path_clone = source_path;
+    let project_id_clone = project_id;
+
+    emit_scene_intel_status(
+        app_clone.as_ref(),
+        registry_clone.as_ref(),
+        scene_intelligence::SceneIntelStatus {
+            project_id: project_id_clone.clone(),
+            status: "running".to_string(),
+            progress: 0,
+            scene_count: 0,
+        },
+    );
+
+    tokio::task::spawn_blocking(move || {
+        match scene_intelligence::SceneIntelligenceEngine::new(None) {
+            Ok(scene_engine) => {
+                println!(
+                    "[SceneIntel] Background pre-warming initiated for {}",
+                    source_path_clone
+                );
+                let app_progress = app_clone.clone();
+                let registry_progress = registry_clone.clone();
+                let pid_progress = project_id_clone.clone();
+                let doc = scene_engine.process_source_with_progress(&source_path_clone, move |pct| {
+                    emit_scene_intel_status(
+                        app_progress.as_ref(),
+                        registry_progress.as_ref(),
+                        scene_intelligence::SceneIntelStatus {
+                            project_id: pid_progress.clone(),
+                            status: "running".to_string(),
+                            progress: pct,
+                            scene_count: 0,
+                        },
+                    );
+                });
+                println!(
+                    "[SceneIntel] Background pre-warming COMPLETE: {} scenes cached (fallback={})",
+                    doc.scenes.len(),
+                    doc.fallback
+                );
+                emit_scene_intel_status(
+                    app_clone.as_ref(),
+                    registry_clone.as_ref(),
+                    scene_intelligence::SceneIntelStatus {
+                        project_id: project_id_clone,
+                        status: if doc.fallback {
+                            "error".to_string()
+                        } else {
+                            "completed".to_string()
+                        },
+                        progress: 100,
+                        scene_count: doc.scenes.len(),
+                    },
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[SceneIntel] Background pre-warming engine init failed (non-fatal): {}",
+                    e
+                );
+                emit_scene_intel_status(
+                    app_clone.as_ref(),
+                    registry_clone.as_ref(),
+                    scene_intelligence::SceneIntelStatus {
+                        project_id: project_id_clone,
+                        status: "error".to_string(),
+                        progress: 0,
+                        scene_count: 0,
+                    },
+                );
+            }
+        }
+    });
+}
+
 use anyhow::{anyhow, Context, Result};
 use tauri::{Emitter, Manager};
 
@@ -731,86 +818,12 @@ pub async fn transcribe_project_impl_internal(
     // ── Phase 3: Background Scene Intelligence Pre-Warming ──────────────
     // Immediately initiate scene intelligence detection in the background
     // right after transcription finishes so the cache is warm when user renders.
-    if scene_intelligence::scene_intelligence_enabled() {
-        let source_path_clone = project.source_path.clone();
-        let project_id_clone = project_id.clone();
-        let registry_clone = scene_intel_registry
-            .clone()
-            .or_else(|| GLOBAL_SCENE_INTEL_REGISTRY.get().cloned());
-        let app_clone = app.clone().or_else(|| GLOBAL_APP_HANDLE.get().cloned());
-
-        emit_scene_intel_status(
-            app_clone.as_ref(),
-            registry_clone.as_ref(),
-            scene_intelligence::SceneIntelStatus {
-                project_id: project_id_clone.clone(),
-                status: "running".to_string(),
-                progress: 0,
-                scene_count: 0,
-            },
-        );
-
-        tokio::task::spawn_blocking(move || {
-            match scene_intelligence::SceneIntelligenceEngine::new(None) {
-                Ok(scene_engine) => {
-                    println!(
-                        "[SceneIntel] Background pre-warming initiated for {}",
-                        source_path_clone
-                    );
-                    let app_progress = app_clone.clone();
-                    let registry_progress = registry_clone.clone();
-                    let pid_progress = project_id_clone.clone();
-                    let doc = scene_engine.process_source_with_progress(&source_path_clone, move |pct| {
-                        emit_scene_intel_status(
-                            app_progress.as_ref(),
-                            registry_progress.as_ref(),
-                            scene_intelligence::SceneIntelStatus {
-                                project_id: pid_progress.clone(),
-                                status: "running".to_string(),
-                                progress: pct,
-                                scene_count: 0,
-                            },
-                        );
-                    });
-                    println!(
-                        "[SceneIntel] Background pre-warming COMPLETE: {} scenes cached (fallback={})",
-                        doc.scenes.len(),
-                        doc.fallback
-                    );
-                    emit_scene_intel_status(
-                        app_clone.as_ref(),
-                        registry_clone.as_ref(),
-                        scene_intelligence::SceneIntelStatus {
-                            project_id: project_id_clone,
-                            status: if doc.fallback {
-                                "error".to_string()
-                            } else {
-                                "completed".to_string()
-                            },
-                            progress: 100,
-                            scene_count: doc.scenes.len(),
-                        },
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[SceneIntel] Background pre-warming engine init failed (non-fatal): {}",
-                        e
-                    );
-                    emit_scene_intel_status(
-                        app_clone.as_ref(),
-                        registry_clone.as_ref(),
-                        scene_intelligence::SceneIntelStatus {
-                            project_id: project_id_clone,
-                            status: "error".to_string(),
-                            progress: 0,
-                            scene_count: 0,
-                        },
-                    );
-                }
-            }
-        });
-    }
+    trigger_scene_intel_prewarm(
+        app.as_ref(),
+        scene_intel_registry.as_ref(),
+        project_id.clone(),
+        project.source_path.clone(),
+    );
 
     Ok(saved)
 }
@@ -3478,7 +3491,29 @@ fn restore_clip_output_path(
 }
 
 #[tauri::command]
+async fn trigger_scene_intelligence(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<scene_intelligence::SceneIntelStatus, String> {
+    let project = state.db.get_project(&project_id).map_err(to_command_error)?;
+    trigger_scene_intel_prewarm(
+        Some(&app),
+        Some(&state.scene_intel_registry),
+        project_id.clone(),
+        project.source_path.clone(),
+    );
+    Ok(scene_intelligence::SceneIntelStatus {
+        project_id,
+        status: "running".to_string(),
+        progress: 0,
+        scene_count: 0,
+    })
+}
+
+#[tauri::command]
 async fn get_scene_intelligence_status(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     project_id: String,
 ) -> Result<scene_intelligence::SceneIntelStatus, String> {
@@ -3507,6 +3542,23 @@ async fn get_scene_intelligence_status(
             }
             return Ok(status);
         }
+    }
+
+    // Auto-prewarm if project has transcripts but has no cached scene boundaries yet
+    let has_transcript = state.db.latest_transcript(&project_id).ok().flatten().is_some();
+    if has_transcript && scene_intelligence::scene_intelligence_enabled() {
+        trigger_scene_intel_prewarm(
+            Some(&app),
+            Some(&state.scene_intel_registry),
+            project_id.clone(),
+            project.source_path.clone(),
+        );
+        return Ok(scene_intelligence::SceneIntelStatus {
+            project_id,
+            status: "running".to_string(),
+            progress: 0,
+            scene_count: 0,
+        });
     }
 
     Ok(scene_intelligence::SceneIntelStatus {
@@ -3567,7 +3619,8 @@ pub fn run() {
             check_youtube_copyright,
             probe_youtube_media,
             download_youtube_video,
-            get_scene_intelligence_status
+            get_scene_intelligence_status,
+            trigger_scene_intelligence
         ])
         .run(tauri::generate_context!())
         .expect("error while running AutoShorts");

@@ -2002,16 +2002,28 @@ function App() {
                         <option value="window_scoring">Discovery: REZE Window</option>
                       </select>
 
-                      {sceneIntelStatus && sceneIntelStatus.status !== "idle" && (
+                      {sceneIntelStatus && (
                         <div
                           className={`scene-intel-pill status-${sceneIntelStatus.status}`}
+                          onClick={() => {
+                            if (sceneIntelStatus.status === "idle" || sceneIntelStatus.status === "error") {
+                              invoke<SceneIntelStatus>("trigger_scene_intelligence", { projectId: detail.project.id })
+                                .then((status) => { if (status) setSceneIntelStatus(status); })
+                                .catch((err) => console.warn("[SceneIntel] Failed to trigger:", err));
+                            }
+                          }}
                           title={
                             sceneIntelStatus.status === "running"
                               ? "GPU Scene Intelligence is scanning video for camera cuts in the background."
                               : sceneIntelStatus.status === "completed"
                               ? `Full scene intelligence ready (${sceneIntelStatus.sceneCount} camera cuts cached).`
-                              : "Scene intelligence encountered an issue; single-scene fallback active."
+                              : sceneIntelStatus.status === "idle"
+                              ? "Click to start GPU Scene Intelligence scan in background."
+                              : "Scene intelligence encountered an issue; click to retry."
                           }
+                          style={{
+                            cursor: (sceneIntelStatus.status === "idle" || sceneIntelStatus.status === "error") ? "pointer" : "default"
+                          }}
                         >
                           {sceneIntelStatus.status === "running" && (
                             <>
@@ -2025,10 +2037,16 @@ function App() {
                               <span>Scene Intel Ready ({sceneIntelStatus.sceneCount})</span>
                             </>
                           )}
+                          {sceneIntelStatus.status === "idle" && (
+                            <>
+                              <Sparkles size={13} className="pill-idle-icon" />
+                              <span>Scan Scenes (GPU)</span>
+                            </>
+                          )}
                           {sceneIntelStatus.status === "error" && (
                             <>
                               <AlertCircle size={13} className="pill-error-icon" />
-                              <span>Scene Intel (Fallback)</span>
+                              <span>Retry Scene Intel</span>
                             </>
                           )}
                         </div>
