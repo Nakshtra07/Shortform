@@ -6,9 +6,32 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CopyrightCheckResult {
     pub is_safe: bool,
     pub license: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTrackInfo {
+    pub format_id: String,
+    pub language: Option<String>,
+    pub language_name: String,
+    pub format_note: Option<String>,
+    pub is_original: bool,
+    pub bitrate_kbps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YoutubeProbeResult {
+    pub is_safe: bool,
+    pub license: Option<String>,
+    pub title: Option<String>,
+    pub duration: Option<f64>,
+    pub audio_tracks: Vec<AudioTrackInfo>,
+    pub default_audio_format_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -304,17 +327,7 @@ pub fn check_copyright(
         };
         attempted_auths.push(auth_label.clone());
 
-        let mut args: Vec<String> = vec![
-            "--ignore-config".to_string(),
-        ];
-        args.extend(build_network_args());
-        args.extend(build_extractor_args());
-        args.extend(vec![
-            "--dump-json".to_string(),
-            "--no-playlist".to_string(),
-        ]);
-        args.extend(build_auth_args(auth));
-        args.push(normalized_url.clone());
+        let args = build_probe_args(&normalized_url, auth);
 
         println!(
             "[YouTube Copyright Check] Executing: {} {}",
@@ -363,6 +376,213 @@ pub fn check_copyright(
         );
 
         // If this wasn't an auth / bot / lock issue (e.g. invalid URL or private video), don't keep cycling through browsers
+        if !is_bot_verification_error(&stderr) && !is_cookie_lock_or_access_error(&stderr).0 {
+            break;
+        }
+    }
+
+    Err(format_actionable_error(&last_stderr, &attempted_auths))
+}
+
+pub fn resolve_language_display_name(lang_code: Option<&str>, format_note: Option<&str>, is_original: bool) -> String {
+    let lower_lang = lang_code.map(|s| s.to_lowercase());
+    let lang_prefix = lower_lang.as_deref().and_then(|s| s.split(&['-', '_'][..]).next());
+    let base_name = match lang_prefix {
+        Some("hi") | Some("hin") => "Hindi",
+        Some("en") | Some("eng") => "English",
+        Some("es") | Some("spa") => "Spanish",
+        Some("fr") | Some("fra") | Some("fre") => "French",
+        Some("de") | Some("deu") | Some("ger") => "German",
+        Some("ja") | Some("jpn") => "Japanese",
+        Some("ko") | Some("kor") => "Korean",
+        Some("pt") | Some("por") => "Portuguese",
+        Some("ru") | Some("rus") => "Russian",
+        Some("zh") | Some("zho") | Some("chi") => "Chinese",
+        Some("ar") | Some("ara") => "Arabic",
+        Some("bn") | Some("ben") => "Bengali",
+        Some("id") | Some("ind") => "Indonesian",
+        Some("it") | Some("ita") => "Italian",
+        Some("tr") | Some("tur") => "Turkish",
+        Some("vi") | Some("vie") => "Vietnamese",
+        Some(other) => other,
+        None => "Original / Default",
+    };
+
+    if is_original {
+        format!("{} [Original]", base_name)
+    } else if let Some(note) = format_note {
+        let note_lower = note.to_lowercase();
+        if note_lower.contains("dub") || note_lower.contains("translation") || note_lower.contains("auto") {
+            format!("{} [Dubbed]", base_name)
+        } else {
+            format!("{} [Dubbed]", base_name)
+        }
+    } else {
+        format!("{} [Dubbed]", base_name)
+    }
+}
+
+pub fn parse_audio_tracks_from_formats(formats: &[serde_json::Value]) -> Vec<AudioTrackInfo> {
+    let mut tracks: Vec<AudioTrackInfo> = Vec::new();
+
+    for f in formats {
+        let ext = f.get("ext").and_then(|e| e.as_str()).unwrap_or("");
+        let vcodec = f.get("vcodec").and_then(|v| v.as_str()).unwrap_or("");
+        let acodec = f.get("acodec").and_then(|a| a.as_str()).unwrap_or("");
+        let note = f.get("format_note").and_then(|n| n.as_str()).unwrap_or("");
+
+        if ext == "mhtml" || vcodec == "images" || note.to_lowercase().contains("storyboard") {
+            continue;
+        }
+
+        if (vcodec == "none" || vcodec.is_empty()) && acodec != "none" && !acodec.is_empty() {
+            let format_id = f.get("format_id").and_then(|id| id.as_str()).unwrap_or("").to_string();
+            if format_id.is_empty() {
+                continue;
+            }
+
+            let language = f.get("language").and_then(|l| l.as_str()).map(|s| s.to_string());
+            let format_note = if note.is_empty() { None } else { Some(note.to_string()) };
+            let lang_pref = f.get("language_preference").and_then(|lp| lp.as_i64()).unwrap_or(-1);
+            let note_lower = note.to_lowercase();
+            let is_original = note_lower.contains("original") || lang_pref >= 10;
+            let bitrate_kbps = f.get("tbr").and_then(|b| b.as_f64()).or_else(|| f.get("abr").and_then(|b| b.as_f64()));
+
+            let language_name = resolve_language_display_name(language.as_deref(), format_note.as_deref(), is_original);
+
+            // Deduplicate: If an audio track with the same language and is_original state exists, keep the one with higher bitrate
+            if let Some(existing) = tracks.iter_mut().find(|t| t.language == language && (t.is_original == is_original || language.is_some())) {
+                if bitrate_kbps.unwrap_or(0.0) > existing.bitrate_kbps.unwrap_or(0.0) {
+                    existing.format_id = format_id;
+                    existing.format_note = format_note;
+                    existing.bitrate_kbps = bitrate_kbps;
+                }
+            } else {
+                tracks.push(AudioTrackInfo {
+                    format_id,
+                    language,
+                    language_name,
+                    format_note,
+                    is_original,
+                    bitrate_kbps,
+                });
+            }
+        }
+    }
+
+    if tracks.len() == 1 {
+        tracks[0].is_original = true;
+    } else if !tracks.is_empty() && !tracks.iter().any(|t| t.is_original) {
+        if let Some(first_non_dub) = tracks.iter_mut().find(|t| !t.language_name.contains("Dubbed")) {
+            first_non_dub.is_original = true;
+            first_non_dub.language_name = format!("{} [Original]", first_non_dub.language_name);
+        } else {
+            tracks[0].is_original = true;
+        }
+    }
+
+    tracks.sort_by(|a, b| {
+        b.is_original.cmp(&a.is_original)
+            .then_with(|| a.language_name.cmp(&b.language_name))
+    });
+
+    tracks
+}
+
+pub fn build_format_selector(audio_format_id: Option<&str>) -> String {
+    if let Some(aid) = audio_format_id {
+        let trimmed = aid.trim();
+        if !trimmed.is_empty() {
+            return format!("bestvideo+{id}/bestvideo*+{id}/best", id = trimmed);
+        }
+    }
+    "bestvideo+bestaudio[format_note*=original]/bestvideo+bestaudio/best".to_string()
+}
+
+pub fn probe_media(
+    url: &str,
+    browser_pref: Option<&str>,
+    cookie_path_pref: Option<&str>,
+) -> Result<YoutubeProbeResult, String> {
+    let ytdlp_path = crate::media::find_ytdlp_cmd().ok_or_else(|| {
+        "yt-dlp executable was not found. Please ensure yt-dlp is installed and available on your PATH.".to_string()
+    })?;
+
+    let normalized_url = normalize_youtube_url(url);
+    let auth_mode = resolve_auth_mode(browser_pref, cookie_path_pref);
+    let strategy_chain = get_auth_strategy_chain(&auth_mode);
+
+    let mut last_stderr = String::new();
+    let mut attempted_auths: Vec<String> = Vec::new();
+
+    for auth in &strategy_chain {
+        let auth_label = match auth {
+            YoutubeAuthMode::None => "Unauthenticated".to_string(),
+            YoutubeAuthMode::Browser(b) => format!("Browser ({b})"),
+            YoutubeAuthMode::CookieFile(_) => "CookieFile".to_string(),
+            YoutubeAuthMode::Auto => "Auto".to_string(),
+        };
+        attempted_auths.push(auth_label.clone());
+
+        let args = build_probe_args(&normalized_url, auth);
+
+        println!(
+            "[YouTube Media Probe] Executing: {} {}",
+            ytdlp_path.display(),
+            sanitize_args_for_logging(&args)
+        );
+
+        let output = match Command::new(&ytdlp_path).args(&args).output() {
+            Ok(out) => out,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to execute yt-dlp at {}: {}",
+                    ytdlp_path.display(),
+                    e
+                ));
+            }
+        };
+
+        if output.status.success() {
+            let json_str = String::from_utf8_lossy(&output.stdout);
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                let license = parsed
+                    .get("license")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let is_safe = if let Some(lic) = &license {
+                    let lower = lic.to_lowercase();
+                    lower.contains("creative commons") || lower.contains("reuse allowed")
+                } else {
+                    false
+                };
+                let title = parsed.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let duration = parsed.get("duration").and_then(|v| v.as_f64());
+                let formats = parsed.get("formats").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]);
+                let audio_tracks = parse_audio_tracks_from_formats(formats);
+                let default_audio_format_id = audio_tracks.first().map(|t| t.format_id.clone());
+
+                println!(
+                    "[YouTube Media Probe] Success: Title: {:?}, Audio Tracks: {}, Default Format: {:?}",
+                    title,
+                    audio_tracks.len(),
+                    default_audio_format_id
+                );
+
+                return Ok(YoutubeProbeResult {
+                    is_safe,
+                    license,
+                    title,
+                    duration,
+                    audio_tracks,
+                    default_audio_format_id,
+                });
+            }
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        last_stderr = stderr.clone();
+
         if !is_bot_verification_error(&stderr) && !is_cookie_lock_or_access_error(&stderr).0 {
             break;
         }
@@ -681,14 +901,16 @@ impl FormatFallbackTier {
     pub fn format_selector(&self) -> &'static str {
         match self {
             FormatFallbackTier::BestSeparateMp4 | FormatFallbackTier::BestSeparateMkv => {
-                "bestvideo+bestaudio/bestvideo*+bestaudio/bestvideo+bestaudio*/best"
+                "bestvideo+bestaudio[format_note*=original]/bestvideo+bestaudio/bestvideo*+bestaudio/bestvideo+bestaudio*/best"
             }
             FormatFallbackTier::BestCombined => "best/bestvideo+bestaudio",
         }
     }
 
     pub fn format_sort(&self) -> &'static str {
-        "res,fps,codec,size,br"
+        // Deterministic format-sort: prioritize hardware-decodable VP9 and H.264 (AVC)
+        // for NVIDIA Turing NVDEC (GTX 1650 lacks AV1 ASIC decode).
+        "res,fps,+codec:vp9,+codec:avc,size,br"
     }
 
     pub fn merge_output_format(&self) -> Option<&'static str> {
@@ -712,6 +934,28 @@ impl FormatFallbackTier {
             }
         }
     }
+}
+
+/// Builds standardized yt-dlp arguments for metadata probing and format discovery.
+/// Guarantees that probe commands (`probe_media`, `query_available_quality`, `check_copyright`)
+/// use the exact same format sorting (`--format-sort res,fps,+codec:vp9,+codec:avc,size,br`) as download commands,
+/// ensuring that synthetic format IDs (e.g. `140-0`, `140-1`, `251-0`) map 1:1 identically between
+/// media probing and download execution.
+pub fn build_probe_args(url: &str, auth: &YoutubeAuthMode) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "--ignore-config".to_string(),
+    ];
+    args.extend(build_network_args());
+    args.extend(build_extractor_args());
+    args.extend(vec![
+        "--dump-json".to_string(),
+        "--no-playlist".to_string(),
+        "--format-sort".to_string(),
+        FormatFallbackTier::BestSeparateMp4.format_sort().to_string(),
+    ]);
+    args.extend(build_auth_args(auth));
+    args.push(url.to_string());
+    args
 }
 
 /// Determines whether a filename matches intermediate yt-dlp temporary or stream part patterns.
@@ -829,17 +1073,7 @@ pub fn query_available_quality(
     let mut last_err = String::new();
 
     for auth in &strategy_chain {
-        let mut args: Vec<String> = vec![
-            "--ignore-config".to_string(),
-        ];
-        args.extend(build_network_args());
-        args.extend(build_extractor_args());
-        args.extend(vec![
-            "--dump-json".to_string(),
-            "--no-playlist".to_string(),
-        ]);
-        args.extend(build_auth_args(auth));
-        args.push(normalized_url.to_string());
+        let args = build_probe_args(normalized_url, auth);
 
         let output = match Command::new(ytdlp_path).args(&args).output() {
             Ok(out) => out,
@@ -889,6 +1123,7 @@ pub fn detect_higher_quality_available(
 pub fn download_video(
     url: &str,
     target_dir: &Path,
+    audio_format_id: Option<&str>,
     browser_pref: Option<&str>,
     cookie_path_pref: Option<&str>,
 ) -> Result<PathBuf, String> {
@@ -904,15 +1139,25 @@ pub fn download_video(
     let auth_mode = resolve_auth_mode(browser_pref, cookie_path_pref);
     let strategy_chain = get_auth_strategy_chain(&auth_mode);
 
+    let audio_tag = audio_format_id
+        .map(|aid| format!("_{}", aid.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")))
+        .unwrap_or_default();
+
     // 0. Cache Inspection & Invalidation:
-    // Check if an existing file for this video is present in target_dir.
-    // Verify quality metadata or probe media to ensure cached file satisfies highest available quality.
     if let Some(ref vid) = video_id {
-        let possible_cached = [
-            target_dir.join(format!("AutoShorts_{}.mp4", vid)),
-            target_dir.join(format!("AutoShorts_{}.mkv", vid)),
-            target_dir.join(format!("AutoShorts_{}.webm", vid)),
-        ];
+        let possible_cached = if !audio_tag.is_empty() {
+            vec![
+                target_dir.join(format!("AutoShorts_{}{}.mp4", vid, audio_tag)),
+                target_dir.join(format!("AutoShorts_{}{}.mkv", vid, audio_tag)),
+                target_dir.join(format!("AutoShorts_{}{}.webm", vid, audio_tag)),
+            ]
+        } else {
+            vec![
+                target_dir.join(format!("AutoShorts_{}.mp4", vid)),
+                target_dir.join(format!("AutoShorts_{}.mkv", vid)),
+                target_dir.join(format!("AutoShorts_{}.webm", vid)),
+            ]
+        };
 
         for candidate in &possible_cached {
             if candidate.exists() && candidate.metadata().map(|m| m.len() > 0).unwrap_or(false) {
@@ -964,7 +1209,12 @@ pub fn download_video(
         }
     }
 
-    let output_template = target_dir.join("AutoShorts_%(id)s.%(ext)s");
+    let file_prefix = if let Some(ref vid) = video_id {
+        format!("AutoShorts_{vid}{audio_tag}")
+    } else {
+        format!("AutoShorts_%(id)s{audio_tag}")
+    };
+    let output_template = target_dir.join(format!("{}.%(ext)s", file_prefix));
     let output_template_str = output_template.to_string_lossy().to_string();
 
     let mut last_stderr = String::new();
@@ -992,6 +1242,12 @@ pub fn download_video(
                 tier.description()
             );
 
+            let format_str = if let Some(aid) = audio_format_id {
+                build_format_selector(Some(aid))
+            } else {
+                tier.format_selector().to_string()
+            };
+
             let mut args: Vec<String> = vec![
                 "--ignore-config".to_string(),
             ];
@@ -999,7 +1255,7 @@ pub fn download_video(
             args.extend(build_extractor_args());
             args.extend(vec![
                 "--format".to_string(),
-                tier.format_selector().to_string(),
+                format_str,
                 "--format-sort".to_string(),
                 tier.format_sort().to_string(),
             ]);
@@ -1230,7 +1486,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target_dir);
         std::fs::create_dir_all(&target_dir).expect("must create temp download dir");
 
-        let res = download_video(url, &target_dir, Some("auto"), None);
+        let res = download_video(url, &target_dir, None, Some("auto"), None);
         assert!(res.is_ok(), "download_video failed: {:?}", res.err());
 
         let downloaded = res.unwrap();
@@ -1797,7 +2053,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target_dir);
         std::fs::create_dir_all(&target_dir).expect("must create temp dir");
 
-        let res = download_video(url, &target_dir, Some("auto"), None);
+        let res = download_video(url, &target_dir, None, Some("auto"), None);
         assert!(res.is_ok(), "1440p download failed: {:?}", res.err());
         let file = res.unwrap();
         assert!(file.exists());
@@ -1818,7 +2074,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target_dir);
         std::fs::create_dir_all(&target_dir).expect("must create temp dir");
 
-        let res = download_video(url, &target_dir, Some("auto"), None);
+        let res = download_video(url, &target_dir, None, Some("auto"), None);
         assert!(res.is_ok(), "4K download failed: {:?}", res.err());
         let file = res.unwrap();
         assert!(file.exists());
@@ -1828,5 +2084,158 @@ mod tests {
         println!("[4K E2E VERIFIED] {}x{} | {:?} | {:?} | {} bytes", meta.width, meta.height, meta.video_codec, meta.audio_codec, meta.file_size_bytes);
 
         let _ = std::fs::remove_dir_all(&target_dir);
+    }
+
+    #[test]
+    fn test_parse_audio_tracks_multi_language() {
+        let formats_json = serde_json::json!([
+            {
+                "format_id": "137",
+                "vcodec": "avc1.640028",
+                "acodec": "none",
+                "width": 1920,
+                "height": 1080,
+                "ext": "mp4"
+            },
+            {
+                "format_id": "251-en",
+                "vcodec": "none",
+                "acodec": "opus",
+                "language": "en",
+                "format_note": "medium, English translation",
+                "tbr": 160.0,
+                "ext": "webm"
+            },
+            {
+                "format_id": "251-hi",
+                "vcodec": "none",
+                "acodec": "opus",
+                "language": "hi",
+                "format_note": "medium, original",
+                "language_preference": 10,
+                "tbr": 128.0,
+                "ext": "webm"
+            },
+            {
+                "format_id": "251-es",
+                "vcodec": "none",
+                "acodec": "opus",
+                "language": "es",
+                "format_note": "medium, Spanish dub",
+                "tbr": 128.0,
+                "ext": "webm"
+            }
+        ]);
+
+        let formats = formats_json.as_array().unwrap();
+        let tracks = parse_audio_tracks_from_formats(formats);
+
+        assert_eq!(tracks.len(), 3);
+        // Original track (Hindi) must be sorted first!
+        assert_eq!(tracks[0].format_id, "251-hi");
+        assert!(tracks[0].is_original);
+        assert!(tracks[0].language_name.to_lowercase().contains("hindi") || tracks[0].language_name.to_lowercase().contains("original"));
+
+        // Other tracks follow
+        let en_track = tracks.iter().find(|t| t.format_id == "251-en").unwrap();
+        assert!(!en_track.is_original);
+        assert_eq!(en_track.language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn test_parse_audio_tracks_single_standard() {
+        let formats_json = serde_json::json!([
+            {
+                "format_id": "137",
+                "vcodec": "avc1.640028",
+                "acodec": "none",
+                "width": 1920,
+                "height": 1080,
+                "ext": "mp4"
+            },
+            {
+                "format_id": "140",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "format_note": "medium",
+                "tbr": 128.0,
+                "ext": "m4a"
+            }
+        ]);
+
+        let formats = formats_json.as_array().unwrap();
+        let tracks = parse_audio_tracks_from_formats(formats);
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].format_id, "140");
+        assert!(tracks[0].is_original);
+    }
+
+    #[test]
+    fn test_build_format_selector_with_audio_track() {
+        let selector_custom = build_format_selector(Some("251-hi"));
+        assert!(selector_custom.contains("251-hi"));
+
+        let selector_default = build_format_selector(None);
+        assert!(selector_default.contains("format_note*=original") || selector_default.contains("bestaudio"));
+    }
+
+    #[test]
+    fn test_youtube_probe_result_serialization_camel_case() {
+        let probe = YoutubeProbeResult {
+            is_safe: true,
+            license: Some("Creative Commons".to_string()),
+            title: Some("Sample Video".to_string()),
+            duration: Some(120.0),
+            audio_tracks: vec![AudioTrackInfo {
+                format_id: "251-hi".to_string(),
+                language: Some("hi".to_string()),
+                language_name: "Hindi [Original]".to_string(),
+                format_note: Some("medium, original".to_string()),
+                is_original: true,
+                bitrate_kbps: Some(128.0),
+            }],
+            default_audio_format_id: Some("251-hi".to_string()),
+        };
+
+        let json = serde_json::to_string(&probe).unwrap();
+        assert!(json.contains("\"isSafe\":true"), "Expected camelCase isSafe, got {}", json);
+        assert!(json.contains("\"audioTracks\":["), "Expected camelCase audioTracks, got {}", json);
+        assert!(json.contains("\"defaultAudioFormatId\":\"251-hi\""), "Expected camelCase defaultAudioFormatId, got {}", json);
+        assert!(json.contains("\"formatId\":\"251-hi\""), "Expected camelCase formatId, got {}", json);
+        assert!(json.contains("\"isOriginal\":true"), "Expected camelCase isOriginal, got {}", json);
+    }
+
+    #[test]
+    fn test_build_probe_args_includes_deterministic_format_sort() {
+        let auth = YoutubeAuthMode::None;
+        let args = build_probe_args("https://www.youtube.com/watch?v=MNCHAAupzBo", &auth);
+
+        let format_sort_pos = args.iter().position(|a| a == "--format-sort");
+        assert!(format_sort_pos.is_some(), "build_probe_args must include --format-sort");
+        let sort_val = &args[format_sort_pos.unwrap() + 1];
+        assert_eq!(sort_val, FormatFallbackTier::BestSeparateMp4.format_sort());
+        assert_eq!(sort_val, "res,fps,+codec:vp9,+codec:avc,size,br");
+        assert!(args.contains(&"--dump-json".to_string()));
+        assert!(args.contains(&"--no-playlist".to_string()));
+    }
+
+    #[test]
+    fn test_tier_format_selector_prefers_original() {
+        let selector = FormatFallbackTier::BestSeparateMp4.format_selector();
+        assert!(selector.contains("bestaudio[format_note*=original]"));
+    }
+
+    #[test]
+    fn test_build_probe_args_prefers_hardware_codecs() {
+        let args = build_probe_args("https://www.youtube.com/watch?v=MNCHAAupzBo", &YoutubeAuthMode::None);
+        let sort_arg_idx = args.iter().position(|a| a == "--format-sort")
+            .expect("--format-sort must be present");
+        let sort_val = &args[sort_arg_idx + 1];
+        assert!(
+            sort_val.contains("+codec:vp9") && sort_val.contains("+codec:avc"),
+            "format-sort must prioritize hardware decodable codecs (vp9, avc) for Turing NVDEC: got {}",
+            sort_val
+        );
     }
 }
