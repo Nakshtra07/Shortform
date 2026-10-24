@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import {
+  AlertCircle,
   AudioLines,
   BadgeCheck,
   Captions,
@@ -86,7 +87,7 @@ type PresentationEngineMode = "autoshorts" | "autoclip";
 type AutoClipPlatformStrategy = "douyin" | "tiktok" | "youtube_shorts" | "bilibili" | "xiaohongshu";
 type AutoClipSubtitleLook = "clean" | "bold" | "box" | "accent";
 type AutoClipTitleStyle = "comic" | "neon" | "arena" | "editorial" | "pixel" | "frosted" | "plain";
-type AutoClipTemplate = "interview_zh" | "podcast_en";
+type AutoClipTemplate = "interview_zh" | "podcast_en" | "none";
 
 type Transcript = {
   id: string;
@@ -120,6 +121,31 @@ type Clip = {
   renderLog: string | null;
   appliedFeatures: string | null;
 };
+
+type SceneIntelStatus = {
+  projectId: string;
+  status: "idle" | "running" | "completed" | "error";
+  progress: number;
+  sceneCount: number;
+};
+
+interface AudioTrackInfo {
+  formatId: string;
+  language?: string | null;
+  languageName: string;
+  formatNote?: string | null;
+  isOriginal: boolean;
+  bitrateKbps?: number | null;
+}
+
+interface YoutubeProbeResult {
+  isSafe: boolean;
+  license?: string | null;
+  title?: string | null;
+  duration?: number | null;
+  audioTracks: AudioTrackInfo[];
+  defaultAudioFormatId?: string | null;
+}
 
 // Score provenance from the backend's candidate metadata. "llm" = a genuine
 // NVIDIA AutoClip model score; "fallback" = explicitly unscored (score 0.0,
@@ -186,6 +212,7 @@ function App() {
   const [environment, setEnvironment] = useState<EnvironmentStatus | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
+  const [sceneIntelStatus, setSceneIntelStatus] = useState<SceneIntelStatus | null>(null);
   const [busy, setBusy] = useState<BusyState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -223,9 +250,12 @@ function App() {
 
   const [youtubeModalOpen, setYoutubeModalOpen] = useState(false);
   const [youtubeUrl, setYoutubeUrl] = useState("");
-  const [youtubeStatus, setYoutubeStatus] = useState<"idle" | "checking" | "warning" | "downloading">("idle");
+  const [youtubeStatus, setYoutubeStatus] = useState<"idle" | "checking" | "warning" | "ready" | "downloading">("idle");
   const [youtubeWarningLicense, setYoutubeWarningLicense] = useState<string | null>(null);
   const [youtubeError, setYoutubeError] = useState<string | null>(null);
+  const [youtubeAudioTracks, setYoutubeAudioTracks] = useState<AudioTrackInfo[]>([]);
+  const [selectedAudioFormatId, setSelectedAudioFormatId] = useState<string | null>(null);
+  const [youtubeVideoTitle, setYoutubeVideoTitle] = useState<string | null>(null);
 
   // Style Studio Drawer State (Screen D & E)
   const [styleStudioOpen, setStyleStudioOpen] = useState(false);
@@ -258,8 +288,8 @@ function App() {
   const [transcriptionEngine, setTranscriptionEngine] = useState<"deepgram" | "local">(() => {
     return (localStorage.getItem("autoshorts_transcription_engine") as "deepgram" | "local") || "local";
   });
-  const [llmEngine, setLlmEngine] = useState<"claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq">(() => {
-    return (localStorage.getItem("autoshorts_llm_engine") as "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq") || "local";
+  const [llmEngine, setLlmEngine] = useState<"claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq" | "nvidia">(() => {
+    return (localStorage.getItem("autoshorts_llm_engine") as "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq" | "nvidia") || "gemini";
   });
   const [localLlmModel, setLocalLlmModel] = useState(() => {
     return localStorage.getItem("autoshorts_local_llm_model") || "llama3.2";
@@ -287,6 +317,13 @@ function App() {
   });
   const [groqKey, setGroqKey] = useState(() => {
     return localStorage.getItem("autoshorts_groq_key") || "";
+  });
+  const [nvidiaKey, setNvidiaKey] = useState(() => {
+    return localStorage.getItem("autoshorts_nvidia_key") || "";
+  });
+  const [nvidiaModel, setNvidiaModel] = useState(() => {
+    const stored = localStorage.getItem("autoshorts_nvidia_model");
+    return (stored && stored !== "stepfun-ai/step-5-preview") ? stored : "google/gemma-4-31b-it";
   });
   const [openrouterModel, setOpenrouterModel] = useState(() => {
     return localStorage.getItem("autoshorts_openrouter_model") || "google/gemini-2.5-flash";
@@ -503,6 +540,7 @@ function App() {
   const canUseOpenai = environment?.hasOpenaiKey || openaiKey.trim().length > 0;
   const canUseOpenrouter = environment?.hasOpenrouterKey || openrouterKey.trim().length > 0;
   const canUseGroq = environment?.hasGroqKey || groqKey.trim().length > 0;
+  const canUseNvidia = environment?.hasNvidiaKey || nvidiaKey.trim().length > 0;
 
   const canTranscribe = transcriptionEngine === "local"
     ? Boolean(environment?.hasLocalWhisperModel)
@@ -522,7 +560,9 @@ function App() {
               ? canUseOpenrouter
               : llmEngine === "groq"
                 ? canUseGroq
-                : false;
+                : llmEngine === "nvidia"
+                  ? canUseNvidia
+                  : false;
 
   const isRezeMode = discoveryMode === "window_scoring";
   const effectiveTimestampEngine = llmEngine === "openrouter" ? "deepseek" : llmEngine;
@@ -540,20 +580,75 @@ function App() {
     const candidates = detail?.candidates;
     if (!candidates || candidates.length === 0) return;
     const selectedRanks = candidates.filter((c) => c.selected).map((c) => c.rank);
-    if (selectedRanks.length === 0) return;
+    if (selectedRanks.length === 0) {
+      setTopNValue("0");
+      setRangeFromValue("");
+      setRangeToValue(null);
+      lastAppliedRangeRef.current = null;
+      return;
+    }
     const from = Math.min(...selectedRanks);
     const to = Math.max(...selectedRanks);
+    const isContiguous = selectedRanks.length === (to - from + 1);
+    if (!isContiguous) {
+      // Non-contiguous individual selection (e.g. #1, #36, #47)
+      setRangeFromValue("");
+      setRangeToValue(null);
+      setTopNValue("");
+      lastAppliedRangeRef.current = null;
+      return;
+    }
     const lastApplied = lastAppliedRangeRef.current;
     const isEcho = lastApplied !== null && lastApplied.from === from &&
       (lastApplied.to === null ? to === candidates.length : lastApplied.to === to);
     if (isEcho) return;
     setRangeFromValue(String(from));
     setRangeToValue(to === candidates.length ? null : String(to));
+    if (from === 1) {
+      setTopNValue(String(to));
+    } else {
+      setTopNValue("");
+    }
   }, [detail?.candidates]);
 
   useEffect(() => {
     setTranscriptSearch("");
   }, [detail?.project.id]);
+
+  useEffect(() => {
+    if (!detail?.project?.id) {
+      setSceneIntelStatus(null);
+      return;
+    }
+    const pid = detail.project.id;
+    let isCancelled = false;
+    let unlistenFn: (() => void) | null = null;
+
+    // Hydrate initial status
+    invoke<SceneIntelStatus>("get_scene_intelligence_status", { projectId: pid })
+      .then((status) => {
+        if (!isCancelled && status) setSceneIntelStatus(status);
+      })
+      .catch((err) => console.warn("[SceneIntel] Failed to query status:", err));
+
+    // Listen to real-time events
+    listen<SceneIntelStatus>("scene-intel-status", (event) => {
+      if (!isCancelled && event.payload.projectId === pid) {
+        setSceneIntelStatus(event.payload);
+      }
+    }).then((unlisten) => {
+      if (isCancelled) {
+        unlisten();
+      } else {
+        unlistenFn = unlisten;
+      }
+    });
+
+    return () => {
+      isCancelled = true;
+      if (unlistenFn) unlistenFn();
+    };
+  }, [detail?.project?.id]);
 
   useEffect(() => {
     void refresh();
@@ -614,6 +709,14 @@ function App() {
   }, [groqKey]);
 
   useEffect(() => {
+    localStorage.setItem("autoshorts_nvidia_key", nvidiaKey);
+  }, [nvidiaKey]);
+
+  useEffect(() => {
+    localStorage.setItem("autoshorts_nvidia_model", nvidiaModel);
+  }, [nvidiaModel]);
+
+  useEffect(() => {
     localStorage.setItem("autoshorts_openrouter_model", openrouterModel);
   }, [openrouterModel]);
 
@@ -665,12 +768,9 @@ function App() {
 
     if (env?.llmProvider) {
       const p = env.llmProvider.toLowerCase();
-      const validEngines = ["claude", "deepseek", "local", "gemini", "openai", "openrouter", "groq"];
+      const validEngines = ["claude", "deepseek", "local", "gemini", "openai", "openrouter", "groq", "nvidia"];
       if (validEngines.includes(p)) {
-        const stored = localStorage.getItem("autoshorts_llm_engine");
-        if (!stored || stored === "local" || stored === "deepseek" || stored === "openrouter") {
-          setLlmEngine(p as any);
-        }
+        setLlmEngine(p as any);
       }
     }
 
@@ -722,37 +822,55 @@ function App() {
     setYoutubeStatus("checking");
     setYoutubeError(null);
     setError(null);
+    setYoutubeAudioTracks([]);
+    setSelectedAudioFormatId(null);
+    setYoutubeVideoTitle(null);
     try {
-      console.log("[YouTube Frontend] Checking copyright for:", youtubeUrl, "browser:", youtubeBrowser);
-      const result = await invoke<{isSafe: boolean; license: string | null}>("check_youtube_copyright", {
+      console.log("[YouTube Frontend] Probing media for:", youtubeUrl, "browser:", youtubeBrowser);
+      const result = await invoke<YoutubeProbeResult>("probe_youtube_media", {
         url: youtubeUrl,
         browser: youtubeBrowser !== "auto" ? youtubeBrowser : null,
         cookiesPath: youtubeCookiesPath.trim() || null,
       });
-      console.log("[YouTube Frontend] Copyright check result:", result);
+      console.log("[YouTube Frontend] Probe media result:", result);
+      const tracks = result.audioTracks || [];
+      setYoutubeAudioTracks(tracks);
+      setYoutubeVideoTitle(result.title || null);
+      const chosenDefaultId = result.defaultAudioFormatId || (tracks.length > 0 ? tracks[0].formatId : null);
+      setSelectedAudioFormatId(chosenDefaultId);
+
       if (!result.isSafe) {
         setYoutubeWarningLicense(result.license || "Unknown / Not specified");
         setYoutubeStatus("warning");
         return;
       }
-      await executeYoutubeDownload();
+
+      if (tracks.length > 1) {
+        // Multi-track audio detected! Prompt user with interactive selector
+        setYoutubeStatus("ready");
+        return;
+      }
+
+      await executeYoutubeDownload(chosenDefaultId);
     } catch (err: any) {
-      const errMsg = err?.toString() || "Failed to check YouTube video copyright.";
-      console.error("[YouTube Frontend] Copyright check error:", errMsg);
+      const errMsg = err?.toString() || "Failed to check YouTube video details.";
+      console.error("[YouTube Frontend] Probe error:", errMsg);
       setYoutubeError(errMsg);
       setError(errMsg);
       setYoutubeStatus("idle");
     }
   }
 
-  async function executeYoutubeDownload() {
+  async function executeYoutubeDownload(audioFormatIdOverride?: string | null) {
     setYoutubeStatus("downloading");
     setYoutubeError(null);
     setError(null);
+    const chosenFormatId = audioFormatIdOverride !== undefined ? audioFormatIdOverride : selectedAudioFormatId;
     try {
-      console.log("[YouTube Frontend] Starting download for:", youtubeUrl, "browser:", youtubeBrowser);
+      console.log("[YouTube Frontend] Starting download for:", youtubeUrl, "audio format:", chosenFormatId, "browser:", youtubeBrowser);
       const downloadedPath = await invoke<string>("download_youtube_video", {
         url: youtubeUrl,
+        audioFormatId: chosenFormatId || null,
         browser: youtubeBrowser !== "auto" ? youtubeBrowser : null,
         cookiesPath: youtubeCookiesPath.trim() || null,
       });
@@ -762,6 +880,9 @@ function App() {
       setYoutubeStatus("idle");
       setYoutubeWarningLicense(null);
       setYoutubeError(null);
+      setYoutubeAudioTracks([]);
+      setSelectedAudioFormatId(null);
+      setYoutubeVideoTitle(null);
       setSelectedStyle("preset_minimal_capsule");
       setSelectedFramingMode("adaptive");
       setSelectedPresentationMode("autoshorts");
@@ -777,7 +898,7 @@ function App() {
       console.error("[YouTube Frontend] Download error:", errMsg);
       setYoutubeError(errMsg);
       setError(errMsg);
-      setYoutubeStatus("idle");
+      setYoutubeStatus(youtubeAudioTracks.length > 1 ? "ready" : "idle");
     }
   }
 
@@ -793,11 +914,11 @@ function App() {
       platformStrategy: platformStrategy,
       subtitle_style: subtitleLook,
       subtitleLook: subtitleLook,
-      title_style: titleStyle,
-      titleStyle: titleStyle,
-      title_motion: titleMotion,
-      titleMotion: titleMotion,
-      template: template,
+      title_style: "plain",
+      titleStyle: "plain",
+      title_motion: false,
+      titleMotion: false,
+      template: "none",
     });
     setMediaPathToImport(null);
     setShowStyleModal(false);
@@ -866,20 +987,23 @@ function App() {
           targetProvider === "deepseek" ? deepseekKey :
             targetProvider === "gemini" ? geminiKey :
               targetProvider === "openai" ? openaiKey :
-                targetProvider === "groq" ? groqKey : "";
+                targetProvider === "groq" ? groqKey :
+                  targetProvider === "nvidia" ? nvidiaKey : "";
       const hasActiveKey =
         targetProvider === "claude" ? (env.hasAnthropicKey || activeKey.trim().length > 0) :
           targetProvider === "deepseek" ? (env.hasDeepseekKey || activeKey.trim().length > 0) :
             targetProvider === "gemini" ? (env.hasGeminiKey || activeKey.trim().length > 0) :
               targetProvider === "openai" ? (env.hasOpenaiKey || activeKey.trim().length > 0) :
-                targetProvider === "groq" ? (env.hasGroqKey || activeKey.trim().length > 0) : false;
+                targetProvider === "groq" ? (env.hasGroqKey || activeKey.trim().length > 0) :
+                  targetProvider === "nvidia" ? (env.hasNvidiaKey || activeKey.trim().length > 0) : false;
       if (!hasActiveKey) {
         const engineName =
           targetProvider === "claude" ? "Claude" :
             targetProvider === "deepseek" ? "DeepSeek" :
               targetProvider === "gemini" ? "Gemini" :
                 targetProvider === "openai" ? "OpenAI" :
-                  targetProvider === "groq" ? "Groq" : "LLM";
+                  targetProvider === "groq" ? "Groq" :
+                    targetProvider === "nvidia" ? "NVIDIA NIM" : "LLM";
         setError(`Transcription complete. ${engineName} API Key is missing. Please add it in settings to analyze viral moments.`);
         return;
       }
@@ -909,11 +1033,13 @@ function App() {
             targetProvider === "deepseek" ? deepseekKey.trim() :
               targetProvider === "gemini" ? geminiKey.trim() :
                 targetProvider === "openai" ? openaiKey.trim() :
-                  targetProvider === "groq" ? groqKey.trim() : "");
+                  targetProvider === "groq" ? groqKey.trim() :
+                    targetProvider === "nvidia" ? nvidiaKey.trim() : "");
       const targetModel = isReze
         ? null
         : (targetProvider === "local" ? localLlmModel.trim() :
-            targetProvider === "deepseek" ? (deepseekModel.trim() || "deepseek-chat") : null);
+            targetProvider === "deepseek" ? (deepseekModel.trim() || "deepseek-chat") :
+              targetProvider === "nvidia" ? ((nvidiaModel.trim() && nvidiaModel.trim() !== "stepfun-ai/step-5-preview") ? nvidiaModel.trim() : "google/gemma-4-31b-it") : null);
 
       await invoke<Candidate[]>("generate_candidates", {
         projectId,
@@ -1020,7 +1146,9 @@ function App() {
                   ? groqKey.trim()
                   : targetProvider === "deepseek"
                     ? deepseekKey.trim()
-                    : "");
+                    : targetProvider === "nvidia"
+                      ? nvidiaKey.trim()
+                      : "");
 
       const targetModel = isReze
         ? null
@@ -1028,7 +1156,9 @@ function App() {
             ? localLlmModel.trim()
             : targetProvider === "deepseek"
               ? (deepseekModel.trim() || "deepseek-chat")
-              : null);
+              : targetProvider === "nvidia"
+                ? ((nvidiaModel.trim() && nvidiaModel.trim() !== "stepfun-ai/step-5-preview") ? nvidiaModel.trim() : "google/gemma-4-31b-it")
+                : null);
 
       try {
         await invoke<Candidate[]>("generate_candidates", {
@@ -1113,32 +1243,21 @@ function App() {
 
   // Individual candidate checkbox toggle: safely leverages updateSelectionRange or updateTopN(0)
   // ensuring the backend database remains 100% authoritative.
-  function toggleCandidateSelection(candidate: Candidate) {
-    if (candidate.selected) {
-      if (selectedCount === 1) {
-        void updateTopN(0);
-      } else if (candidate.rank === rangeFrom && rangeTo !== null && rangeTo > rangeFrom) {
-        void updateSelectionRange(rangeFrom + 1, rangeToValue === null ? null : rangeTo);
-      } else if (candidate.rank === rangeTo && rangeTo !== null && rangeTo > rangeFrom) {
-        void updateSelectionRange(rangeFrom, rangeTo - 1);
-      } else {
-        void updateTopN(0);
-      }
-    } else {
-      if (selectedCount === 0) {
-        void updateSelectionRange(candidate.rank, candidate.rank);
-      } else {
-        const newFrom = Math.min(
-          candidate.rank,
-          Number.isInteger(rangeFrom) && rangeFrom >= 1 ? rangeFrom : candidate.rank
-        );
-        const newTo = Math.max(
-          candidate.rank,
-          Number.isInteger(rangeTo) && rangeTo >= 1 ? rangeTo : candidate.rank
-        );
-        void updateSelectionRange(newFrom, rangeToValue === null ? null : newTo);
-      }
-    }
+  // Individual candidate checkbox toggle: flips only that candidate's selection
+  // via backend toggle_candidate_selection without forcing contiguous ranges.
+  async function toggleCandidateSelection(candidate: Candidate) {
+    if (!detail) return;
+    const requestSeq = ++selectionSeqRef.current;
+    const projectId = detail.project.id;
+    await run("clipCount", async () => {
+      const candidates = await invoke<Candidate[]>("toggle_candidate_selection", {
+        candidateId: candidate.id,
+      });
+      if (requestSeq !== selectionSeqRef.current) return;
+      setDetail((prev) =>
+        prev && prev.project.id === projectId ? { ...prev, candidates } : prev
+      );
+    });
   }
 
   async function cutCandidate(candidateId: string) {
@@ -1276,11 +1395,11 @@ function App() {
       platformStrategy: styleStudioPlatformStrategy,
       subtitle_style: styleStudioSubtitleLook,
       subtitleLook: styleStudioSubtitleLook,
-      title_style: styleStudioTitleStyle,
-      titleStyle: styleStudioTitleStyle,
-      title_motion: styleStudioTitleMotion,
-      titleMotion: styleStudioTitleMotion,
-      template: styleStudioTemplate,
+      title_style: "plain",
+      titleStyle: "plain",
+      title_motion: false,
+      titleMotion: false,
+      template: "none",
     });
 
     try {
@@ -1553,6 +1672,10 @@ function App() {
                   setOpenrouterModel={setOpenrouterModel}
                   groqKey={groqKey}
                   setGroqKey={setGroqKey}
+                  nvidiaKey={nvidiaKey}
+                  setNvidiaKey={setNvidiaKey}
+                  nvidiaModel={nvidiaModel}
+                  setNvidiaModel={setNvidiaModel}
                   localLlmModel={localLlmModel}
                   setLocalLlmModel={setLocalLlmModel}
                   pullModelDirectly={pullModelDirectly}
@@ -1879,6 +2002,38 @@ function App() {
                         <option value="window_scoring">Discovery: REZE Window</option>
                       </select>
 
+                      {sceneIntelStatus && sceneIntelStatus.status !== "idle" && (
+                        <div
+                          className={`scene-intel-pill status-${sceneIntelStatus.status}`}
+                          title={
+                            sceneIntelStatus.status === "running"
+                              ? "GPU Scene Intelligence is scanning video for camera cuts in the background."
+                              : sceneIntelStatus.status === "completed"
+                              ? `Full scene intelligence ready (${sceneIntelStatus.sceneCount} camera cuts cached).`
+                              : "Scene intelligence encountered an issue; single-scene fallback active."
+                          }
+                        >
+                          {sceneIntelStatus.status === "running" && (
+                            <>
+                              <Loader2 className="spin" size={13} />
+                              <span>Scene Intel {sceneIntelStatus.progress > 0 ? `${sceneIntelStatus.progress}%` : "Scanning..."}</span>
+                            </>
+                          )}
+                          {sceneIntelStatus.status === "completed" && (
+                            <>
+                              <Check size={13} className="pill-check-icon" />
+                              <span>Scene Intel Ready ({sceneIntelStatus.sceneCount})</span>
+                            </>
+                          )}
+                          {sceneIntelStatus.status === "error" && (
+                            <>
+                              <AlertCircle size={13} className="pill-error-icon" />
+                              <span>Scene Intel (Fallback)</span>
+                            </>
+                          )}
+                        </div>
+                      )}
+
                       <button
                         type="button"
                         className="find-moments-btn"
@@ -2055,6 +2210,10 @@ function App() {
                   setOpenrouterModel={setOpenrouterModel}
                   groqKey={groqKey}
                   setGroqKey={setGroqKey}
+                  nvidiaKey={nvidiaKey}
+                  setNvidiaKey={setNvidiaKey}
+                  nvidiaModel={nvidiaModel}
+                  setNvidiaModel={setNvidiaModel}
                   localLlmModel={localLlmModel}
                   setLocalLlmModel={setLocalLlmModel}
                   pullModelDirectly={pullModelDirectly}
@@ -2086,7 +2245,16 @@ function App() {
                   <button
                     type="button"
                     className="secondary-action-outlined compact"
-                    onClick={() => setYoutubeModalOpen(true)}
+                    onClick={() => {
+                      setYoutubeUrl("");
+                      setYoutubeStatus("idle");
+                      setYoutubeWarningLicense(null);
+                      setYoutubeError(null);
+                      setYoutubeAudioTracks([]);
+                      setSelectedAudioFormatId(null);
+                      setYoutubeVideoTitle(null);
+                      setYoutubeModalOpen(true);
+                    }}
                     disabled={busy !== "idle" || !environment?.hasYtdlp}
                     title={!environment?.hasYtdlp ? "Please install yt-dlp to use this feature" : "Download a video from YouTube"}
                   >
@@ -2605,64 +2773,6 @@ function App() {
                       ))}
                     </div>
                   </div>
-
-                  {/* Title Art Style */}
-                  <div>
-                    <span className="style-studio-presets-label" style={{ display: "block", marginBottom: "6px" }}>
-                      Title Art Style (PIL Artwork)
-                    </span>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
-                      {[
-                        { id: "comic", name: "Comic" },
-                        { id: "neon", name: "Neon" },
-                        { id: "arena", name: "Arena" },
-                        { id: "editorial", name: "Editorial" },
-                        { id: "pixel", name: "Pixel" },
-                        { id: "frosted", name: "Frosted" },
-                        { id: "plain", name: "Plain / None" },
-                      ].map((tit) => (
-                        <button
-                          key={tit.id}
-                          type="button"
-                          className={`style-studio-preset-chip ${styleStudioTitleStyle === tit.id ? "active" : ""}`}
-                          onClick={() => setStyleStudioTitleStyle(tit.id as AutoClipTitleStyle)}
-                        >
-                          {tit.name}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Title Motion Toggle & Template */}
-                  <div style={{ display: "flex", flexDirection: "column", gap: "8px", padding: "10px", background: "var(--bg-surface)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-color)" }}>
-                    <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", fontSize: "12px", fontWeight: 600 }}>
-                      <input
-                        type="checkbox"
-                        checked={styleStudioTitleMotion}
-                        onChange={(e) => setStyleStudioTitleMotion(e.target.checked)}
-                        style={{ width: "15px", height: "15px", cursor: "pointer" }}
-                      />
-                      <span>Enable Title Motion (Dynamic Zoom / Keyframe Overlays)</span>
-                    </label>
-                    <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "4px" }}>
-                      <span style={{ fontSize: "11.5px", color: "var(--text-secondary)" }}>Packaging Template:</span>
-                      <div style={{ display: "flex", gap: "6px" }}>
-                        {[
-                          { id: "interview_zh", label: "Interview (ZH)" },
-                          { id: "podcast_en", label: "Podcast (EN)" },
-                        ].map((tpl) => (
-                          <button
-                            key={tpl.id}
-                            type="button"
-                            className={`style-studio-preset-chip ${styleStudioTemplate === tpl.id ? "active" : ""}`}
-                            onClick={() => setStyleStudioTemplate(tpl.id as AutoClipTemplate)}
-                          >
-                            {tpl.label}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
                 </section>
               )}
 
@@ -2751,18 +2861,6 @@ function App() {
                         <span className="style-studio-summary-label">Subtitle Look</span>
                         <span className="style-studio-summary-value" style={{ textTransform: "capitalize" }}>
                           {styleStudioSubtitleLook}
-                        </span>
-                      </div>
-                      <div className="style-studio-summary-row">
-                        <span className="style-studio-summary-label">Title Art</span>
-                        <span className="style-studio-summary-value" style={{ textTransform: "capitalize" }}>
-                          {styleStudioTitleStyle} {styleStudioTitleMotion ? "(Motion)" : ""}
-                        </span>
-                      </div>
-                      <div className="style-studio-summary-row">
-                        <span className="style-studio-summary-label">Template</span>
-                        <span className="style-studio-summary-value">
-                          {styleStudioTemplate === "interview_zh" ? "Interview (ZH)" : "Podcast (EN)"}
                         </span>
                       </div>
                     </>
@@ -3154,73 +3252,6 @@ function App() {
                         ))}
                       </div>
                     </div>
-
-                    {/* Title Art Style */}
-                    <div>
-                      <span className="presets-row-label" style={{ display: "block", marginBottom: "8px", fontWeight: 600 }}>
-                        Title Art Style (PIL Multi-Layer Artwork)
-                      </span>
-                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: "8px" }}>
-                        {[
-                          { id: "comic", name: "Comic Punch" },
-                          { id: "neon", name: "Neon Glow" },
-                          { id: "arena", name: "Arena Slanted" },
-                          { id: "editorial", name: "Editorial Bold" },
-                          { id: "pixel", name: "Pixel Retro" },
-                          { id: "frosted", name: "Frosted Glass" },
-                          { id: "plain", name: "Plain / None" },
-                        ].map((tit) => (
-                          <div
-                            key={tit.id}
-                            className={`framing-card ${titleStyle === tit.id ? "selected" : ""}`}
-                            style={{ padding: "8px 10px" }}
-                            onClick={() => setTitleStyle(tit.id as AutoClipTitleStyle)}
-                          >
-                            <div className="card-top-row">
-                              <span className="card-title" style={{ fontSize: "12px" }}>{tit.name}</span>
-                              <div className="card-indicator">
-                                {titleStyle === tit.id ? (
-                                  <div className="indicator-check"><Check size={10} strokeWidth={3} /></div>
-                                ) : (
-                                  <div className="indicator-empty" />
-                                )}
-                              </div>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Title Motion Toggle & Template */}
-                    <div style={{ display: "flex", gap: "16px", alignItems: "center", flexWrap: "wrap", padding: "12px", background: "var(--bg-surface, #F8F9FA)", borderRadius: "8px", border: "1px solid var(--border-color, #E0E1E3)" }}>
-                      <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer", fontSize: "13px", fontWeight: 600 }}>
-                        <input
-                          type="checkbox"
-                          checked={titleMotion}
-                          onChange={(e) => setTitleMotion(e.target.checked)}
-                          style={{ width: "16px", height: "16px", cursor: "pointer" }}
-                        />
-                        <span>Enable Title Motion (Dynamic Zoom / Keyframe Overlays)</span>
-                      </label>
-                      <div style={{ display: "flex", alignItems: "center", gap: "8px", marginLeft: "auto" }}>
-                        <span style={{ fontSize: "12px", color: "var(--text-secondary, #666)" }}>Template:</span>
-                        <div style={{ display: "flex", gap: "6px" }}>
-                          {[
-                            { id: "interview_zh", label: "Interview (ZH)" },
-                            { id: "podcast_en", label: "Podcast (EN)" },
-                          ].map((tpl) => (
-                            <button
-                              key={tpl.id}
-                              type="button"
-                              className={`preset-pill-chip ${template === tpl.id ? "active" : ""}`}
-                              onClick={() => setTemplate(tpl.id as AutoClipTemplate)}
-                            >
-                              {tpl.label}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
                   </div>
                 )}
               </section>
@@ -3377,7 +3408,7 @@ function App() {
 
       {youtubeModalOpen && (
         <div className="style-modal-overlay">
-          <div className="style-modal" style={{ maxWidth: "500px" }}>
+          <div className="style-modal" style={{ maxWidth: "520px" }}>
             <div className="style-modal-header">
               <h3>Import from YouTube</h3>
               <p>Paste a YouTube URL below to download and import it directly.</p>
@@ -3387,10 +3418,66 @@ function App() {
                 type="text"
                 placeholder="https://www.youtube.com/watch?v=..."
                 value={youtubeUrl}
-                onChange={(e) => setYoutubeUrl(e.target.value)}
-                disabled={youtubeStatus !== "idle"}
+                onChange={(e) => {
+                  setYoutubeUrl(e.target.value);
+                  if (youtubeAudioTracks.length > 0 || youtubeVideoTitle) {
+                    setYoutubeAudioTracks([]);
+                    setSelectedAudioFormatId(null);
+                    setYoutubeVideoTitle(null);
+                    setYoutubeWarningLicense(null);
+                    setYoutubeStatus("idle");
+                  }
+                }}
+                disabled={youtubeStatus === "checking" || youtubeStatus === "downloading"}
                 style={{ width: "100%", padding: "0.75rem", borderRadius: "8px", border: "1px solid var(--border)", background: "var(--background)", color: "var(--foreground)", fontSize: "1rem", marginBottom: "1rem" }}
               />
+
+              {youtubeVideoTitle && (
+                <div style={{ marginBottom: "1rem", padding: "0.6rem 0.85rem", background: "rgba(255, 255, 255, 0.04)", borderRadius: "8px", border: "1px solid var(--border)", fontSize: "0.88rem" }}>
+                  <div style={{ fontSize: "0.75rem", textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--muted-foreground)", marginBottom: "0.25rem", fontWeight: 600 }}>Video Found</div>
+                  <div style={{ fontWeight: 500, color: "var(--foreground)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{youtubeVideoTitle}</div>
+                </div>
+              )}
+
+              {youtubeAudioTracks.length > 1 && (
+                <div style={{ marginBottom: "1.25rem", padding: "0.85rem", background: "rgba(99, 102, 241, 0.08)", borderRadius: "8px", border: "1px solid rgba(99, 102, 241, 0.3)" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", marginBottom: "0.4rem" }}>
+                    <AudioLines size={16} style={{ color: "var(--primary, #6366f1)" }} />
+                    <label style={{ fontSize: "0.85rem", fontWeight: 600, color: "var(--foreground)" }}>
+                      Multiple Audio Tracks Detected ({youtubeAudioTracks.length})
+                    </label>
+                  </div>
+                  <p style={{ margin: "0 0 0.5rem 0", fontSize: "0.8rem", color: "var(--muted-foreground)" }}>
+                    Select which audio language to download with the video:
+                  </p>
+                  <select
+                    value={selectedAudioFormatId || ""}
+                    onChange={(e) => setSelectedAudioFormatId(e.target.value)}
+                    disabled={youtubeStatus === "downloading"}
+                    style={{
+                      width: "100%",
+                      padding: "0.65rem 0.75rem",
+                      borderRadius: "6px",
+                      border: "1px solid var(--border)",
+                      background: "var(--background)",
+                      color: "var(--foreground)",
+                      fontSize: "0.9rem",
+                      cursor: "pointer",
+                      fontWeight: 500,
+                    }}
+                  >
+                    {youtubeAudioTracks.map((track) => (
+                      <option key={track.formatId} value={track.formatId}>
+                        {track.isOriginal ? `⭐ ${track.languageName} (Original - Recommended)` : `${track.languageName}`}
+                        {track.bitrateKbps ? ` [~${Math.round(track.bitrateKbps)} kbps]` : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <div style={{ fontSize: "0.75rem", color: "var(--muted-foreground)", marginTop: "0.4rem" }}>
+                    ⭐ Original audio track is pre-selected by default to avoid translated dubs.
+                  </div>
+                </div>
+              )}
 
               {youtubeError && (
                 <div style={{ background: "rgba(239, 68, 68, 0.1)", border: "1px solid #ef4444", padding: "0.75rem 1rem", borderRadius: "8px", marginBottom: "1rem", color: "#f87171", fontSize: "0.85rem", maxHeight: "150px", overflowY: "auto" }}>
@@ -3422,14 +3509,27 @@ function App() {
               <div className="style-modal-actions" style={{ marginTop: "1rem" }}>
                 <button 
                   className="btn-cancel" 
-                  onClick={() => { setYoutubeModalOpen(false); setYoutubeUrl(""); setYoutubeStatus("idle"); setYoutubeWarningLicense(null); setYoutubeError(null); }}
+                  onClick={() => {
+                    setYoutubeModalOpen(false);
+                    setYoutubeUrl("");
+                    setYoutubeStatus("idle");
+                    setYoutubeWarningLicense(null);
+                    setYoutubeError(null);
+                    setYoutubeAudioTracks([]);
+                    setSelectedAudioFormatId(null);
+                    setYoutubeVideoTitle(null);
+                  }}
                   disabled={youtubeStatus === "checking" || youtubeStatus === "downloading"}
                 >
                   Cancel
                 </button>
                 {youtubeStatus === "warning" ? (
-                  <button className="btn-confirm" onClick={executeYoutubeDownload}>
+                  <button className="btn-confirm" onClick={() => executeYoutubeDownload()}>
                     Yes, I understand the risks
+                  </button>
+                ) : youtubeStatus === "ready" ? (
+                  <button className="btn-confirm" onClick={() => executeYoutubeDownload()} style={{ minWidth: "120px" }}>
+                    Download Video
                   </button>
                 ) : youtubeStatus === "downloading" ? null : (
                   <button 
@@ -3455,8 +3555,8 @@ function App() {
 interface SettingsPanelProps {
   transcriptionEngine: "deepgram" | "local";
   setTranscriptionEngine: (engine: "deepgram" | "local") => void;
-  llmEngine: "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq";
-  setLlmEngine: (engine: "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq") => void;
+  llmEngine: "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq" | "nvidia";
+  setLlmEngine: (engine: "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq" | "nvidia") => void;
   deepgramKey: string;
   setDeepgramKey: (key: string) => void;
   anthropicKey: string;
@@ -3475,6 +3575,10 @@ interface SettingsPanelProps {
   setOpenrouterModel: (m: string) => void;
   groqKey: string;
   setGroqKey: (key: string) => void;
+  nvidiaKey: string;
+  setNvidiaKey: (key: string) => void;
+  nvidiaModel: string;
+  setNvidiaModel: (m: string) => void;
   localLlmModel: string;
   setLocalLlmModel: (m: string) => void;
   pullModelDirectly: (model: string) => Promise<void>;
@@ -3508,6 +3612,10 @@ function SettingsPanel({
   setOpenrouterModel,
   groqKey,
   setGroqKey,
+  nvidiaKey,
+  setNvidiaKey,
+  nvidiaModel,
+  setNvidiaModel,
   localLlmModel,
   setLocalLlmModel,
   pullModelDirectly,
@@ -3534,6 +3642,7 @@ function SettingsPanel({
             value={llmEngine}
             onChange={(event) => setLlmEngine(event.target.value as any)}
           >
+            <option value="nvidia">NVIDIA NIM (Gemma 4 31B IT)</option>
             <option value="local">Ollama (Offline Local)</option>
             <option value="claude">Claude (Cloud)</option>
             <option value="deepseek">DeepSeek (Cloud)</option>
@@ -3641,6 +3750,28 @@ function SettingsPanel({
               type="password"
             />
           </label>
+        )}
+        {llmEngine === "nvidia" && (
+          <>
+            <label>
+              <span>NVIDIA API Key</span>
+              <input
+                value={nvidiaKey}
+                onChange={(event) => setNvidiaKey(event.target.value)}
+                placeholder={environment?.hasNvidiaKey ? "Loaded from env" : "Optional (NVIDIA API Key)"}
+                type="password"
+              />
+            </label>
+            <label>
+              <span>NVIDIA Model</span>
+              <input
+                value={nvidiaModel}
+                onChange={(event) => setNvidiaModel(event.target.value)}
+                placeholder="Optional (e.g. google/gemma-4-31b-it)"
+                type="text"
+              />
+            </label>
+          </>
         )}
 
         {llmEngine === "local" && (
