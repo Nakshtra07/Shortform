@@ -11,7 +11,7 @@
 //! callers can log and fall back from.
 
 use anyhow::{anyhow, Result};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -34,6 +34,19 @@ pub struct BoundedOutput {
 /// deadlock where the child blocks writing to a full pipe while the parent
 /// blocks in `wait()`.
 pub fn run_bounded(cmd: &mut Command, timeout: Duration, stage: &str) -> Result<BoundedOutput> {
+    run_bounded_with_stderr_line_callback(cmd, timeout, stage, |_| {})
+}
+
+/// Run `cmd` to completion with a real-time line callback for stderr.
+///
+/// Each line read from stderr is passed to `on_line` as it arrives while also
+/// being accumulated into `BoundedOutput.stderr`.
+pub fn run_bounded_with_stderr_line_callback<F: Fn(&str) + Send + 'static>(
+    cmd: &mut Command,
+    timeout: Duration,
+    stage: &str,
+    on_line: F,
+) -> Result<BoundedOutput> {
     let started = Instant::now();
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -46,7 +59,7 @@ pub fn run_bounded(cmd: &mut Command, timeout: Duration, stage: &str) -> Result<
 
     // Take the pipes before waiting so the readers start immediately.
     let mut out_pipe = child.stdout.take();
-    let mut err_pipe = child.stderr.take();
+    let err_pipe = child.stderr.take();
 
     let (tx_out, rx_out) = mpsc::channel();
     let (tx_err, rx_err) = mpsc::channel();
@@ -60,8 +73,24 @@ pub fn run_bounded(cmd: &mut Command, timeout: Duration, stage: &str) -> Result<
     });
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(p) = err_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
+        if let Some(p) = err_pipe {
+            let mut reader = BufReader::new(p);
+            let mut line = String::new();
+            loop {
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        on_line(&line);
+                        buf.extend_from_slice(line.as_bytes());
+                        line.clear();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        let _ = reader.read_to_end(&mut buf);
+                        break;
+                    }
+                }
+            }
         }
         let _ = tx_err.send(buf);
     });
@@ -350,5 +379,32 @@ mod tests {
         let _ = child.wait().unwrap(); // Already exited and reaped
         // Calling kill_process_tree on an exited process must not fail or panic
         kill_process_tree(&mut child);
+    }
+
+    #[test]
+    fn test_run_bounded_with_stderr_line_callback() {
+        let mut cmd = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+        if cfg!(windows) {
+            cmd.args(["/C", "@echo line1 1>&2 & @echo line2 1>&2"]);
+        } else {
+            cmd.args(["-c", "echo line1 >&2; echo line2 >&2"]);
+        }
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lines_clone = lines.clone();
+        let out = run_bounded_with_stderr_line_callback(
+            &mut cmd,
+            Duration::from_secs(10),
+            "T",
+            move |line| {
+                lines_clone.lock().unwrap().push(line.trim().to_string());
+            },
+        )
+        .unwrap();
+        assert!(out.success);
+        let captured = lines.lock().unwrap().clone();
+        assert!(captured.iter().any(|l| l.contains("line1")), "captured: {:?}", captured);
+        assert!(captured.iter().any(|l| l.contains("line2")), "captured: {:?}", captured);
+        assert!(out.stderr.contains("line1"));
+        assert!(out.stderr.contains("line2"));
     }
 }

@@ -757,7 +757,21 @@ pub async fn transcribe_project_impl_internal(
                         "[SceneIntel] Background pre-warming initiated for {}",
                         source_path_clone
                     );
-                    let doc = scene_engine.process_source(&source_path_clone);
+                    let app_progress = app_clone.clone();
+                    let registry_progress = registry_clone.clone();
+                    let pid_progress = project_id_clone.clone();
+                    let doc = scene_engine.process_source_with_progress(&source_path_clone, move |pct| {
+                        emit_scene_intel_status(
+                            app_progress.as_ref(),
+                            registry_progress.as_ref(),
+                            scene_intelligence::SceneIntelStatus {
+                                project_id: pid_progress.clone(),
+                                status: "running".to_string(),
+                                progress: pct,
+                                scene_count: 0,
+                            },
+                        );
+                    });
                     println!(
                         "[SceneIntel] Background pre-warming COMPLETE: {} scenes cached (fallback={})",
                         doc.scenes.len(),

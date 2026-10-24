@@ -175,6 +175,22 @@ pub fn validate_scene_boundaries(
     Ok(())
 }
 
+/// Parse a line for `[SceneIntel] PROGRESS <pct>%` and return the progress (0..=100).
+pub fn parse_progress_line(line: &str) -> Option<u8> {
+    let tag = "[SceneIntel] PROGRESS";
+    let pos = line.find(tag)?;
+    let remainder = line[pos + tag.len()..].trim();
+    let token = remainder.split_whitespace().next()?;
+    let clean = token.trim_end_matches('%');
+    if let Ok(val) = clean.parse::<u8>() {
+        Some(val.min(100))
+    } else if let Ok(val) = clean.parse::<f64>() {
+        Some((val.round() as u8).min(100))
+    } else {
+        None
+    }
+}
+
 pub struct SceneIntelligenceEngine {
     cache_dir: PathBuf,
 }
@@ -276,6 +292,15 @@ impl SceneIntelligenceEngine {
     /// Run scene detection (cached). On ANY failure returns the single-scene
     /// fallback so the pipeline continues — never an error path for callers.
     pub fn process_source(&self, source_path: &str) -> SceneIntelligenceResult {
+        self.process_source_with_progress(source_path, |_| {})
+    }
+
+    /// Run scene detection with streaming progress callback (cached).
+    pub fn process_source_with_progress<F: Fn(u8) + Send + Sync + 'static>(
+        &self,
+        source_path: &str,
+        on_progress: F,
+    ) -> SceneIntelligenceResult {
         let started = std::time::Instant::now();
         let fallback = |reason: &str| {
             eprintln!("[SceneIntel] {} — single-scene fallback", reason);
@@ -332,7 +357,18 @@ impl SceneIntelligenceEngine {
             .arg("--cache-dir")
             .arg(&self.cache_dir);
 
-        let output = match crate::proc_guard::run_bounded(&mut cmd, budget, "SceneIntel") {
+        let progress_cb = std::sync::Arc::new(on_progress);
+        let progress_cb_clone = progress_cb.clone();
+        let output = match crate::proc_guard::run_bounded_with_stderr_line_callback(
+            &mut cmd,
+            budget,
+            "SceneIntel",
+            move |line| {
+                if let Some(pct) = parse_progress_line(line) {
+                    progress_cb_clone(pct);
+                }
+            },
+        ) {
             Ok(o) => o,
             Err(e) => return fallback(&format!("scene sidecar spawn failed: {}", e)),
         };
@@ -821,5 +857,31 @@ mod tests {
         assert_eq!(cuts, vec![2.76, 397.95]);
         assert!(cuts.iter().all(|c| *c > 0.0));
         assert!(cuts.windows(2).all(|w| w[0] < w[1]), "cuts must be monotonic");
+    }
+
+    #[test]
+    fn test_parse_progress_line() {
+        assert_eq!(parse_progress_line("[SceneIntel] PROGRESS 0%\n"), Some(0));
+        assert_eq!(parse_progress_line("[SceneIntel] PROGRESS 45%"), Some(45));
+        assert_eq!(parse_progress_line("[SceneIntel] PROGRESS 100%\r\n"), Some(100));
+        assert_eq!(parse_progress_line("[SceneIntel] PROGRESS 75"), Some(75));
+        assert_eq!(parse_progress_line("noise [SceneIntel] PROGRESS 50% extra"), Some(50));
+        assert_eq!(parse_progress_line("[SceneIntel] PROGRESS 150%"), Some(100));
+        assert_eq!(parse_progress_line("[SceneIntel] PROGRESS foo"), None);
+        assert_eq!(parse_progress_line("Random log line"), None);
+    }
+
+    #[test]
+    fn test_process_source_with_progress_missing_file_falls_back() {
+        let cache_dir = std::env::temp_dir().join(format!("scene_test_cb_{}", std::process::id()));
+        let engine =
+            SceneIntelligenceEngine::new(Some(cache_dir.to_string_lossy().to_string())).unwrap();
+        let progress_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pc = progress_called.clone();
+        let doc = engine.process_source_with_progress("Z:/definitely/missing/video.mp4", move |_| {
+            pc.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(doc.fallback);
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }
