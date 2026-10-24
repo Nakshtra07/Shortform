@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
         // 3b. The app's downloader (same function `download_youtube_video` wraps).
         let target = dirs::download_dir().ok_or_else(|| anyhow!("no Downloads dir"))?;
         let t = Instant::now();
-        let path = autoshorts_lib::youtube::download_video(url, &target, None, None, None)
+        let path = autoshorts_lib::youtube::download_video(url, &target, None, None)
             .map_err(|e| anyhow!("app download failed: {e}"))?;
         println!(
             "[Download] via youtube::download_video in {:.1}s -> {}",

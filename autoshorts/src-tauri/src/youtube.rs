@@ -1118,9 +1118,9 @@ pub fn detect_higher_quality_available(
     }
 }
 
-/// Runs yt-dlp to download the YouTube video with authenticated browser cookies and robust post-download verification.
+/// Runs yt-dlp to download the YouTube video with authenticated browser cookies, optional custom audio track selection, and robust post-download verification.
 /// Reliably selects the highest available resolution (including 1080p, 1440p, 4K/2160p+) with best audio.
-pub fn download_video(
+pub fn download_video_with_audio_track(
     url: &str,
     target_dir: &Path,
     audio_format_id: Option<&str>,
@@ -1471,6 +1471,16 @@ pub fn download_video(
     Err(format_actionable_error(&last_stderr, &attempted_auths))
 }
 
+/// Backwards-compatible 4-parameter wrapper for downloading YouTube video with default best audio.
+pub fn download_video(
+    url: &str,
+    target_dir: &Path,
+    browser_pref: Option<&str>,
+    cookie_path_pref: Option<&str>,
+) -> Result<PathBuf, String> {
+    download_video_with_audio_track(url, target_dir, None, browser_pref, cookie_path_pref)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1486,7 +1496,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target_dir);
         std::fs::create_dir_all(&target_dir).expect("must create temp download dir");
 
-        let res = download_video(url, &target_dir, None, Some("auto"), None);
+        let res = download_video(url, &target_dir, Some("auto"), None);
         assert!(res.is_ok(), "download_video failed: {:?}", res.err());
 
         let downloaded = res.unwrap();
@@ -2053,7 +2063,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target_dir);
         std::fs::create_dir_all(&target_dir).expect("must create temp dir");
 
-        let res = download_video(url, &target_dir, None, Some("auto"), None);
+        let res = download_video(url, &target_dir, Some("auto"), None);
         assert!(res.is_ok(), "1440p download failed: {:?}", res.err());
         let file = res.unwrap();
         assert!(file.exists());
@@ -2074,7 +2084,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target_dir);
         std::fs::create_dir_all(&target_dir).expect("must create temp dir");
 
-        let res = download_video(url, &target_dir, None, Some("auto"), None);
+        let res = download_video(url, &target_dir, Some("auto"), None);
         assert!(res.is_ok(), "4K download failed: {:?}", res.err());
         let file = res.unwrap();
         assert!(file.exists());
@@ -2237,5 +2247,11 @@ mod tests {
             "format-sort must prioritize hardware decodable codecs (vp9, avc) for Turing NVDEC: got {}",
             sort_val
         );
+    }
+
+    #[test]
+    fn test_download_video_signatures_compile() {
+        let _fn4: fn(&str, &Path, Option<&str>, Option<&str>) -> Result<PathBuf, String> = download_video;
+        let _fn5: fn(&str, &Path, Option<&str>, Option<&str>, Option<&str>) -> Result<PathBuf, String> = download_video_with_audio_track;
     }
 }
