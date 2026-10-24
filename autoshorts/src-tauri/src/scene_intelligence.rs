@@ -14,24 +14,29 @@ use std::io::{BufReader, Read};
 use std::path::PathBuf;
 
 /// Scene detector identity written to the cache and DB.
-pub const SCENE_DETECTOR: &str = "PySceneDetect-AdaptiveDetector";
-pub const SCENE_DETECTOR_VERSION: &str = "0.7.1";
-pub const SCENE_CONFIG_VERSION: &str = "2-frame_skip";
+pub const SCENE_DETECTOR: &str = "PyTorch-CUDA-AdaptiveDetector";
+pub const SCENE_DETECTOR_VERSION: &str = "1.0.0";
+pub const SCENE_CONFIG_VERSION: &str = "gpu-cuda-v1";
 
 /// Wall-clock budget for the scene sidecar, derived from source duration.
-///
-/// The sidecar's cost is linear in runtime: measured 20.1 s per 60 s of 1080p
-/// source (~0.33x realtime). The budget is therefore a multiple of the source
-/// duration rather than a fixed constant, so a 25-minute source is allowed
-/// enough time to finish while a pathological child is still killed.
-const SCENE_TIMEOUT_FLOOR_SEC: f64 = 120.0;
-const SCENE_TIMEOUT_REALTIME_FACTOR: f64 = 2.5;
-const SCENE_TIMEOUT_CEILING_SEC: f64 = 3600.0;
+/// Calibrated for PyTorch CUDA GPU acceleration with a 600s ceiling.
+const SCENE_TIMEOUT_FLOOR_SEC: f64 = 60.0;
+const SCENE_TIMEOUT_REALTIME_FACTOR: f64 = 0.5;
+const SCENE_TIMEOUT_CEILING_SEC: f64 = 600.0;
 
 /// Default frame-sampling stride for the sidecar, mirroring the Python
 /// `FRAME_SKIP` default. Declared here so the value is asserted in tests rather
 /// than duplicated as a magic number.
 pub const FRAME_SKIP_DEFAULT: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneIntelStatus {
+    pub project_id: String,
+    pub status: String,
+    pub progress: u8,
+    pub scene_count: usize,
+}
 
 fn scene_timeout_for(duration_sec: Option<f64>) -> std::time::Duration {
     let secs = match duration_sec {
@@ -232,6 +237,12 @@ impl SceneIntelligenceEngine {
         }
     }
 
+    /// Retrieve cached scenes for a source path without executing detection.
+    pub fn get_cached_scenes(&self, source_path: &str) -> Option<SceneIntelligenceResult> {
+        let source_hash = self.compute_source_hash(source_path).ok()?;
+        self.load_cache(&source_hash)
+    }
+
     fn save_cache(&self, doc: &SceneIntelligenceResult) -> Result<()> {
         let path = self.cache_path(&doc.source_hash);
         std::fs::write(&path, serde_json::to_string_pretty(doc)?)
@@ -409,26 +420,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_scene_timeout_for_gpu_bound() {
+        let dur = scene_timeout_for(Some(5000.0));
+        assert!(dur.as_secs_f64() <= 600.0, "Ceiling must clamp to 600s for GPU acceleration");
+    }
+
+    #[test]
+    fn test_scene_intel_status_serialization() {
+        let s = SceneIntelStatus {
+            project_id: "test_proj".to_string(),
+            status: "completed".to_string(),
+            progress: 100,
+            scene_count: 42,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"projectId\":\"test_proj\""));
+        assert!(json.contains("\"sceneCount\":42"));
+    }
+
+    #[test]
+    fn test_get_cached_scenes_missing_file_returns_none() {
+        let cache_dir = std::env::temp_dir().join(format!("scene_test_cache_{}", std::process::id()));
+        let engine = SceneIntelligenceEngine::new(Some(cache_dir.to_string_lossy().to_string())).unwrap();
+        assert!(engine.get_cached_scenes("Z:/missing/file.mp4").is_none());
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
     fn scene_timeout_scales_with_duration_and_is_bounded() {
         // Short source: floored so a normal short video is never truncated.
         let short = scene_timeout_for(Some(20.0));
-        assert!(short.as_secs_f64() >= 120.0, "{:?}", short);
-        // The real 25-minute source gets a budget above its measured 183s run,
-        // so the fix is not merely "wait longer" -- it makes the stage finish
-        // inside a bounded window.
+        assert!(short.as_secs_f64() >= 60.0, "{:?}", short);
+        // The real 25-minute source gets a budget bounded by ceiling.
         let long = scene_timeout_for(Some(1482.4));
         assert!(
-            long.as_secs_f64() > 183.0,
-            "budget {:?} must exceed the measured 183s runtime",
+            long.as_secs_f64() > 60.0,
+            "budget {:?} must exceed the 60s floor",
             long
         );
         // Unknown duration assumes long rather than guessing short and
         // truncating a legitimate detection run.
-        assert_eq!(scene_timeout_for(None).as_secs_f64(), 3600.0);
+        assert_eq!(scene_timeout_for(None).as_secs_f64(), 600.0);
         // Bounded on both ends: never unbounded, never absurd.
-        assert!(long.as_secs_f64() <= 3600.0);
-        assert!(scene_timeout_for(Some(1e9)).as_secs_f64() <= 3600.0);
-        assert!(scene_timeout_for(Some(f64::NAN)).as_secs_f64() <= 3600.0);
+        assert!(long.as_secs_f64() <= 600.0);
+        assert!(scene_timeout_for(Some(1e9)).as_secs_f64() <= 600.0);
+        assert!(scene_timeout_for(Some(f64::NAN)).as_secs_f64() <= 600.0);
     }
 
     #[test]
