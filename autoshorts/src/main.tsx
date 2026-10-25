@@ -2043,7 +2043,7 @@ function App() {
                             {effectiveStatus.status === "running" && (
                               <>
                                 <Loader2 className="spin" size={13} />
-                                <span>Scene Intel {effectiveStatus.progress > 0 ? `${effectiveStatus.progress}%` : "Scanning..."}</span>
+                                <span>Scene Intel {effectiveStatus.progress}%</span>
                               </>
                             )}
                             {effectiveStatus.status === "completed" && (

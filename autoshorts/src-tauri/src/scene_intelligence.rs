@@ -19,10 +19,10 @@ pub const SCENE_DETECTOR_VERSION: &str = "1.0.0";
 pub const SCENE_CONFIG_VERSION: &str = "gpu-cuda-v1";
 
 /// Wall-clock budget for the scene sidecar, derived from source duration.
-/// Calibrated for PyTorch CUDA GPU acceleration with a 600s ceiling.
+/// Calibrated for PyTorch CUDA GPU acceleration with a 3600s ceiling.
 const SCENE_TIMEOUT_FLOOR_SEC: f64 = 60.0;
 const SCENE_TIMEOUT_REALTIME_FACTOR: f64 = 0.5;
-const SCENE_TIMEOUT_CEILING_SEC: f64 = 600.0;
+const SCENE_TIMEOUT_CEILING_SEC: f64 = 3600.0;
 
 /// Default frame-sampling stride for the sidecar, mirroring the Python
 /// `FRAME_SKIP` default. Declared here so the value is asserted in tests rather
@@ -457,8 +457,8 @@ mod tests {
 
     #[test]
     fn test_scene_timeout_for_gpu_bound() {
-        let dur = scene_timeout_for(Some(5000.0));
-        assert!(dur.as_secs_f64() <= 600.0, "Ceiling must clamp to 600s for GPU acceleration");
+        let dur = scene_timeout_for(Some(10000.0));
+        assert!(dur.as_secs_f64() <= 3600.0, "Ceiling must clamp to 3600s for GPU acceleration");
     }
 
     #[test]
@@ -496,11 +496,11 @@ mod tests {
         );
         // Unknown duration assumes long rather than guessing short and
         // truncating a legitimate detection run.
-        assert_eq!(scene_timeout_for(None).as_secs_f64(), 600.0);
+        assert_eq!(scene_timeout_for(None).as_secs_f64(), 3600.0);
         // Bounded on both ends: never unbounded, never absurd.
-        assert!(long.as_secs_f64() <= 600.0);
-        assert!(scene_timeout_for(Some(1e9)).as_secs_f64() <= 600.0);
-        assert!(scene_timeout_for(Some(f64::NAN)).as_secs_f64() <= 600.0);
+        assert!(long.as_secs_f64() <= 3600.0);
+        assert!(scene_timeout_for(Some(1e9)).as_secs_f64() <= 3600.0);
+        assert!(scene_timeout_for(Some(f64::NAN)).as_secs_f64() <= 3600.0);
     }
 
     #[test]

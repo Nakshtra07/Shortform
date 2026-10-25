@@ -68,6 +68,33 @@ fn emit_scene_intel_status(
     }
 }
 
+fn check_and_mark_scene_intel_running(
+    registry: Option<&Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>>>,
+    project_id: &str,
+) -> bool {
+    if let Some(reg) = registry {
+        let mut map = match reg.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(current) = map.get(project_id) {
+            if current.status == "running" {
+                return false;
+            }
+        }
+        map.insert(
+            project_id.to_string(),
+            scene_intelligence::SceneIntelStatus {
+                project_id: project_id.to_string(),
+                status: "running".to_string(),
+                progress: 0,
+                scene_count: 0,
+            },
+        );
+    }
+    true
+}
+
 fn trigger_scene_intel_prewarm(
     app: Option<&tauri::AppHandle>,
     registry: Option<&Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>>>,
@@ -82,16 +109,25 @@ fn trigger_scene_intel_prewarm(
     let source_path_clone = source_path;
     let project_id_clone = project_id;
 
-    emit_scene_intel_status(
-        app_clone.as_ref(),
-        registry_clone.as_ref(),
-        scene_intelligence::SceneIntelStatus {
-            project_id: project_id_clone.clone(),
-            status: "running".to_string(),
-            progress: 0,
-            scene_count: 0,
-        },
-    );
+    if !check_and_mark_scene_intel_running(registry_clone.as_ref(), &project_id_clone) {
+        println!(
+            "[SceneIntel] Pre-warming already running for project {}, skipping duplicate spawn",
+            project_id_clone
+        );
+        return;
+    }
+
+    if let Some(app_handle) = app_clone.as_ref() {
+        let _ = app_handle.emit(
+            "scene-intel-status",
+            &scene_intelligence::SceneIntelStatus {
+                project_id: project_id_clone.clone(),
+                status: "running".to_string(),
+                progress: 0,
+                scene_count: 0,
+            },
+        );
+    }
 
     tokio::task::spawn_blocking(move || {
         match scene_intelligence::SceneIntelligenceEngine::new(None) {
@@ -4391,6 +4427,48 @@ mod tests {
         assert_eq!(retrieved.status, "running");
         assert_eq!(retrieved.progress, 45);
         assert_eq!(retrieved.scene_count, 0);
+    }
+
+    #[test]
+    fn test_scene_intel_registry_deduplication_state() {
+        let registry: Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Initial prewarm check: succeeds and marks as running
+        let first_allowed = check_and_mark_scene_intel_running(Some(&registry), "proj_dedup");
+        assert!(first_allowed, "First prewarm trigger must be allowed");
+
+        // Verify status is registered as running with progress 0
+        {
+            let map = registry.lock().unwrap();
+            let status = map.get("proj_dedup").unwrap();
+            assert_eq!(status.status, "running");
+            assert_eq!(status.progress, 0);
+        }
+
+        // Simulate progress update to 50%
+        emit_scene_intel_status(
+            None,
+            Some(&registry),
+            scene_intelligence::SceneIntelStatus {
+                project_id: "proj_dedup".to_string(),
+                status: "running".to_string(),
+                progress: 50,
+                scene_count: 0,
+            },
+        );
+
+        // Second prewarm check while running: rejected by deduplication
+        let duplicate_allowed = check_and_mark_scene_intel_running(Some(&registry), "proj_dedup");
+        assert!(!duplicate_allowed, "Duplicate prewarm trigger must be rejected while running");
+
+        // Progress must NOT be overwritten back to 0
+        {
+            let map = registry.lock().unwrap();
+            let status = map.get("proj_dedup").unwrap();
+            assert_eq!(status.status, "running");
+            assert_eq!(status.progress, 50, "In-progress scan must not be reset to 0");
+        }
     }
 
     fn make_word(text: &str, start: f64, end: f64) -> TranscriptWord {
