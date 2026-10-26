@@ -9,6 +9,7 @@ pub mod db;
 // entry points the Tauri commands use, rather than reimplementing them.
 pub mod llm;
 pub mod media;
+pub mod model_manager;
 pub mod models;
 pub mod pacing;
 pub mod panns_reactions;
@@ -59,9 +60,11 @@ fn emit_scene_intel_status(
     status: scene_intelligence::SceneIntelStatus,
 ) {
     if let Some(reg) = registry {
-        if let Ok(mut map) = reg.lock() {
-            map.insert(status.project_id.clone(), status.clone());
-        }
+        let mut map = match reg.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.insert(status.project_id.clone(), status.clone());
     }
     if let Some(app_handle) = app {
         let _ = app_handle.emit("scene-intel-status", &status);
@@ -337,8 +340,11 @@ async fn environment_status(
         .unwrap_or_else(|_| "nvidia".to_string())
         .to_lowercase();
 
-    let has_local_whisper_model =
-        transcription::whisper_cli_exists() || transcription::whisper_python_exists();
+    let has_local_whisper_model = tokio::task::spawn_blocking(|| {
+        transcription::whisper_cli_exists() || transcription::whisper_python_exists()
+    })
+    .await
+    .unwrap_or(false);
 
     let has_ollama = reqwest::Client::new()
         .get("http://localhost:11434")
@@ -815,8 +821,11 @@ pub async fn transcribe_project_impl_internal(
                 .map_err(to_command_error)?
         }
         "local" => {
-            let has_whisper =
-                transcription::whisper_cli_exists() || transcription::whisper_python_exists();
+            let has_whisper = tokio::task::spawn_blocking(|| {
+                transcription::whisper_cli_exists() || transcription::whisper_python_exists()
+            })
+            .await
+            .unwrap_or(false);
             if !has_whisper {
                 return Err("Whisper is not installed. Please install it (e.g., via Homebrew 'brew install whisper-cli' or via Python 'pip3 install openai-whisper').".to_string());
             }
@@ -1044,46 +1053,6 @@ pub async fn generate_candidates_impl(
                 .to_string(),
         );
     }
-
-    // If params are provided, override env vars for this call only:
-    // Set AUTOSHORTS_DISCOVERY_MODE from discovery_mode
-    // Set AUTOSHORTS_REZE_PROVIDER from reze_provider
-    let prev_discovery_mode = std::env::var("AUTOSHORTS_DISCOVERY_MODE").ok();
-    let prev_reze_provider = std::env::var("AUTOSHORTS_REZE_PROVIDER").ok();
-
-    if let Some(ref dm) = discovery_mode {
-        let trimmed = dm.trim();
-        if !trimmed.is_empty() {
-            std::env::set_var("AUTOSHORTS_DISCOVERY_MODE", trimmed);
-        }
-    }
-    if let Some(ref rp) = reze_provider {
-        let trimmed = rp.trim();
-        if !trimmed.is_empty() {
-            std::env::set_var("AUTOSHORTS_REZE_PROVIDER", trimmed);
-        }
-    }
-
-    struct CallEnvGuard {
-        prev_discovery_mode: Option<String>,
-        prev_reze_provider: Option<String>,
-    }
-    impl Drop for CallEnvGuard {
-        fn drop(&mut self) {
-            match &self.prev_discovery_mode {
-                Some(v) => std::env::set_var("AUTOSHORTS_DISCOVERY_MODE", v),
-                None => std::env::remove_var("AUTOSHORTS_DISCOVERY_MODE"),
-            }
-            match &self.prev_reze_provider {
-                Some(v) => std::env::set_var("AUTOSHORTS_REZE_PROVIDER", v),
-                None => std::env::remove_var("AUTOSHORTS_REZE_PROVIDER"),
-            }
-        }
-    }
-    let _call_env_guard = CallEnvGuard {
-        prev_discovery_mode,
-        prev_reze_provider,
-    };
 
     let effective_provider = reze_provider.as_deref().or(provider.as_deref());
     let (discovery_mode, is_nvidia_reze, nvidia_key_opt) = resolve_reze_3_way_gate(
@@ -3605,6 +3574,14 @@ async fn get_scene_intelligence_status(
     })
 }
 
+#[tauri::command]
+async fn ensure_yolo_model(app: tauri::AppHandle) -> Result<String, String> {
+    model_manager::ensure_yolo_weights(Some(&app))
+        .await
+        .map(|p| p.to_string_lossy().to_string())
+        .map_err(|e| e.to_string())
+}
+
 pub fn run() {
     let _ = dotenvy::dotenv();
     let _ = dotenvy::from_filename("../.env");
@@ -3656,7 +3633,8 @@ pub fn run() {
             probe_youtube_media,
             download_youtube_video,
             get_scene_intelligence_status,
-            trigger_scene_intelligence
+            trigger_scene_intelligence,
+            ensure_yolo_model
         ])
         .run(tauri::generate_context!())
         .expect("error while running AutoShorts");
@@ -4427,6 +4405,39 @@ mod tests {
         assert_eq!(retrieved.status, "running");
         assert_eq!(retrieved.progress, 45);
         assert_eq!(retrieved.scene_count, 0);
+    }
+
+    #[test]
+    fn test_emit_scene_intel_status_recovers_from_poisoned_registry() {
+        let registry: Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let reg_clone = Arc::clone(&registry);
+        let _ = std::thread::spawn(move || {
+            let _lock = reg_clone.lock().unwrap();
+            panic!("Intentional panic to poison mutex");
+        })
+        .join();
+
+        assert!(registry.is_poisoned(), "Precondition: registry mutex must be poisoned");
+
+        let status = scene_intelligence::SceneIntelStatus {
+            project_id: "proj_poison_test".to_string(),
+            status: "completed".to_string(),
+            progress: 100,
+            scene_count: 5,
+        };
+
+        emit_scene_intel_status(None, Some(&registry), status);
+
+        let locked = match registry.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let retrieved = locked.get("proj_poison_test").expect("status must be present in poisoned registry");
+        assert_eq!(retrieved.status, "completed");
+        assert_eq!(retrieved.progress, 100);
+        assert_eq!(retrieved.scene_count, 5);
     }
 
     #[test]

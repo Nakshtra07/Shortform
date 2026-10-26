@@ -260,14 +260,34 @@ def extract_embedding_batch(model: torch.nn.Module, crops: List[np.ndarray], dev
     if not tensors:
         return [None] * len(crops)
     
-    batch = torch.cat(tensors, dim=0).to(REID_DEVICE)
-    
-    with torch.no_grad():
-        features = model(batch)
-        if features.dim() == 4:
-            features = F.adaptive_avg_pool2d(features, (1, 1))
-            features = features.view(features.size(0), -1)
-        features = F.normalize(features, p=2, dim=1)
+    try:
+        batch = torch.cat(tensors, dim=0).to(REID_DEVICE)
+        with torch.no_grad():
+            features = model(batch)
+            if features.dim() == 4:
+                features = F.adaptive_avg_pool2d(features, (1, 1))
+                features = features.view(features.size(0), -1)
+            features = F.normalize(features, p=2, dim=1)
+    except Exception as e:
+        if "out of memory" in str(e).lower():
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            sys.stderr.write(f"[ReID] CUDA OOM in tracker ({e}); fallback to CPU for this batch\n")
+            cpu_model = model.to("cpu")
+            cpu_batch = torch.cat(tensors, dim=0).to("cpu")
+            with torch.no_grad():
+                features = cpu_model(cpu_batch)
+                if features.dim() == 4:
+                    features = F.adaptive_avg_pool2d(features, (1, 1))
+                    features = features.view(features.size(0), -1)
+                features = F.normalize(features, p=2, dim=1)
+            if REID_DEVICE != "cpu" and torch.cuda.is_available():
+                try:
+                    model.to(REID_DEVICE)
+                except Exception:
+                    pass
+        else:
+            raise
     
     results = [None] * len(crops)
     for idx, feat_idx in enumerate(valid_indices):
@@ -1061,6 +1081,28 @@ SALIENCY_OTS_LISTENER   = 0.20
 SALIENCY_BACKGROUND_FACE = 0.05
 SALIENCY_FURNITURE      = 0.00
 SALIENCY_EMPTY_CENTER   = 0.00
+
+# ─── Resolution-Independent Framing Scaler ────────────────────────────────────
+REF_FRAME_W = 1920.0
+REF_FRAME_H = 1080.0
+REF_DIAGONAL_1080P = math.hypot(REF_FRAME_W, REF_FRAME_H)  # ≈ 2202.907 px
+REF_AREA_1080P = REF_FRAME_W * REF_FRAME_H                 # 2,073,600 px²
+
+class ResolutionScaler:
+    """Scales Euclidean distances and 2D pixel areas invariant to frame resolution and aspect ratio."""
+    def __init__(self, w: float, h: float):
+        self.w = max(1.0, float(w))
+        self.h = max(1.0, float(h))
+        self.diag = math.hypot(self.w, self.h)
+        self.area = self.w * self.h
+        self.scale_diag = self.diag / REF_DIAGONAL_1080P
+        self.scale_area = self.area / REF_AREA_1080P
+
+    def dist(self, px_1080p: float) -> float:
+        return px_1080p * self.scale_diag
+
+    def area_val(self, area_1080p: float) -> float:
+        return area_1080p * self.scale_area
 
 
 # ─── Per-Shot Scale State ──────────────────────────────────────────────────────
@@ -2204,15 +2246,32 @@ class NativeTracker:
     2-stage ByteTrack face association with Kalman/velocity motion prediction.
     """
     @staticmethod
-    def track_shot(shot_samples):
+    def track_shot(shot_samples, source_w: Optional[float] = None, source_h: Optional[float] = None):
         shot_tracks = {}
         next_tid = 0
         prev_frame = None
+
+        inferred_w, inferred_h = source_w, source_h
+        if inferred_w is None or inferred_h is None:
+            for s in shot_samples:
+                f = s[1] if len(s) > 1 else None
+                if f is not None and hasattr(f, "shape") and len(f.shape) >= 2:
+                    inferred_h = float(f.shape[0])
+                    inferred_w = float(f.shape[1])
+                    break
+        if inferred_w is None:
+            inferred_w = 1920.0
+        if inferred_h is None:
+            inferred_h = 1080.0
+        scaler = ResolutionScaler(inferred_w, inferred_h)
 
         for sample in shot_samples:
             rel_t = sample[0]
             frame = sample[1] if len(sample) > 1 else None
             faces = sample[2] if len(sample) > 2 else []
+
+            if frame is not None and hasattr(frame, "shape") and len(frame.shape) >= 2:
+                scaler = ResolutionScaler(float(frame.shape[1]), float(frame.shape[0]))
 
             # 1. Global Motion Compensation (GMC)
             dx, dy = 0.0, 0.0
@@ -2305,7 +2364,7 @@ class NativeTracker:
                 tr["is_occluded"] = False
 
             # Stage 1: High confidence detections
-            stage1_matches = _match_tracks_to_dets(active_track_ids, high_dets, dist_thresh=180.0)
+            stage1_matches = _match_tracks_to_dets(active_track_ids, high_dets, dist_thresh=scaler.dist(180.0))
             for tid, det_idx in stage1_matches:
                 matched_tracks.add(tid)
                 matched_high_dets.add(det_idx)
@@ -2313,7 +2372,7 @@ class NativeTracker:
 
             # Stage 2: Low confidence detections for remaining tracks
             unmatched_track_ids = [tid for tid in active_track_ids if tid not in matched_tracks]
-            stage2_matches = _match_tracks_to_dets(unmatched_track_ids, low_dets, dist_thresh=140.0)
+            stage2_matches = _match_tracks_to_dets(unmatched_track_ids, low_dets, dist_thresh=scaler.dist(140.0))
             for tid, det_idx in stage2_matches:
                 matched_tracks.add(tid)
                 _update_tr(shot_tracks[tid], low_dets[det_idx])
@@ -2374,7 +2433,7 @@ class UltralyticsTracker:
                 if hasattr(t, 'reset'):
                     t.reset()
 
-    def track_shot(self, shot_samples):
+    def track_shot(self, shot_samples, source_w: Optional[float] = None, source_h: Optional[float] = None):
         # Reset BoT-SORT tracker so tracking IDs never bleed across shot cuts
         self._reset_tracker()
         sys.stderr.write("[CV Runtime] BoT-SORT tracking started\n")
@@ -2386,6 +2445,10 @@ class UltralyticsTracker:
         # Initialize Re-ID manager for this shot
         reid_manager = get_reid_manager()
 
+        cur_w = source_w if source_w is not None else 1920.0
+        cur_h = source_h if source_h is not None else 1080.0
+        scaler = ResolutionScaler(cur_w, cur_h)
+
         for sample in shot_samples:
             rel_t = sample[0]
             frame = sample[1] if len(sample) > 1 else None
@@ -2393,6 +2456,8 @@ class UltralyticsTracker:
 
             if frame is None:
                 continue
+
+            scaler = ResolutionScaler(float(frame.shape[1]), float(frame.shape[0]))
 
             # Run official Ultralytics BoT-SORT tracking for person class (classes=[0])
             # sparseOptFlow GMC is performed inside BoT-SORT; external GMC is bypassed
@@ -2576,7 +2641,7 @@ class UltralyticsTracker:
                     fcx, fcy = face["center"]
                     matched_tid = None
                     for tid, tr in shot_tracks.items():
-                        if rel_t - tr["last_t"] <= 0.60 and math.hypot(tr["cx"] - fcx, tr["cy"] - fcy) < 150.0:
+                        if rel_t - tr["last_t"] <= 0.60 and math.hypot(tr["cx"] - fcx, tr["cy"] - fcy) < scaler.dist(150.0):
                             matched_tid = tid
                             break
                     if matched_tid is not None:
@@ -2616,7 +2681,7 @@ _CURRENT_BACKEND = None
 _BACKEND_HEADER_PRINTED = False
 
 
-def build_shot_tracks(shot_samples):
+def build_shot_tracks(shot_samples, source_w: Optional[float] = None, source_h: Optional[float] = None):
     """
     Unified Multi-Object Subject Tracking Entry Point.
     Supports dual backends:
@@ -2633,7 +2698,7 @@ def build_shot_tracks(shot_samples):
     t_start = time.time()
 
     if backend != "ultralytics":
-        shot_tracks = NativeTracker.track_shot(shot_samples)
+        shot_tracks = NativeTracker.track_shot(shot_samples, source_w=source_w, source_h=source_h)
         if not _BACKEND_HEADER_PRINTED:
             sys.stderr.write(f"[CV Backend] backend={backend}\n")
             sys.stderr.flush()
@@ -2660,7 +2725,7 @@ def build_shot_tracks(shot_samples):
                     _BACKEND_HEADER_PRINTED = True
 
                 tracker = UltralyticsTracker(model)
-                shot_tracks = tracker.track_shot(shot_samples)
+                shot_tracks = tracker.track_shot(shot_samples, source_w=source_w, source_h=source_h)
                 return shot_tracks
         except Exception as e:
             # Genuine last-resort fallback only. The concrete error type, message
@@ -2674,7 +2739,7 @@ def build_shot_tracks(shot_samples):
             sys.stderr.flush()
 
     # Fallback to NativeTracker (for synthetic unit tests where frame is None or when Ultralytics is disabled)
-    shot_tracks = NativeTracker.track_shot(shot_samples)
+    shot_tracks = NativeTracker.track_shot(shot_samples, source_w=source_w, source_h=source_h)
     if not _BACKEND_HEADER_PRINTED:
         sys.stderr.write("[CV Backend] backend=native\n")
         sys.stderr.flush()
@@ -2945,6 +3010,7 @@ def resolve_visual_subject(
     is empty or uncertain the deterministic mouth-motion heuristic decides.
     """
     cfg = config or DEFAULT_FRAMING_CONFIG
+    scaler = ResolutionScaler(source_w, source_h)
     max_area_in_shot = max(
         (float(np.mean([d[1]["area"] for d in tr["detections"]])) for tr in genuine_tracks),
         default=0.0
@@ -3230,7 +3296,7 @@ def resolve_visual_subject(
             target_cx = target_track["cx"]
 
         m_mot = target_track.get("mot", 0.0)
-        if m_mot < cfg.mouth_motion_active_thresh and (is_shot_cut or (spk and spk in last_confirmed_cx_by_spk and abs(target_cx - last_confirmed_cx_by_spk[spk]) > 250.0)):
+        if m_mot < cfg.mouth_motion_active_thresh and (is_shot_cut or (spk and spk in last_confirmed_cx_by_spk and abs(target_cx - last_confirmed_cx_by_spk[spk]) > scaler.dist(250.0))):
             subject_role = "listener_reaction"
         else:
             subject_role = "speaker"
@@ -3350,6 +3416,7 @@ class DualFrameLayoutResolver:
         """
         if not isinstance(track, dict):
             return False
+        scaler = ResolutionScaler(source_w, source_h)
 
         # Explicit eligibility override (for mocking or fast paths)
         if track.get("is_eligible") is not None:
@@ -3439,7 +3506,7 @@ class DualFrameLayoutResolver:
                 # Reject micro-artifacts and distant background specs (< ~38px width/height or < 1800px area in 1080p)
                 min_w = source_w * 0.02   # ~38px
                 min_h = source_h * 0.035  # ~38px
-                if fw < min_w or fh < min_h or fa < 1800.0:
+                if fw < min_w or fh < min_h or fa < scaler.area_val(1800.0):
                     return False
 
         # 5. Prominence check (not distant background passerby)
@@ -3642,6 +3709,7 @@ def classify_and_frame_subject(
     crop_w and crop_h are REAL dynamic pixel dimensions.
     """
     cfg = config or DEFAULT_FRAMING_CONFIG
+    scaler = ResolutionScaler(source_w, source_h)
     identity = get_or_create_identity(spk) if spk else None
     local_samples, all_local_faces = [], []
     if shot_samples and isinstance(shot_samples[0], (list, tuple)) and len(shot_samples[0]) >= 3:
@@ -3850,7 +3918,7 @@ def classify_and_frame_subject(
         try:
             _lo = float(corridor_info.get("min_valid_x", clamped_x))
             _hi = float(corridor_info.get("max_valid_x", clamped_x))
-            _deadband = max(17.5, eff_crop_w * 0.045)
+            _deadband = max(scaler.dist(17.5), eff_crop_w * 0.045)
             _cands = sorted({
                 float(np.clip(clamped_x, _lo, _hi)),
                 float(np.clip(clamped_x - _deadband, _lo, _hi)),
@@ -6468,7 +6536,7 @@ def run(
         else:
             track_samples = shot_samples
         shot_tracks = _scale_shot_tracks_to_source_space(
-            build_shot_tracks(track_samples), 1.0 / stored_ratio
+            build_shot_tracks(track_samples, source_w=source_w, source_h=source_h), 1.0 / stored_ratio
         )
         shot_scale_state = None  # KEY INVARIANT: reset per shot
 

@@ -11,8 +11,9 @@
 
 use crate::db::Database;
 use crate::models::{
-    ActiveSpeakerState, ApplicationSpeakerMap, ApplicationSpeakerRole, MappingEvidence,
-    SpeakerDiarizationResult, SpeakerMapping, TrackReIdEmbedding, TranscriptWord,
+    ActiveSpeakerState, ApplicationSpeakerMap, ApplicationSpeakerRole, DiarizedSegment,
+    DiarizedSpeaker, MappingEvidence, SpeakerDiarizationResult, SpeakerMapping,
+    TrackReIdEmbedding, TranscriptWord,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -271,7 +272,23 @@ impl SpeakerIntelligenceEngine {
         println!("[SpeakerIntel] Processing source video: {}", source_path);
 
         // Step 1: Diarization (fallback-safe: never blocks the pipeline).
-        let diarization = self.run_diarization(source_path, &source_hash)?;
+        let mut diarization = if let Some(inline_diar) = Self::build_diarization_from_transcript_words(
+            transcript_words,
+            "deepgram-nova3-transcription",
+        ) {
+            println!(
+                "[SpeakerIntel] Zero-redundancy diarization extracted from transcript: {} speakers, {} segments (model={})",
+                inline_diar.speakers.len(),
+                inline_diar.segments.len(),
+                inline_diar.model
+            );
+            inline_diar
+        } else {
+            self.run_diarization(source_path, &source_hash)?
+        };
+        if diarization.source_hash.is_empty() {
+            diarization.source_hash = source_hash.clone();
+        }
         println!(
             "[SpeakerIntel] Diarization complete: {} speakers, {} segments (model={})",
             diarization.speakers.len(),
@@ -339,6 +356,107 @@ the next run will retry diarization.",
             speaker_map,
             reid_embeddings,
             fusion_intervals,
+        })
+    }
+
+    /// Extracts zero-redundancy diarization segments and speaker summaries directly from
+    /// pre-existing word-level transcription speaker tags.
+    ///
+    /// Avoids invoking a redundant secondary diarization pipeline if the transcription
+    /// already tagged speakers on the words.
+    pub fn build_diarization_from_transcript_words(
+        words: &[TranscriptWord],
+        model_label: &str,
+    ) -> Option<SpeakerDiarizationResult> {
+        if words.is_empty() || words.iter().all(|w| w.speaker.is_none()) {
+            return None;
+        }
+
+        let mut segments: Vec<DiarizedSegment> = Vec::new();
+        let mut current_segment: Option<DiarizedSegment> = None;
+
+        for word in words {
+            let Some(speaker) = word.speaker.as_ref() else {
+                if let Some(seg) = current_segment.take() {
+                    segments.push(seg);
+                }
+                continue;
+            };
+
+            if let Some(ref mut seg) = current_segment {
+                let gap = word.start - seg.end;
+                if &seg.speaker_id == speaker && gap <= 0.45 {
+                    if word.end > seg.end {
+                        seg.end = word.end;
+                    }
+                } else {
+                    let old_seg = current_segment.take().unwrap();
+                    segments.push(old_seg);
+                    current_segment = Some(DiarizedSegment {
+                        speaker_id: speaker.clone(),
+                        start: word.start,
+                        end: word.end,
+                        confidence: 0.95,
+                    });
+                }
+            } else {
+                current_segment = Some(DiarizedSegment {
+                    speaker_id: speaker.clone(),
+                    start: word.start,
+                    end: word.end,
+                    confidence: 0.95,
+                });
+            }
+        }
+
+        if let Some(seg) = current_segment {
+            segments.push(seg);
+        }
+
+        if segments.is_empty() {
+            return None;
+        }
+
+        let mut speaker_order: Vec<String> = Vec::new();
+        let mut speaker_stats: HashMap<String, (f64, usize)> = HashMap::new();
+
+        for seg in &segments {
+            let entry = speaker_stats
+                .entry(seg.speaker_id.clone())
+                .or_insert_with(|| {
+                    speaker_order.push(seg.speaker_id.clone());
+                    (0.0, 0)
+                });
+            entry.0 += (seg.end - seg.start).max(0.0);
+            entry.1 += 1;
+        }
+
+        speaker_order.sort();
+
+        let speakers: Vec<DiarizedSpeaker> = speaker_order
+            .into_iter()
+            .map(|id| {
+                let (total_speech_sec, segment_count) = speaker_stats
+                    .get(&id)
+                    .copied()
+                    .unwrap_or((0.0, 0));
+                DiarizedSpeaker {
+                    diarization_id: id,
+                    total_speech_sec,
+                    segment_count,
+                    avg_confidence: 0.95,
+                }
+            })
+            .collect();
+
+        Some(SpeakerDiarizationResult {
+            source_hash: String::new(),
+            model: model_label.to_string(),
+            version: "inline-v1".to_string(),
+            speakers,
+            segments,
+            confidence: 0.95,
+            created_at: chrono::Utc::now().to_rfc3339(),
         })
     }
 
@@ -910,10 +1028,30 @@ impl SpeakerIntelligenceEngine {
         }
         if let Some(mut cache) = self.load_cache(&source_hash) {
             if !reid_embeddings.is_empty() {
-                cache.reid_embeddings = reid_embeddings.to_vec();
+                for new_emb in reid_embeddings {
+                    if let Some(existing) = cache
+                        .reid_embeddings
+                        .iter_mut()
+                        .find(|e| e.track_id == new_emb.track_id && e.shot_idx == new_emb.shot_idx)
+                    {
+                        *existing = new_emb.clone();
+                    } else {
+                        cache.reid_embeddings.push(new_emb.clone());
+                    }
+                }
             }
             if !fusion_intervals.is_empty() {
-                cache.fusion_intervals = fusion_intervals.to_vec();
+                for new_interval in fusion_intervals {
+                    if let Some(existing) = cache.fusion_intervals.iter_mut().find(|i| {
+                        i.track_id == new_interval.track_id
+                            && (i.start - new_interval.start).abs() < 1e-4
+                            && (i.end - new_interval.end).abs() < 1e-4
+                    }) {
+                        *existing = new_interval.clone();
+                    } else {
+                        cache.fusion_intervals.push(new_interval.clone());
+                    }
+                }
             }
             let _ = self.save_cache(&cache);
         }
@@ -2157,5 +2295,186 @@ mod tests {
             engine.load_cache(&source_hash).is_some(),
             "real result must round-trip"
         );
+    }
+
+    #[test]
+    fn test_refresh_cache_from_render_merges_reid_and_fusion() {
+        let engine = si_engine_named("refreshmerge");
+        let source_file =
+            std::env::temp_dir().join(format!("test_src_{}.mp4", uuid::Uuid::new_v4()));
+        std::fs::write(&source_file, b"test-source-bytes").unwrap();
+        let source_hash = engine
+            .compute_source_hash(source_file.to_str().unwrap())
+            .unwrap();
+
+        let initial_cache = SpeakerIntelligenceCache {
+            source_hash: source_hash.clone(),
+            diarization: None,
+            speaker_map: None,
+            reid_embeddings: vec![TrackReIdEmbedding {
+                track_id: 1,
+                shot_idx: 0,
+                embedding_b64: "emb1".to_string(),
+                model: "osnet".to_string(),
+                detection_count: 5,
+                first_seen_sec: 1.0,
+                last_seen_sec: 5.0,
+                updated_at: "t1".to_string(),
+            }],
+            fusion_intervals: vec![ActiveSpeakerState {
+                track_id: 1,
+                application_role: None,
+                diarization_id: None,
+                start: 1.0,
+                end: 5.0,
+                audio_evidence: 0.8,
+                visual_evidence: 0.7,
+                speaking_probability: 0.75,
+                confidence: 0.8,
+                evidence_sources: vec![],
+            }],
+            config_hash: engine.compute_config_hash(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        engine.save_cache(&initial_cache).unwrap();
+
+        // Render cut 2 with track 2 in shot 1
+        let new_reid = vec![TrackReIdEmbedding {
+            track_id: 2,
+            shot_idx: 1,
+            embedding_b64: "emb2".to_string(),
+            model: "osnet".to_string(),
+            detection_count: 10,
+            first_seen_sec: 20.0,
+            last_seen_sec: 25.0,
+            updated_at: "t2".to_string(),
+        }];
+        let new_fusion = vec![ActiveSpeakerState {
+            track_id: 2,
+            application_role: None,
+            diarization_id: None,
+            start: 20.0,
+            end: 25.0,
+            audio_evidence: 0.9,
+            visual_evidence: 0.8,
+            speaking_probability: 0.85,
+            confidence: 0.9,
+            evidence_sources: vec![],
+        }];
+
+        engine
+            .refresh_cache_from_render(
+                "proj1",
+                "cand2",
+                source_file.to_str().unwrap(),
+                &new_reid,
+                &new_fusion,
+            )
+            .unwrap();
+
+        let updated = engine.load_cache(&source_hash).unwrap();
+        let _ = std::fs::remove_file(&source_file);
+        assert_eq!(
+            updated.reid_embeddings.len(),
+            2,
+            "ReID embeddings must be merged, not overwritten"
+        );
+        assert_eq!(
+            updated.fusion_intervals.len(),
+            2,
+            "Fusion intervals must be merged, not overwritten"
+        );
+    }
+
+    #[test]
+    fn test_build_diarization_from_transcript_words_multi_speaker() {
+        let words = vec![
+            word("Hello", 0.0, 0.5, "S1"),
+            word("world", 0.6, 1.0, "S1"), // gap 0.1 <= 0.45 -> merged S1 [0.0, 1.0]
+            word("today", 1.8, 2.5, "S1"), // gap 0.8 > 0.45 -> new segment S1 [1.8, 2.5]
+            word("Hi", 2.6, 3.2, "S2"),    // speaker change -> new segment S2 [2.6, 3.2]
+            word("there", 3.3, 4.0, "S2"), // gap 0.1 <= 0.45 -> merged S2 [2.6, 4.0]
+        ];
+
+        let result = SpeakerIntelligenceEngine::build_diarization_from_transcript_words(
+            &words,
+            "deepgram-nova3-transcription",
+        )
+        .expect("should produce diarization result");
+
+        assert_eq!(result.model, "deepgram-nova3-transcription");
+        assert_eq!(result.version, "inline-v1");
+        assert!((result.confidence - 0.95).abs() < 1e-6);
+
+        // Verify segments
+        assert_eq!(result.segments.len(), 3);
+        assert_eq!(result.segments[0].speaker_id, "S1");
+        assert!((result.segments[0].start - 0.0).abs() < 1e-6);
+        assert!((result.segments[0].end - 1.0).abs() < 1e-6);
+        assert!((result.segments[0].confidence - 0.95).abs() < 1e-6);
+
+        assert_eq!(result.segments[1].speaker_id, "S1");
+        assert!((result.segments[1].start - 1.8).abs() < 1e-6);
+        assert!((result.segments[1].end - 2.5).abs() < 1e-6);
+        assert!((result.segments[1].confidence - 0.95).abs() < 1e-6);
+
+        assert_eq!(result.segments[2].speaker_id, "S2");
+        assert!((result.segments[2].start - 2.6).abs() < 1e-6);
+        assert!((result.segments[2].end - 4.0).abs() < 1e-6);
+        assert!((result.segments[2].confidence - 0.95).abs() < 1e-6);
+
+        // Verify speakers summary
+        assert_eq!(result.speakers.len(), 2);
+
+        let s1 = result
+            .speakers
+            .iter()
+            .find(|s| s.diarization_id == "S1")
+            .expect("S1 present");
+        assert_eq!(s1.segment_count, 2);
+        // S1 speech duration: (1.0 - 0.0) + (2.5 - 1.8) = 1.0 + 0.7 = 1.7
+        assert!((s1.total_speech_sec - 1.7).abs() < 1e-6);
+        assert!((s1.avg_confidence - 0.95).abs() < 1e-6);
+
+        let s2 = result
+            .speakers
+            .iter()
+            .find(|s| s.diarization_id == "S2")
+            .expect("S2 present");
+        assert_eq!(s2.segment_count, 1);
+        // S2 speech duration: (4.0 - 2.6) = 1.4
+        assert!((s2.total_speech_sec - 1.4).abs() < 1e-6);
+        assert!((s2.avg_confidence - 0.95).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_build_diarization_from_transcript_words_none_fallback() {
+        // Empty words
+        let empty_result = SpeakerIntelligenceEngine::build_diarization_from_transcript_words(
+            &[],
+            "deepgram-nova3-transcription",
+        );
+        assert!(empty_result.is_none());
+
+        // Untagged words (all speaker: None)
+        let untagged_words = vec![
+            TranscriptWord {
+                text: "Hello".to_string(),
+                start: 0.0,
+                end: 1.0,
+                speaker: None,
+            },
+            TranscriptWord {
+                text: "world".to_string(),
+                start: 1.2,
+                end: 2.0,
+                speaker: None,
+            },
+        ];
+        let untagged_result = SpeakerIntelligenceEngine::build_diarization_from_transcript_words(
+            &untagged_words,
+            "deepgram-nova3-transcription",
+        );
+        assert!(untagged_result.is_none());
     }
 }
