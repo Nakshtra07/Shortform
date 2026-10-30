@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import {
+  AlertCircle,
   AudioLines,
   BadgeCheck,
   Captions,
@@ -76,9 +77,17 @@ type Project = {
   transcriptionMode: string;
   captionStyle?: string | null;
   framingMode?: string | null;
+  presentationMode?: string | null;
+  presentationConfig?: string | null;
   createdAt: string;
   updatedAt: string;
 };
+
+type PresentationEngineMode = "autoshorts" | "autoclip";
+type AutoClipPlatformStrategy = "douyin" | "tiktok" | "youtube_shorts" | "bilibili" | "xiaohongshu";
+type AutoClipSubtitleLook = "clean" | "bold" | "box" | "accent";
+type AutoClipTitleStyle = "comic" | "neon" | "arena" | "editorial" | "pixel" | "frosted" | "plain";
+type AutoClipTemplate = "interview_zh" | "podcast_en" | "none";
 
 type Transcript = {
   id: string;
@@ -112,6 +121,31 @@ type Clip = {
   renderLog: string | null;
   appliedFeatures: string | null;
 };
+
+type SceneIntelStatus = {
+  projectId: string;
+  status: "idle" | "running" | "completed" | "error";
+  progress: number;
+  sceneCount: number;
+};
+
+interface AudioTrackInfo {
+  formatId: string;
+  language?: string | null;
+  languageName: string;
+  formatNote?: string | null;
+  isOriginal: boolean;
+  bitrateKbps?: number | null;
+}
+
+interface YoutubeProbeResult {
+  isSafe: boolean;
+  license?: string | null;
+  title?: string | null;
+  duration?: number | null;
+  audioTracks: AudioTrackInfo[];
+  defaultAudioFormatId?: string | null;
+}
 
 // Score provenance from the backend's candidate metadata. "llm" = a genuine
 // NVIDIA AutoClip model score; "fallback" = explicitly unscored (score 0.0,
@@ -178,6 +212,7 @@ function App() {
   const [environment, setEnvironment] = useState<EnvironmentStatus | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
+  const [sceneIntelStatus, setSceneIntelStatus] = useState<SceneIntelStatus | null>(null);
   const [busy, setBusy] = useState<BusyState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -185,6 +220,13 @@ function App() {
   const [showStyleModal, setShowStyleModal] = useState(false);
   const [selectedStyle, setSelectedStyle] = useState<string>("preset_minimal_capsule");
   const [selectedFramingMode, setSelectedFramingMode] = useState<string>("adaptive");
+  // Initial Setup Modal Presentation Engine & Mode 2 Configuration State
+  const [selectedPresentationMode, setSelectedPresentationMode] = useState<PresentationEngineMode>("autoshorts");
+  const [platformStrategy, setPlatformStrategy] = useState<AutoClipPlatformStrategy>("douyin");
+  const [subtitleLook, setSubtitleLook] = useState<AutoClipSubtitleLook>("accent");
+  const [titleStyle, setTitleStyle] = useState<AutoClipTitleStyle>("comic");
+  const [titleMotion, setTitleMotion] = useState<boolean>(true);
+  const [template, setTemplate] = useState<AutoClipTemplate>("interview_zh");
   // Candidate discovery engine for "Find Viral Moments": "timestamp_generation"
   // is the production default; "window_scoring" (REZE) is the experimental
   // opt-in. Per generation call — flip and re-run to compare on the same project.
@@ -208,15 +250,24 @@ function App() {
 
   const [youtubeModalOpen, setYoutubeModalOpen] = useState(false);
   const [youtubeUrl, setYoutubeUrl] = useState("");
-  const [youtubeStatus, setYoutubeStatus] = useState<"idle" | "checking" | "warning" | "downloading">("idle");
+  const [youtubeStatus, setYoutubeStatus] = useState<"idle" | "checking" | "warning" | "ready" | "downloading">("idle");
   const [youtubeWarningLicense, setYoutubeWarningLicense] = useState<string | null>(null);
   const [youtubeError, setYoutubeError] = useState<string | null>(null);
+  const [youtubeAudioTracks, setYoutubeAudioTracks] = useState<AudioTrackInfo[]>([]);
+  const [selectedAudioFormatId, setSelectedAudioFormatId] = useState<string | null>(null);
+  const [youtubeVideoTitle, setYoutubeVideoTitle] = useState<string | null>(null);
 
   // Style Studio Drawer State (Screen D & E)
   const [styleStudioOpen, setStyleStudioOpen] = useState(false);
   const [styleStudioTargetCandidateId, setStyleStudioTargetCandidateId] = useState<string | null>(null);
   const [styleStudioFraming, setStyleStudioFraming] = useState<"adaptive" | "original">("adaptive");
   const [styleStudioCaption, setStyleStudioCaption] = useState<string>("preset_minimal_capsule");
+  const [styleStudioPresentationMode, setStyleStudioPresentationMode] = useState<PresentationEngineMode>("autoshorts");
+  const [styleStudioPlatformStrategy, setStyleStudioPlatformStrategy] = useState<AutoClipPlatformStrategy>("douyin");
+  const [styleStudioSubtitleLook, setStyleStudioSubtitleLook] = useState<AutoClipSubtitleLook>("accent");
+  const [styleStudioTitleStyle, setStyleStudioTitleStyle] = useState<AutoClipTitleStyle>("comic");
+  const [styleStudioTitleMotion, setStyleStudioTitleMotion] = useState<boolean>(true);
+  const [styleStudioTemplate, setStyleStudioTemplate] = useState<AutoClipTemplate>("interview_zh");
   const [styleStudioScope, setStyleStudioScope] = useState<"target" | "selected" | "all">("target");
   const [previousRenderHistory, setPreviousRenderHistory] = useState<Map<string, string>>(new Map());
 
@@ -237,8 +288,8 @@ function App() {
   const [transcriptionEngine, setTranscriptionEngine] = useState<"deepgram" | "local">(() => {
     return (localStorage.getItem("autoshorts_transcription_engine") as "deepgram" | "local") || "local";
   });
-  const [llmEngine, setLlmEngine] = useState<"claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq">(() => {
-    return (localStorage.getItem("autoshorts_llm_engine") as "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq") || "local";
+  const [llmEngine, setLlmEngine] = useState<"claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq" | "nvidia">(() => {
+    return (localStorage.getItem("autoshorts_llm_engine") as "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq" | "nvidia") || "gemini";
   });
   const [localLlmModel, setLocalLlmModel] = useState(() => {
     return localStorage.getItem("autoshorts_local_llm_model") || "llama3.2";
@@ -266,6 +317,13 @@ function App() {
   });
   const [groqKey, setGroqKey] = useState(() => {
     return localStorage.getItem("autoshorts_groq_key") || "";
+  });
+  const [nvidiaKey, setNvidiaKey] = useState(() => {
+    return localStorage.getItem("autoshorts_nvidia_key") || "";
+  });
+  const [nvidiaModel, setNvidiaModel] = useState(() => {
+    const stored = localStorage.getItem("autoshorts_nvidia_model");
+    return (stored && stored !== "stepfun-ai/step-5-preview") ? stored : "google/gemma-4-31b-it";
   });
   const [openrouterModel, setOpenrouterModel] = useState(() => {
     return localStorage.getItem("autoshorts_openrouter_model") || "google/gemini-2.5-flash";
@@ -482,6 +540,7 @@ function App() {
   const canUseOpenai = environment?.hasOpenaiKey || openaiKey.trim().length > 0;
   const canUseOpenrouter = environment?.hasOpenrouterKey || openrouterKey.trim().length > 0;
   const canUseGroq = environment?.hasGroqKey || groqKey.trim().length > 0;
+  const canUseNvidia = environment?.hasNvidiaKey || nvidiaKey.trim().length > 0;
 
   const canTranscribe = transcriptionEngine === "local"
     ? Boolean(environment?.hasLocalWhisperModel)
@@ -501,7 +560,9 @@ function App() {
               ? canUseOpenrouter
               : llmEngine === "groq"
                 ? canUseGroq
-                : false;
+                : llmEngine === "nvidia"
+                  ? canUseNvidia
+                  : false;
 
   const isRezeMode = discoveryMode === "window_scoring";
   const effectiveTimestampEngine = llmEngine === "openrouter" ? "deepseek" : llmEngine;
@@ -519,20 +580,83 @@ function App() {
     const candidates = detail?.candidates;
     if (!candidates || candidates.length === 0) return;
     const selectedRanks = candidates.filter((c) => c.selected).map((c) => c.rank);
-    if (selectedRanks.length === 0) return;
+    if (selectedRanks.length === 0) {
+      setTopNValue("0");
+      setRangeFromValue("");
+      setRangeToValue(null);
+      lastAppliedRangeRef.current = null;
+      return;
+    }
     const from = Math.min(...selectedRanks);
     const to = Math.max(...selectedRanks);
+    const isContiguous = selectedRanks.length === (to - from + 1);
+    if (!isContiguous) {
+      // Non-contiguous individual selection (e.g. #1, #36, #47)
+      setRangeFromValue("");
+      setRangeToValue(null);
+      setTopNValue("");
+      lastAppliedRangeRef.current = null;
+      return;
+    }
     const lastApplied = lastAppliedRangeRef.current;
     const isEcho = lastApplied !== null && lastApplied.from === from &&
       (lastApplied.to === null ? to === candidates.length : lastApplied.to === to);
     if (isEcho) return;
     setRangeFromValue(String(from));
     setRangeToValue(to === candidates.length ? null : String(to));
+    if (from === 1) {
+      setTopNValue(String(to));
+    } else {
+      setTopNValue("");
+    }
   }, [detail?.candidates]);
 
   useEffect(() => {
     setTranscriptSearch("");
   }, [detail?.project.id]);
+
+  useEffect(() => {
+    if (!detail?.project?.id) {
+      setSceneIntelStatus(null);
+      return;
+    }
+    const pid = detail.project.id;
+    let isCancelled = false;
+    let unlistenFn: (() => void) | null = null;
+
+    // Immediately provide a default idle status so the pill is ALWAYS visible without IPC delay
+    setSceneIntelStatus((prev) => (prev?.projectId === pid ? prev : {
+      projectId: pid,
+      status: "idle",
+      progress: 0,
+      sceneCount: 0,
+    }));
+
+    // Hydrate initial status
+    invoke<SceneIntelStatus>("get_scene_intelligence_status", { projectId: pid })
+      .then((status) => {
+        if (!isCancelled && status) setSceneIntelStatus(status);
+      })
+      .catch((err) => console.warn("[SceneIntel] Failed to query status:", err));
+
+    // Listen to real-time events
+    listen<SceneIntelStatus>("scene-intel-status", (event) => {
+      if (!isCancelled && event.payload.projectId === pid) {
+        setSceneIntelStatus(event.payload);
+      }
+    }).then((unlisten) => {
+      if (isCancelled) {
+        unlisten();
+      } else {
+        unlistenFn = unlisten;
+      }
+    });
+
+    return () => {
+      isCancelled = true;
+      if (unlistenFn) unlistenFn();
+    };
+  }, [detail?.project?.id]);
 
   useEffect(() => {
     void refresh();
@@ -593,6 +717,14 @@ function App() {
   }, [groqKey]);
 
   useEffect(() => {
+    localStorage.setItem("autoshorts_nvidia_key", nvidiaKey);
+  }, [nvidiaKey]);
+
+  useEffect(() => {
+    localStorage.setItem("autoshorts_nvidia_model", nvidiaModel);
+  }, [nvidiaModel]);
+
+  useEffect(() => {
     localStorage.setItem("autoshorts_openrouter_model", openrouterModel);
   }, [openrouterModel]);
 
@@ -644,12 +776,9 @@ function App() {
 
     if (env?.llmProvider) {
       const p = env.llmProvider.toLowerCase();
-      const validEngines = ["claude", "deepseek", "local", "gemini", "openai", "openrouter", "groq"];
+      const validEngines = ["claude", "deepseek", "local", "gemini", "openai", "openrouter", "groq", "nvidia"];
       if (validEngines.includes(p)) {
-        const stored = localStorage.getItem("autoshorts_llm_engine");
-        if (!stored || stored === "local" || stored === "deepseek" || stored === "openrouter") {
-          setLlmEngine(p as any);
-        }
+        setLlmEngine(p as any);
       }
     }
 
@@ -686,6 +815,12 @@ function App() {
     if (typeof selected !== "string") return;
     setSelectedStyle("preset_minimal_capsule");
     setSelectedFramingMode("adaptive");
+    setSelectedPresentationMode("autoshorts");
+    setPlatformStrategy("douyin");
+    setSubtitleLook("accent");
+    setTitleStyle("comic");
+    setTitleMotion(true);
+    setTemplate("interview_zh");
     setMediaPathToImport(selected);
     setShowStyleModal(true);
   }
@@ -695,37 +830,55 @@ function App() {
     setYoutubeStatus("checking");
     setYoutubeError(null);
     setError(null);
+    setYoutubeAudioTracks([]);
+    setSelectedAudioFormatId(null);
+    setYoutubeVideoTitle(null);
     try {
-      console.log("[YouTube Frontend] Checking copyright for:", youtubeUrl, "browser:", youtubeBrowser);
-      const result = await invoke<{isSafe: boolean; license: string | null}>("check_youtube_copyright", {
+      console.log("[YouTube Frontend] Probing media for:", youtubeUrl, "browser:", youtubeBrowser);
+      const result = await invoke<YoutubeProbeResult>("probe_youtube_media", {
         url: youtubeUrl,
         browser: youtubeBrowser !== "auto" ? youtubeBrowser : null,
         cookiesPath: youtubeCookiesPath.trim() || null,
       });
-      console.log("[YouTube Frontend] Copyright check result:", result);
+      console.log("[YouTube Frontend] Probe media result:", result);
+      const tracks = result.audioTracks || [];
+      setYoutubeAudioTracks(tracks);
+      setYoutubeVideoTitle(result.title || null);
+      const chosenDefaultId = result.defaultAudioFormatId || (tracks.length > 0 ? tracks[0].formatId : null);
+      setSelectedAudioFormatId(chosenDefaultId);
+
       if (!result.isSafe) {
         setYoutubeWarningLicense(result.license || "Unknown / Not specified");
         setYoutubeStatus("warning");
         return;
       }
-      await executeYoutubeDownload();
+
+      if (tracks.length > 1) {
+        // Multi-track audio detected! Prompt user with interactive selector
+        setYoutubeStatus("ready");
+        return;
+      }
+
+      await executeYoutubeDownload(chosenDefaultId);
     } catch (err: any) {
-      const errMsg = err?.toString() || "Failed to check YouTube video copyright.";
-      console.error("[YouTube Frontend] Copyright check error:", errMsg);
+      const errMsg = err?.toString() || "Failed to check YouTube video details.";
+      console.error("[YouTube Frontend] Probe error:", errMsg);
       setYoutubeError(errMsg);
       setError(errMsg);
       setYoutubeStatus("idle");
     }
   }
 
-  async function executeYoutubeDownload() {
+  async function executeYoutubeDownload(audioFormatIdOverride?: string | null) {
     setYoutubeStatus("downloading");
     setYoutubeError(null);
     setError(null);
+    const chosenFormatId = audioFormatIdOverride !== undefined ? audioFormatIdOverride : selectedAudioFormatId;
     try {
-      console.log("[YouTube Frontend] Starting download for:", youtubeUrl, "browser:", youtubeBrowser);
+      console.log("[YouTube Frontend] Starting download for:", youtubeUrl, "audio format:", chosenFormatId, "browser:", youtubeBrowser);
       const downloadedPath = await invoke<string>("download_youtube_video", {
         url: youtubeUrl,
+        audioFormatId: chosenFormatId || null,
         browser: youtubeBrowser !== "auto" ? youtubeBrowser : null,
         cookiesPath: youtubeCookiesPath.trim() || null,
       });
@@ -735,8 +888,17 @@ function App() {
       setYoutubeStatus("idle");
       setYoutubeWarningLicense(null);
       setYoutubeError(null);
+      setYoutubeAudioTracks([]);
+      setSelectedAudioFormatId(null);
+      setYoutubeVideoTitle(null);
       setSelectedStyle("preset_minimal_capsule");
       setSelectedFramingMode("adaptive");
+      setSelectedPresentationMode("autoshorts");
+      setPlatformStrategy("douyin");
+      setSubtitleLook("accent");
+      setTitleStyle("comic");
+      setTitleMotion(true);
+      setTemplate("interview_zh");
       setMediaPathToImport(downloadedPath);
       setShowStyleModal(true);
     } catch (err: any) {
@@ -744,16 +906,28 @@ function App() {
       console.error("[YouTube Frontend] Download error:", errMsg);
       setYoutubeError(errMsg);
       setError(errMsg);
-      setYoutubeStatus("idle");
+      setYoutubeStatus(youtubeAudioTracks.length > 1 ? "ready" : "idle");
     }
   }
 
   async function confirmImport(style: string | null, framingMode: string) {
-    if (!mediaPathToImport || !style) return;
+    if (!mediaPathToImport) return;
     const selected = mediaPathToImport;
-    const chosenStyle = style;
+    const chosenStyle = style || "preset_minimal_capsule";
     const chosenFramingMode = framingMode;
     const chosenScoringMode = scoringMode;
+    const chosenPresentationMode = selectedPresentationMode;
+    const chosenPresentationConfig = JSON.stringify({
+      platform_strategy: platformStrategy,
+      platformStrategy: platformStrategy,
+      subtitle_style: subtitleLook,
+      subtitleLook: subtitleLook,
+      title_style: "plain",
+      titleStyle: "plain",
+      title_motion: false,
+      titleMotion: false,
+      template: "none",
+    });
     setMediaPathToImport(null);
     setShowStyleModal(false);
 
@@ -764,6 +938,8 @@ function App() {
         transcriptionMode: transcriptionEngine === "local" ? "local" : "cloud",
         captionStyle: chosenStyle,
         framingMode: chosenFramingMode,
+        presentationMode: chosenPresentationMode,
+        presentationConfig: chosenPresentationConfig,
       });
       newProjectId = project.id;
       await refresh(project.id);
@@ -819,20 +995,23 @@ function App() {
           targetProvider === "deepseek" ? deepseekKey :
             targetProvider === "gemini" ? geminiKey :
               targetProvider === "openai" ? openaiKey :
-                targetProvider === "groq" ? groqKey : "";
+                targetProvider === "groq" ? groqKey :
+                  targetProvider === "nvidia" ? nvidiaKey : "";
       const hasActiveKey =
         targetProvider === "claude" ? (env.hasAnthropicKey || activeKey.trim().length > 0) :
           targetProvider === "deepseek" ? (env.hasDeepseekKey || activeKey.trim().length > 0) :
             targetProvider === "gemini" ? (env.hasGeminiKey || activeKey.trim().length > 0) :
               targetProvider === "openai" ? (env.hasOpenaiKey || activeKey.trim().length > 0) :
-                targetProvider === "groq" ? (env.hasGroqKey || activeKey.trim().length > 0) : false;
+                targetProvider === "groq" ? (env.hasGroqKey || activeKey.trim().length > 0) :
+                  targetProvider === "nvidia" ? (env.hasNvidiaKey || activeKey.trim().length > 0) : false;
       if (!hasActiveKey) {
         const engineName =
           targetProvider === "claude" ? "Claude" :
             targetProvider === "deepseek" ? "DeepSeek" :
               targetProvider === "gemini" ? "Gemini" :
                 targetProvider === "openai" ? "OpenAI" :
-                  targetProvider === "groq" ? "Groq" : "LLM";
+                  targetProvider === "groq" ? "Groq" :
+                    targetProvider === "nvidia" ? "NVIDIA NIM" : "LLM";
         setError(`Transcription complete. ${engineName} API Key is missing. Please add it in settings to analyze viral moments.`);
         return;
       }
@@ -862,11 +1041,13 @@ function App() {
             targetProvider === "deepseek" ? deepseekKey.trim() :
               targetProvider === "gemini" ? geminiKey.trim() :
                 targetProvider === "openai" ? openaiKey.trim() :
-                  targetProvider === "groq" ? groqKey.trim() : "");
+                  targetProvider === "groq" ? groqKey.trim() :
+                    targetProvider === "nvidia" ? nvidiaKey.trim() : "");
       const targetModel = isReze
         ? null
         : (targetProvider === "local" ? localLlmModel.trim() :
-            targetProvider === "deepseek" ? (deepseekModel.trim() || "deepseek-chat") : null);
+            targetProvider === "deepseek" ? (deepseekModel.trim() || "deepseek-chat") :
+              targetProvider === "nvidia" ? ((nvidiaModel.trim() && nvidiaModel.trim() !== "stepfun-ai/step-5-preview") ? nvidiaModel.trim() : "google/gemma-4-31b-it") : null);
 
       await invoke<Candidate[]>("generate_candidates", {
         projectId,
@@ -973,7 +1154,9 @@ function App() {
                   ? groqKey.trim()
                   : targetProvider === "deepseek"
                     ? deepseekKey.trim()
-                    : "");
+                    : targetProvider === "nvidia"
+                      ? nvidiaKey.trim()
+                      : "");
 
       const targetModel = isReze
         ? null
@@ -981,7 +1164,9 @@ function App() {
             ? localLlmModel.trim()
             : targetProvider === "deepseek"
               ? (deepseekModel.trim() || "deepseek-chat")
-              : null);
+              : targetProvider === "nvidia"
+                ? ((nvidiaModel.trim() && nvidiaModel.trim() !== "stepfun-ai/step-5-preview") ? nvidiaModel.trim() : "google/gemma-4-31b-it")
+                : null);
 
       try {
         await invoke<Candidate[]>("generate_candidates", {
@@ -1066,32 +1251,21 @@ function App() {
 
   // Individual candidate checkbox toggle: safely leverages updateSelectionRange or updateTopN(0)
   // ensuring the backend database remains 100% authoritative.
-  function toggleCandidateSelection(candidate: Candidate) {
-    if (candidate.selected) {
-      if (selectedCount === 1) {
-        void updateTopN(0);
-      } else if (candidate.rank === rangeFrom && rangeTo !== null && rangeTo > rangeFrom) {
-        void updateSelectionRange(rangeFrom + 1, rangeToValue === null ? null : rangeTo);
-      } else if (candidate.rank === rangeTo && rangeTo !== null && rangeTo > rangeFrom) {
-        void updateSelectionRange(rangeFrom, rangeTo - 1);
-      } else {
-        void updateTopN(0);
-      }
-    } else {
-      if (selectedCount === 0) {
-        void updateSelectionRange(candidate.rank, candidate.rank);
-      } else {
-        const newFrom = Math.min(
-          candidate.rank,
-          Number.isInteger(rangeFrom) && rangeFrom >= 1 ? rangeFrom : candidate.rank
-        );
-        const newTo = Math.max(
-          candidate.rank,
-          Number.isInteger(rangeTo) && rangeTo >= 1 ? rangeTo : candidate.rank
-        );
-        void updateSelectionRange(newFrom, rangeToValue === null ? null : newTo);
-      }
-    }
+  // Individual candidate checkbox toggle: flips only that candidate's selection
+  // via backend toggle_candidate_selection without forcing contiguous ranges.
+  async function toggleCandidateSelection(candidate: Candidate) {
+    if (!detail) return;
+    const requestSeq = ++selectionSeqRef.current;
+    const projectId = detail.project.id;
+    await run("clipCount", async () => {
+      const candidates = await invoke<Candidate[]>("toggle_candidate_selection", {
+        candidateId: candidate.id,
+      });
+      if (requestSeq !== selectionSeqRef.current) return;
+      setDetail((prev) =>
+        prev && prev.project.id === projectId ? { ...prev, candidates } : prev
+      );
+    });
   }
 
   async function cutCandidate(candidateId: string) {
@@ -1148,22 +1322,65 @@ function App() {
     }
   }
 
-  function openSingleClipStyleStudio(candidateId: string) {
-    setStyleStudioTargetCandidateId(candidateId);
-    setStyleStudioScope("target");
-    const currentFraming = (detail?.project.framingMode as "adaptive" | "original") || "adaptive";
+  function openStyleStudio(targetCandidateId: string | null, scope: "target" | "selected") {
+    setStyleStudioTargetCandidateId(targetCandidateId);
+    setStyleStudioScope(scope);
+
+    const project = detail?.project;
+    const currentFraming = (project?.framingMode as "adaptive" | "original") || "adaptive";
     setStyleStudioFraming(currentFraming === "original" ? "original" : "adaptive");
-    setStyleStudioCaption(detail?.project.captionStyle || "preset_minimal_capsule");
+    setStyleStudioCaption(project?.captionStyle || "preset_minimal_capsule");
+
+    const currentMode = project?.presentationMode === "autoclip" ? "autoclip" : "autoshorts";
+    setStyleStudioPresentationMode(currentMode);
+
+    if (project?.presentationConfig) {
+      try {
+        const cfg = JSON.parse(project.presentationConfig);
+        setStyleStudioPlatformStrategy(
+          cfg.platform_strategy || cfg.platformStrategy || "douyin"
+        );
+        setStyleStudioSubtitleLook(
+          cfg.subtitle_style || cfg.subtitleLook || "accent"
+        );
+        setStyleStudioTitleStyle(
+          cfg.title_style || cfg.titleStyle || "comic"
+        );
+        setStyleStudioTitleMotion(
+          cfg.title_motion !== undefined
+            ? Boolean(cfg.title_motion)
+            : cfg.titleMotion !== undefined
+            ? Boolean(cfg.titleMotion)
+            : true
+        );
+        setStyleStudioTemplate(
+          cfg.template || "interview_zh"
+        );
+      } catch (err) {
+        console.warn("[Style Studio] Failed to parse project.presentationConfig:", err);
+        setStyleStudioPlatformStrategy("douyin");
+        setStyleStudioSubtitleLook("accent");
+        setStyleStudioTitleStyle("comic");
+        setStyleStudioTitleMotion(true);
+        setStyleStudioTemplate("interview_zh");
+      }
+    } else {
+      setStyleStudioPlatformStrategy("douyin");
+      setStyleStudioSubtitleLook("accent");
+      setStyleStudioTitleStyle("comic");
+      setStyleStudioTitleMotion(true);
+      setStyleStudioTemplate("interview_zh");
+    }
+
     setStyleStudioOpen(true);
   }
 
+  function openSingleClipStyleStudio(candidateId: string) {
+    openStyleStudio(candidateId, "target");
+  }
+
   function openBulkStyleStudio() {
-    setStyleStudioTargetCandidateId(null);
-    setStyleStudioScope("selected");
-    const currentFraming = (detail?.project.framingMode as "adaptive" | "original") || "adaptive";
-    setStyleStudioFraming(currentFraming === "original" ? "original" : "adaptive");
-    setStyleStudioCaption(detail?.project.captionStyle || "preset_minimal_capsule");
-    setStyleStudioOpen(true);
+    openStyleStudio(null, "selected");
   }
 
   async function applyStyleStudioAndRerender() {
@@ -1180,12 +1397,26 @@ function App() {
     }
     setPreviousRenderHistory(nextHistory);
 
-    // 2. Persist updated framing and caption style to backend DB
+    // 2. Persist updated framing, caption style, presentation mode, and presentation config to backend DB
+    const presentationConfig = JSON.stringify({
+      platform_strategy: styleStudioPlatformStrategy,
+      platformStrategy: styleStudioPlatformStrategy,
+      subtitle_style: styleStudioSubtitleLook,
+      subtitleLook: styleStudioSubtitleLook,
+      title_style: "plain",
+      titleStyle: "plain",
+      title_motion: false,
+      titleMotion: false,
+      template: "none",
+    });
+
     try {
       await invoke("update_project_style", {
         projectId: detail.project.id,
         captionStyle: styleStudioCaption,
         framingMode: styleStudioFraming,
+        presentationMode: styleStudioPresentationMode,
+        presentationConfig,
       });
     } catch (err) {
       console.warn("[Style Studio] Failed to update project style in DB:", err);
@@ -1449,6 +1680,10 @@ function App() {
                   setOpenrouterModel={setOpenrouterModel}
                   groqKey={groqKey}
                   setGroqKey={setGroqKey}
+                  nvidiaKey={nvidiaKey}
+                  setNvidiaKey={setNvidiaKey}
+                  nvidiaModel={nvidiaModel}
+                  setNvidiaModel={setNvidiaModel}
                   localLlmModel={localLlmModel}
                   setLocalLlmModel={setLocalLlmModel}
                   pullModelDirectly={pullModelDirectly}
@@ -1775,6 +2010,64 @@ function App() {
                         <option value="window_scoring">Discovery: REZE Window</option>
                       </select>
 
+                      {(() => {
+                        const effectiveStatus: SceneIntelStatus = sceneIntelStatus ?? {
+                          projectId: detail.project.id,
+                          status: "idle",
+                          progress: 0,
+                          sceneCount: 0,
+                        };
+                        return (
+                          <div
+                            className={`scene-intel-pill status-${effectiveStatus.status}`}
+                            onClick={() => {
+                              if (effectiveStatus.status === "idle" || effectiveStatus.status === "error") {
+                                invoke<SceneIntelStatus>("trigger_scene_intelligence", { projectId: detail.project.id })
+                                  .then((status) => { if (status) setSceneIntelStatus(status); })
+                                  .catch((err) => console.warn("[SceneIntel] Failed to trigger:", err));
+                              }
+                            }}
+                            title={
+                              effectiveStatus.status === "running"
+                                ? "GPU Scene Intelligence is scanning video for camera cuts in the background."
+                                : effectiveStatus.status === "completed"
+                                ? `Full scene intelligence ready (${effectiveStatus.sceneCount} camera cuts cached).`
+                                : effectiveStatus.status === "idle"
+                                ? "Click to start GPU Scene Intelligence scan in background."
+                                : "Scene intelligence encountered an issue; click to retry."
+                            }
+                            style={{
+                              cursor: (effectiveStatus.status === "idle" || effectiveStatus.status === "error") ? "pointer" : "default"
+                            }}
+                          >
+                            {effectiveStatus.status === "running" && (
+                              <>
+                                <Loader2 className="spin" size={13} />
+                                <span>Scene Intel {effectiveStatus.progress}%</span>
+                              </>
+                            )}
+                            {effectiveStatus.status === "completed" && (
+                              <>
+                                <Check size={13} className="pill-check-icon" />
+                                <span>Scene Intel Ready ({effectiveStatus.sceneCount})</span>
+                              </>
+                            )}
+                            {effectiveStatus.status === "idle" && (
+                              <>
+                                <Sparkles size={13} className="pill-idle-icon" />
+                                <span>Scan Scenes (GPU)</span>
+                              </>
+                            )}
+                            {effectiveStatus.status === "error" && (
+                              <>
+                                <AlertCircle size={13} className="pill-error-icon" />
+                                <span>Retry Scene Intel</span>
+                              </>
+                            )}
+                          </div>
+                        );
+                      })()}
+
                       <button
                         type="button"
                         className="find-moments-btn"
@@ -1951,6 +2244,10 @@ function App() {
                   setOpenrouterModel={setOpenrouterModel}
                   groqKey={groqKey}
                   setGroqKey={setGroqKey}
+                  nvidiaKey={nvidiaKey}
+                  setNvidiaKey={setNvidiaKey}
+                  nvidiaModel={nvidiaModel}
+                  setNvidiaModel={setNvidiaModel}
                   localLlmModel={localLlmModel}
                   setLocalLlmModel={setLocalLlmModel}
                   pullModelDirectly={pullModelDirectly}
@@ -1982,7 +2279,16 @@ function App() {
                   <button
                     type="button"
                     className="secondary-action-outlined compact"
-                    onClick={() => setYoutubeModalOpen(true)}
+                    onClick={() => {
+                      setYoutubeUrl("");
+                      setYoutubeStatus("idle");
+                      setYoutubeWarningLicense(null);
+                      setYoutubeError(null);
+                      setYoutubeAudioTracks([]);
+                      setSelectedAudioFormatId(null);
+                      setYoutubeVideoTitle(null);
+                      setYoutubeModalOpen(true);
+                    }}
                     disabled={busy !== "idle" || !environment?.hasYtdlp}
                     title={!environment?.hasYtdlp ? "Please install yt-dlp to use this feature" : "Download a video from YouTube"}
                   >
@@ -2259,126 +2565,250 @@ function App() {
 
             {/* Scrollable Body */}
             <div className="style-studio-body">
-              {/* Section 1: Framing */}
+              {/* Section 1: Presentation Engine */}
               <section className="style-studio-section">
-                <h4 className="style-studio-section-title">Framing</h4>
+                <h4 className="style-studio-section-title">Presentation Engine</h4>
                 <div className="style-studio-framing-grid">
                   <div
-                    className={`style-studio-framing-card ${styleStudioFraming === "adaptive" ? "selected" : ""}`}
-                    onClick={() => setStyleStudioFraming("adaptive")}
+                    className={`style-studio-framing-card ${styleStudioPresentationMode === "autoshorts" ? "selected" : ""}`}
+                    onClick={() => setStyleStudioPresentationMode("autoshorts")}
                   >
                     <div className="style-studio-framing-top">
                       <div className="framing-icon-box mint">
                         <Crop size={16} />
                       </div>
                       <div className="card-indicator">
-                        {styleStudioFraming === "adaptive" ? (
+                        {styleStudioPresentationMode === "autoshorts" ? (
                           <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
                         ) : (
                           <div className="indicator-empty" />
                         )}
                       </div>
                     </div>
-                    <span className="style-studio-card-title">Adaptive Framing</span>
-                    <p className="style-studio-card-desc">Dynamic speaker tracking and isolation</p>
+                    <span className="style-studio-card-title">AutoShorts Native (Mode 1)</span>
+                    <p className="style-studio-card-desc">BoT-SORT tracking, 1:1 midpoint retention &amp; kinetic ASS</p>
                   </div>
 
                   <div
-                    className={`style-studio-framing-card ${styleStudioFraming === "original" ? "selected" : ""}`}
-                    onClick={() => setStyleStudioFraming("original")}
+                    className={`style-studio-framing-card ${styleStudioPresentationMode === "autoclip" ? "selected" : ""}`}
+                    onClick={() => setStyleStudioPresentationMode("autoclip")}
                   >
                     <div className="style-studio-framing-top">
-                      <div className="framing-icon-box">
-                        <Smartphone size={16} />
+                      <div className="framing-icon-box slate">
+                        <Clapperboard size={16} />
                       </div>
                       <div className="card-indicator">
-                        {styleStudioFraming === "original" ? (
+                        {styleStudioPresentationMode === "autoclip" ? (
                           <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
                         ) : (
                           <div className="indicator-empty" />
                         )}
                       </div>
                     </div>
-                    <span className="style-studio-card-title">Original 9:16</span>
-                    <p className="style-studio-card-desc">Fixed portrait framing, DualFrame where supported</p>
+                    <span className="style-studio-card-title">AutoClip Studio (Mode 2)</span>
+                    <p className="style-studio-card-desc">YuNet detector, hard cuts, mouth motion &amp; PIL TitleArt</p>
                   </div>
                 </div>
               </section>
 
-              {/* Section 2: Caption Style */}
-              <section className="style-studio-section">
-                <h4 className="style-studio-section-title">Caption Style</h4>
-                <div className="style-studio-caption-grid">
-                  {/* Clean */}
-                  <div
-                    className={`style-studio-caption-card ${
-                      styleStudioCaption === "preset_minimal_capsule" || styleStudioCaption === "preset_cinematic_vlog"
-                        ? "selected"
-                        : ""
-                    }`}
-                    onClick={() => setStyleStudioCaption("preset_minimal_capsule")}
-                  >
-                    <div className="style-studio-preview-box">
-                      <div className="preview-pill-clean">How sleep affects cortisol</div>
-                    </div>
-                    <span className="style-studio-card-title">Clean</span>
-                    <p className="style-studio-card-desc">Minimal centered</p>
-                  </div>
+              {styleStudioPresentationMode === "autoshorts" ? (
+                <>
+                  {/* Mode 1 - Section 2: Framing */}
+                  <section className="style-studio-section">
+                    <h4 className="style-studio-section-title">Framing</h4>
+                    <div className="style-studio-framing-grid">
+                      <div
+                        className={`style-studio-framing-card ${styleStudioFraming === "adaptive" ? "selected" : ""}`}
+                        onClick={() => setStyleStudioFraming("adaptive")}
+                      >
+                        <div className="style-studio-framing-top">
+                          <div className="framing-icon-box mint">
+                            <Crop size={16} />
+                          </div>
+                          <div className="card-indicator">
+                            {styleStudioFraming === "adaptive" ? (
+                              <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
+                            ) : (
+                              <div className="indicator-empty" />
+                            )}
+                          </div>
+                        </div>
+                        <span className="style-studio-card-title">Adaptive Framing</span>
+                        <p className="style-studio-card-desc">Dynamic speaker tracking and isolation</p>
+                      </div>
 
-                  {/* Bold */}
-                  <div
-                    className={`style-studio-caption-card ${
-                      styleStudioCaption === "preset_viral_bold" || styleStudioCaption === "preset_bhaukal_caption"
-                        ? "selected"
-                        : ""
-                    }`}
-                    onClick={() => setStyleStudioCaption("preset_viral_bold")}
-                  >
-                    <div className="style-studio-preview-box">
-                      <div className="preview-text-bold">HORMOZI VIRAL</div>
-                    </div>
-                    <span className="style-studio-card-title">Bold</span>
-                    <p className="style-studio-card-desc">Punchy uppercase</p>
-                  </div>
-
-                  {/* Word Highlight */}
-                  <div
-                    className={`style-studio-caption-card ${
-                      styleStudioCaption === "preset_mrbeast_pop" ||
-                      styleStudioCaption === "preset_dynamic_editorial" ||
-                      styleStudioCaption === "preset_t7"
-                        ? "selected"
-                        : ""
-                    }`}
-                    onClick={() => setStyleStudioCaption("preset_mrbeast_pop")}
-                  >
-                    <div className="style-studio-preview-box">
-                      <div className="preview-text-highlight">
-                        Morning <span className="word-accent">cortisol</span>
+                      <div
+                        className={`style-studio-framing-card ${styleStudioFraming === "original" ? "selected" : ""}`}
+                        onClick={() => setStyleStudioFraming("original")}
+                      >
+                        <div className="style-studio-framing-top">
+                          <div className="framing-icon-box">
+                            <Smartphone size={16} />
+                          </div>
+                          <div className="card-indicator">
+                            {styleStudioFraming === "original" ? (
+                              <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
+                            ) : (
+                              <div className="indicator-empty" />
+                            )}
+                          </div>
+                        </div>
+                        <span className="style-studio-card-title">Original 9:16</span>
+                        <p className="style-studio-card-desc">Fixed portrait framing, DualFrame where supported</p>
                       </div>
                     </div>
-                    <span className="style-studio-card-title">Highlight</span>
-                    <p className="style-studio-card-desc">Word accent</p>
-                  </div>
-                </div>
+                  </section>
 
-                {/* Preset Chips */}
-                <div className="style-studio-presets-row">
-                  <span className="style-studio-presets-label">Preset Selector:</span>
-                  <div className="style-studio-presets-list">
-                    {CAPTION_PRESETS.map((preset) => (
-                      <button
-                        key={preset.id}
-                        type="button"
-                        className={`style-studio-preset-chip ${styleStudioCaption === preset.id ? "active" : ""}`}
-                        onClick={() => setStyleStudioCaption(preset.id)}
+                  {/* Mode 1 - Section 3: Caption Style */}
+                  <section className="style-studio-section">
+                    <h4 className="style-studio-section-title">Caption Style</h4>
+                    <div className="style-studio-caption-grid">
+                      {/* Clean */}
+                      <div
+                        className={`style-studio-caption-card ${
+                          styleStudioCaption === "preset_minimal_capsule" || styleStudioCaption === "preset_cinematic_vlog"
+                            ? "selected"
+                            : ""
+                        }`}
+                        onClick={() => setStyleStudioCaption("preset_minimal_capsule")}
                       >
-                        {preset.name}
-                      </button>
-                    ))}
+                        <div className="style-studio-preview-box">
+                          <div className="preview-pill-clean">How sleep affects cortisol</div>
+                        </div>
+                        <span className="style-studio-card-title">Clean</span>
+                        <p className="style-studio-card-desc">Minimal centered</p>
+                      </div>
+
+                      {/* Bold */}
+                      <div
+                        className={`style-studio-caption-card ${
+                          styleStudioCaption === "preset_viral_bold" || styleStudioCaption === "preset_bhaukal_caption"
+                            ? "selected"
+                            : ""
+                        }`}
+                        onClick={() => setStyleStudioCaption("preset_viral_bold")}
+                      >
+                        <div className="style-studio-preview-box">
+                          <div className="preview-text-bold">HORMOZI VIRAL</div>
+                        </div>
+                        <span className="style-studio-card-title">Bold</span>
+                        <p className="style-studio-card-desc">Punchy uppercase</p>
+                      </div>
+
+                      {/* Word Highlight */}
+                      <div
+                        className={`style-studio-caption-card ${
+                          styleStudioCaption === "preset_mrbeast_pop" ||
+                          styleStudioCaption === "preset_dynamic_editorial" ||
+                          styleStudioCaption === "preset_t7"
+                            ? "selected"
+                            : ""
+                        }`}
+                        onClick={() => setStyleStudioCaption("preset_mrbeast_pop")}
+                      >
+                        <div className="style-studio-preview-box">
+                          <div className="preview-text-highlight">
+                            Morning <span className="word-accent">cortisol</span>
+                          </div>
+                        </div>
+                        <span className="style-studio-card-title">Highlight</span>
+                        <p className="style-studio-card-desc">Word accent</p>
+                      </div>
+                    </div>
+
+                    {/* Preset Chips */}
+                    <div className="style-studio-presets-row">
+                      <span className="style-studio-presets-label">Preset Selector:</span>
+                      <div className="style-studio-presets-list">
+                        {CAPTION_PRESETS.map((preset) => (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            className={`style-studio-preset-chip ${styleStudioCaption === preset.id ? "active" : ""}`}
+                            onClick={() => setStyleStudioCaption(preset.id)}
+                          >
+                            {preset.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </section>
+                </>
+              ) : (
+                /* Mode 2: AutoClip Studio Controls */
+                <section className="style-studio-section" style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+                  <h4 className="style-studio-section-title">AutoClip Studio Controls</h4>
+
+                  {/* Platform Strategy */}
+                  <div>
+                    <span className="style-studio-presets-label" style={{ display: "block", marginBottom: "6px" }}>
+                      Platform Strategy
+                    </span>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: "8px" }}>
+                      {[
+                        { id: "douyin", name: "抖音 9:16", desc: "9:16 Blur" },
+                        { id: "tiktok", name: "TikTok 9:16", desc: "9:16 Crop" },
+                        { id: "youtube_shorts", name: "YouTube Shorts", desc: "9:16 Crop" },
+                        { id: "bilibili", name: "Bilibili 16:9", desc: "16:9 Fit" },
+                        { id: "xiaohongshu", name: "小红书 9:16", desc: "9:16 Blur Box" },
+                      ].map((plat) => (
+                        <div
+                          key={plat.id}
+                          className={`style-studio-framing-card ${styleStudioPlatformStrategy === plat.id ? "selected" : ""}`}
+                          style={{ padding: "8px 10px" }}
+                          onClick={() => setStyleStudioPlatformStrategy(plat.id as AutoClipPlatformStrategy)}
+                        >
+                          <div className="style-studio-framing-top">
+                            <span className="style-studio-card-title" style={{ fontSize: "12px" }}>{plat.name}</span>
+                            <div className="card-indicator">
+                              {styleStudioPlatformStrategy === plat.id ? (
+                                <div className="indicator-check"><Check size={10} strokeWidth={3} /></div>
+                              ) : (
+                                <div className="indicator-empty" />
+                              )}
+                            </div>
+                          </div>
+                          <p className="style-studio-card-desc" style={{ fontSize: "10.5px" }}>{plat.desc}</p>
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              </section>
+
+                  {/* Subtitle Look */}
+                  <div>
+                    <span className="style-studio-presets-label" style={{ display: "block", marginBottom: "6px" }}>
+                      Subtitle Look (≤2 lines, CJK/Latin width-aware)
+                    </span>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "8px" }}>
+                      {[
+                        { id: "clean", name: "Clean", desc: "White text, 2px outline" },
+                        { id: "bold", name: "Bold", desc: "Large bold white, 3px outline" },
+                        { id: "box", name: "Box", desc: "Translucent dark card box" },
+                        { id: "accent", name: "Accent", desc: "Bold yellow, high contrast" },
+                      ].map((sub) => (
+                        <div
+                          key={sub.id}
+                          className={`style-studio-framing-card ${styleStudioSubtitleLook === sub.id ? "selected" : ""}`}
+                          style={{ padding: "8px 10px" }}
+                          onClick={() => setStyleStudioSubtitleLook(sub.id as AutoClipSubtitleLook)}
+                        >
+                          <div className="style-studio-framing-top">
+                            <span className="style-studio-card-title" style={{ fontSize: "12px" }}>{sub.name}</span>
+                            <div className="card-indicator">
+                              {styleStudioSubtitleLook === sub.id ? (
+                                <div className="indicator-check"><Check size={10} strokeWidth={3} /></div>
+                              ) : (
+                                <div className="indicator-empty" />
+                              )}
+                            </div>
+                          </div>
+                          <p className="style-studio-card-desc" style={{ fontSize: "10.5px" }}>{sub.desc}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </section>
+              )}
 
               {/* Section 3: Scope Selection */}
               <section className="style-studio-section">
@@ -2433,17 +2863,42 @@ function App() {
                     </span>
                   </div>
                   <div className="style-studio-summary-row">
-                    <span className="style-studio-summary-label">Framing</span>
+                    <span className="style-studio-summary-label">Engine</span>
                     <span className="style-studio-summary-value">
-                      {styleStudioFraming === "adaptive" ? "Adaptive Framing" : "Original 9:16"}
+                      {styleStudioPresentationMode === "autoshorts" ? "AutoShorts Native (Mode 1)" : "AutoClip Studio (Mode 2)"}
                     </span>
                   </div>
-                  <div className="style-studio-summary-row">
-                    <span className="style-studio-summary-label">Captions</span>
-                    <span className="style-studio-summary-value">
-                      {CAPTION_PRESETS.find(p => p.id === styleStudioCaption)?.name || styleStudioCaption}
-                    </span>
-                  </div>
+                  {styleStudioPresentationMode === "autoshorts" ? (
+                    <>
+                      <div className="style-studio-summary-row">
+                        <span className="style-studio-summary-label">Framing</span>
+                        <span className="style-studio-summary-value">
+                          {styleStudioFraming === "adaptive" ? "Adaptive Framing" : "Original 9:16"}
+                        </span>
+                      </div>
+                      <div className="style-studio-summary-row">
+                        <span className="style-studio-summary-label">Captions</span>
+                        <span className="style-studio-summary-value">
+                          {CAPTION_PRESETS.find(p => p.id === styleStudioCaption)?.name || styleStudioCaption}
+                        </span>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="style-studio-summary-row">
+                        <span className="style-studio-summary-label">Platform</span>
+                        <span className="style-studio-summary-value" style={{ textTransform: "capitalize" }}>
+                          {styleStudioPlatformStrategy.replace("_", " ")}
+                        </span>
+                      </div>
+                      <div className="style-studio-summary-row">
+                        <span className="style-studio-summary-label">Subtitle Look</span>
+                        <span className="style-studio-summary-value" style={{ textTransform: "capitalize" }}>
+                          {styleStudioSubtitleLook}
+                        </span>
+                      </div>
+                    </>
+                  )}
                   <div className="style-studio-summary-row">
                     <span className="style-studio-summary-label">Estimated renders</span>
                     <span className="style-studio-summary-value">
@@ -2455,7 +2910,9 @@ function App() {
                 <div className="style-studio-recommendation-card">
                   <Sparkles size={15} />
                   <span>
-                    AI Recommendation: Adaptive Framing with high-contrast captions delivers highest completion rate on short-form platforms.
+                    {styleStudioPresentationMode === "autoshorts"
+                      ? "AI Recommendation: Adaptive Framing with high-contrast captions delivers highest completion rate on short-form platforms."
+                      : "AutoClip Studio: CJK 2-line subtitles, optical-flow mouth tracking, and platform packaging optimized for viral retention."}
                   </span>
                 </div>
               </section>
@@ -2528,23 +2985,24 @@ function App() {
 
             {/* Scrollable Modal Body */}
             <div className="style-modal-body">
-              {/* Section 1: Framing */}
+              {/* Section 1: Presentation Engine */}
               <section className="modal-section">
                 <div className="modal-section-header">
-                  <h2 className="modal-section-title">Framing</h2>
-                  <span className="modal-section-step">Step 1 of 3</span>
+                  <h2 className="modal-section-title">Presentation Engine</h2>
+                  <span className="modal-section-step">Step 1 of 3 · Engine Architecture</span>
                 </div>
                 <div className="framing-grid">
+                  {/* Mode 1: AutoShorts Native */}
                   <div
-                    className={`framing-card ${selectedFramingMode === "adaptive" ? "selected" : ""}`}
-                    onClick={() => setSelectedFramingMode("adaptive")}
+                    className={`framing-card ${selectedPresentationMode === "autoshorts" ? "selected" : ""}`}
+                    onClick={() => setSelectedPresentationMode("autoshorts")}
                   >
                     <div className="card-top-row">
                       <div className="card-icon-box mint">
                         <Crop size={18} />
                       </div>
                       <div className="card-indicator">
-                        {selectedFramingMode === "adaptive" ? (
+                        {selectedPresentationMode === "autoshorts" ? (
                           <div className="indicator-check"><Check size={13} strokeWidth={3} /></div>
                         ) : (
                           <div className="indicator-empty" />
@@ -2552,24 +3010,25 @@ function App() {
                       </div>
                     </div>
                     <div className="card-title-row">
-                      <span className="card-title">Adaptive Framing</span>
-                      <span className="card-badge mint">SMART</span>
+                      <span className="card-title">AutoShorts Native (Mode 1)</span>
+                      <span className="card-badge mint">DEFAULT</span>
                     </div>
                     <p className="card-desc">
-                      AutoShorts dynamically tracks and reframes speakers, isolating the active speaker when two or more are present.
+                      YOLOv8/11 + BoT-SORT continuous tracking, 1:1 midpoint retention, kinetic ASS subtitles.
                     </p>
                   </div>
 
+                  {/* Mode 2: AutoClip Studio */}
                   <div
-                    className={`framing-card ${selectedFramingMode === "original" ? "selected" : ""}`}
-                    onClick={() => setSelectedFramingMode("original")}
+                    className={`framing-card ${selectedPresentationMode === "autoclip" ? "selected" : ""}`}
+                    onClick={() => setSelectedPresentationMode("autoclip")}
                   >
                     <div className="card-top-row">
-                      <div className="card-icon-box">
-                        <Smartphone size={18} />
+                      <div className="card-icon-box slate">
+                        <Clapperboard size={18} />
                       </div>
                       <div className="card-indicator">
-                        {selectedFramingMode === "original" ? (
+                        {selectedPresentationMode === "autoclip" ? (
                           <div className="indicator-check"><Check size={13} strokeWidth={3} /></div>
                         ) : (
                           <div className="indicator-empty" />
@@ -2577,117 +3036,258 @@ function App() {
                       </div>
                     </div>
                     <div className="card-title-row">
-                      <span className="card-title">Original 9:16</span>
+                      <span className="card-title">AutoClip Studio (Mode 2)</span>
+                      <span className="card-badge slate">STUDIO</span>
                     </div>
                     <p className="card-desc">
-                      Preserves original recording framing at 9:16 aspect ratio. Includes DualFrame layout when multiple speakers are detected.
+                      OpenCV YuNet, hard cuts, mouth optical flow, hold-segment framing, blurred fit fallback, CJK 2-line subtitles, PIL TitleArt.
                     </p>
                   </div>
                 </div>
               </section>
 
-              {/* Section 2: Caption Style */}
+              {/* Section 2: Presentation Styling */}
               <section className="modal-section">
                 <div className="modal-section-header">
-                  <h2 className="modal-section-title">Caption Style</h2>
-                  <span className="modal-section-step">Step 2 of 3 · Live On-screen Rendering</span>
-                </div>
-                <div className="style-grid-c">
-                  {/* Clean */}
-                  <div
-                    className={`style-card-c ${selectedStyle === "preset_minimal_capsule" || selectedStyle === "preset_cinematic_vlog" ? "selected" : ""}`}
-                    onClick={() => setSelectedStyle("preset_minimal_capsule")}
-                  >
-                    <div className="style-preview-box-c">
-                      <div className="preview-dots">
-                        <span /><span />
-                      </div>
-                      <div className="preview-badge-clean">
-                        How sleep affects cortisol
-                      </div>
-                    </div>
-                    <div className="card-info-row">
-                      <div className="card-info">
-                        <span className="card-title">Clean</span>
-                        <p className="card-desc-compact">Minimal, centered captions.</p>
-                      </div>
-                      <div className="card-indicator">
-                        {selectedStyle === "preset_minimal_capsule" || selectedStyle === "preset_cinematic_vlog" ? (
-                          <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
-                        ) : (
-                          <div className="indicator-empty" />
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Bold */}
-                  <div
-                    className={`style-card-c ${selectedStyle === "preset_viral_bold" || selectedStyle === "preset_bhaukal_caption" ? "selected" : ""}`}
-                    onClick={() => setSelectedStyle("preset_viral_bold")}
-                  >
-                    <div className="style-preview-box-c">
-                      <div className="preview-text-bold">
-                        HORMOZI VIRAL
-                      </div>
-                    </div>
-                    <div className="card-info-row">
-                      <div className="card-info">
-                        <span className="card-title">Bold</span>
-                        <p className="card-desc-compact">High-contrast, punchy captions.</p>
-                      </div>
-                      <div className="card-indicator">
-                        {selectedStyle === "preset_viral_bold" || selectedStyle === "preset_bhaukal_caption" ? (
-                          <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
-                        ) : (
-                          <div className="indicator-empty" />
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Word Highlight */}
-                  <div
-                    className={`style-card-c ${selectedStyle === "preset_mrbeast_pop" || selectedStyle === "preset_dynamic_editorial" || selectedStyle === "preset_t7" ? "selected" : ""}`}
-                    onClick={() => setSelectedStyle("preset_mrbeast_pop")}
-                  >
-                    <div className="style-preview-box-c">
-                      <div className="preview-text-highlight">
-                        The morning <span className="word-accent">cortisol</span> surge
-                      </div>
-                    </div>
-                    <div className="card-info-row">
-                      <div className="card-info">
-                        <span className="card-title">Word Highlight</span>
-                        <p className="card-desc-compact">Word-by-word accented karaoke.</p>
-                      </div>
-                      <div className="card-indicator">
-                        {selectedStyle === "preset_mrbeast_pop" || selectedStyle === "preset_dynamic_editorial" || selectedStyle === "preset_t7" ? (
-                          <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
-                        ) : (
-                          <div className="indicator-empty" />
-                        )}
-                      </div>
-                    </div>
-                  </div>
+                  <h2 className="modal-section-title">
+                    {selectedPresentationMode === "autoshorts" ? "Presentation Styling" : "AutoClip Studio Styling"}
+                  </h2>
+                  <span className="modal-section-step">Step 2 of 3 · Visual &amp; Layout Styling</span>
                 </div>
 
-                {/* Secondary row for specific presets */}
-                <div className="style-presets-row">
-                  <span className="presets-row-label">Specific Preset:</span>
-                  <div className="preset-pills-list">
-                    {CAPTION_PRESETS.map((preset) => (
-                      <button
-                        key={preset.id}
-                        type="button"
-                        className={`preset-pill-chip ${selectedStyle === preset.id ? "active" : ""}`}
-                        onClick={() => setSelectedStyle(preset.id)}
+                {selectedPresentationMode === "autoshorts" ? (
+                  <>
+                    {/* Mode 1 Framing options */}
+                    <div style={{ marginBottom: "16px" }}>
+                      <span className="presets-row-label" style={{ display: "block", marginBottom: "8px", fontWeight: 600 }}>
+                        Framing Mode
+                      </span>
+                      <div className="framing-grid">
+                        <div
+                          className={`framing-card ${selectedFramingMode === "adaptive" ? "selected" : ""}`}
+                          onClick={() => setSelectedFramingMode("adaptive")}
+                        >
+                          <div className="card-top-row">
+                            <div className="card-icon-box mint">
+                              <Crop size={18} />
+                            </div>
+                            <div className="card-indicator">
+                              {selectedFramingMode === "adaptive" ? (
+                                <div className="indicator-check"><Check size={13} strokeWidth={3} /></div>
+                              ) : (
+                                <div className="indicator-empty" />
+                              )}
+                            </div>
+                          </div>
+                          <div className="card-title-row">
+                            <span className="card-title">Adaptive Framing</span>
+                            <span className="card-badge mint">SMART</span>
+                          </div>
+                          <p className="card-desc">
+                            AutoShorts dynamically tracks and reframes speakers, isolating the active speaker when two or more are present.
+                          </p>
+                        </div>
+
+                        <div
+                          className={`framing-card ${selectedFramingMode === "original" ? "selected" : ""}`}
+                          onClick={() => setSelectedFramingMode("original")}
+                        >
+                          <div className="card-top-row">
+                            <div className="card-icon-box">
+                              <Smartphone size={18} />
+                            </div>
+                            <div className="card-indicator">
+                              {selectedFramingMode === "original" ? (
+                                <div className="indicator-check"><Check size={13} strokeWidth={3} /></div>
+                              ) : (
+                                <div className="indicator-empty" />
+                              )}
+                            </div>
+                          </div>
+                          <div className="card-title-row">
+                            <span className="card-title">Original 9:16</span>
+                          </div>
+                          <p className="card-desc">
+                            Preserves original recording framing at 9:16 aspect ratio. Includes DualFrame layout when multiple speakers are detected.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Mode 1 Caption presets */}
+                    <span className="presets-row-label" style={{ display: "block", marginBottom: "8px", fontWeight: 600 }}>
+                      Caption Preset
+                    </span>
+                    <div className="style-grid-c">
+                      {/* Clean */}
+                      <div
+                        className={`style-card-c ${selectedStyle === "preset_minimal_capsule" || selectedStyle === "preset_cinematic_vlog" ? "selected" : ""}`}
+                        onClick={() => setSelectedStyle("preset_minimal_capsule")}
                       >
-                        {preset.name}
-                      </button>
-                    ))}
+                        <div className="style-preview-box-c">
+                          <div className="preview-dots">
+                            <span /><span />
+                          </div>
+                          <div className="preview-badge-clean">
+                            How sleep affects cortisol
+                          </div>
+                        </div>
+                        <div className="card-info-row">
+                          <div className="card-info">
+                            <span className="card-title">Clean</span>
+                            <p className="card-desc-compact">Minimal, centered captions.</p>
+                          </div>
+                          <div className="card-indicator">
+                            {selectedStyle === "preset_minimal_capsule" || selectedStyle === "preset_cinematic_vlog" ? (
+                              <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
+                            ) : (
+                              <div className="indicator-empty" />
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Bold */}
+                      <div
+                        className={`style-card-c ${selectedStyle === "preset_viral_bold" || selectedStyle === "preset_bhaukal_caption" ? "selected" : ""}`}
+                        onClick={() => setSelectedStyle("preset_viral_bold")}
+                      >
+                        <div className="style-preview-box-c">
+                          <div className="preview-text-bold">
+                            HORMOZI VIRAL
+                          </div>
+                        </div>
+                        <div className="card-info-row">
+                          <div className="card-info">
+                            <span className="card-title">Bold</span>
+                            <p className="card-desc-compact">High-contrast, punchy captions.</p>
+                          </div>
+                          <div className="card-indicator">
+                            {selectedStyle === "preset_viral_bold" || selectedStyle === "preset_bhaukal_caption" ? (
+                              <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
+                            ) : (
+                              <div className="indicator-empty" />
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Word Highlight */}
+                      <div
+                        className={`style-card-c ${selectedStyle === "preset_mrbeast_pop" || selectedStyle === "preset_dynamic_editorial" || selectedStyle === "preset_t7" ? "selected" : ""}`}
+                        onClick={() => setSelectedStyle("preset_mrbeast_pop")}
+                      >
+                        <div className="style-preview-box-c">
+                          <div className="preview-text-highlight">
+                            The morning <span className="word-accent">cortisol</span> surge
+                          </div>
+                        </div>
+                        <div className="card-info-row">
+                          <div className="card-info">
+                            <span className="card-title">Word Highlight</span>
+                            <p className="card-desc-compact">Word-by-word accented karaoke.</p>
+                          </div>
+                          <div className="card-indicator">
+                            {selectedStyle === "preset_mrbeast_pop" || selectedStyle === "preset_dynamic_editorial" || selectedStyle === "preset_t7" ? (
+                              <div className="indicator-check"><Check size={12} strokeWidth={3} /></div>
+                            ) : (
+                              <div className="indicator-empty" />
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Secondary row for specific presets */}
+                    <div className="style-presets-row">
+                      <span className="presets-row-label">Specific Preset:</span>
+                      <div className="preset-pills-list">
+                        {CAPTION_PRESETS.map((preset) => (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            className={`preset-pill-chip ${selectedStyle === preset.id ? "active" : ""}`}
+                            onClick={() => setSelectedStyle(preset.id)}
+                          >
+                            {preset.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  /* Mode 2: AutoClip Isolated Controls */
+                  <div className="autoclip-isolated-controls" style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                    {/* Platform Strategy */}
+                    <div>
+                      <span className="presets-row-label" style={{ display: "block", marginBottom: "8px", fontWeight: 600 }}>
+                        Platform Strategy
+                      </span>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "10px" }}>
+                        {[
+                          { id: "douyin", name: "抖音 9:16", desc: "9:16 Blur Backdrop" },
+                          { id: "tiktok", name: "TikTok 9:16", desc: "9:16 Tight Face Crop" },
+                          { id: "youtube_shorts", name: "YouTube Shorts", desc: "9:16 Portrait Crop" },
+                          { id: "bilibili", name: "Bilibili 16:9", desc: "16:9 Landscape Fit" },
+                          { id: "xiaohongshu", name: "小红书 9:16", desc: "9:16 Blur + Card" },
+                        ].map((plat) => (
+                          <div
+                            key={plat.id}
+                            className={`framing-card ${platformStrategy === plat.id ? "selected" : ""}`}
+                            style={{ padding: "10px" }}
+                            onClick={() => setPlatformStrategy(plat.id as AutoClipPlatformStrategy)}
+                          >
+                            <div className="card-top-row">
+                              <span className="card-title" style={{ fontSize: "13px" }}>{plat.name}</span>
+                              <div className="card-indicator">
+                                {platformStrategy === plat.id ? (
+                                  <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
+                                ) : (
+                                  <div className="indicator-empty" />
+                                )}
+                              </div>
+                            </div>
+                            <p className="card-desc" style={{ fontSize: "11px", margin: 0 }}>{plat.desc}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Subtitle Look */}
+                    <div>
+                      <span className="presets-row-label" style={{ display: "block", marginBottom: "8px", fontWeight: 600 }}>
+                        Subtitle Look (≤2 lines per screen, CJK/Latin width-aware)
+                      </span>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "10px" }}>
+                        {[
+                          { id: "clean", name: "Clean", desc: "White text, 2px outline" },
+                          { id: "bold", name: "Bold", desc: "Large bold white, 3px outline" },
+                          { id: "box", name: "Box", desc: "Translucent dark card box" },
+                          { id: "accent", name: "Accent", desc: "Bold yellow, high contrast" },
+                        ].map((sub) => (
+                          <div
+                            key={sub.id}
+                            className={`framing-card ${subtitleLook === sub.id ? "selected" : ""}`}
+                            style={{ padding: "10px" }}
+                            onClick={() => setSubtitleLook(sub.id as AutoClipSubtitleLook)}
+                          >
+                            <div className="card-top-row">
+                              <span className="card-title" style={{ fontSize: "13px" }}>{sub.name}</span>
+                              <div className="card-indicator">
+                                {subtitleLook === sub.id ? (
+                                  <div className="indicator-check"><Check size={11} strokeWidth={3} /></div>
+                                ) : (
+                                  <div className="indicator-empty" />
+                                )}
+                              </div>
+                            </div>
+                            <p className="card-desc" style={{ fontSize: "11px", margin: 0 }}>{sub.desc}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                   </div>
-                </div>
+                )}
               </section>
 
               {/* Section 3: Scoring Backend */}
@@ -2801,9 +3401,9 @@ function App() {
                 <button
                   type="button"
                   className="btn-modal-confirm"
-                  disabled={!selectedStyle}
+                  disabled={selectedPresentationMode === "autoshorts" ? !selectedStyle : false}
                   onClick={() => {
-                    if (selectedStyle) confirmImport(selectedStyle, selectedFramingMode);
+                    confirmImport(selectedStyle, selectedFramingMode);
                   }}
                 >
                   <span>Start Processing</span>
@@ -2842,7 +3442,7 @@ function App() {
 
       {youtubeModalOpen && (
         <div className="style-modal-overlay">
-          <div className="style-modal" style={{ maxWidth: "500px" }}>
+          <div className="style-modal" style={{ maxWidth: "520px" }}>
             <div className="style-modal-header">
               <h3>Import from YouTube</h3>
               <p>Paste a YouTube URL below to download and import it directly.</p>
@@ -2852,10 +3452,66 @@ function App() {
                 type="text"
                 placeholder="https://www.youtube.com/watch?v=..."
                 value={youtubeUrl}
-                onChange={(e) => setYoutubeUrl(e.target.value)}
-                disabled={youtubeStatus !== "idle"}
+                onChange={(e) => {
+                  setYoutubeUrl(e.target.value);
+                  if (youtubeAudioTracks.length > 0 || youtubeVideoTitle) {
+                    setYoutubeAudioTracks([]);
+                    setSelectedAudioFormatId(null);
+                    setYoutubeVideoTitle(null);
+                    setYoutubeWarningLicense(null);
+                    setYoutubeStatus("idle");
+                  }
+                }}
+                disabled={youtubeStatus === "checking" || youtubeStatus === "downloading"}
                 style={{ width: "100%", padding: "0.75rem", borderRadius: "8px", border: "1px solid var(--border)", background: "var(--background)", color: "var(--foreground)", fontSize: "1rem", marginBottom: "1rem" }}
               />
+
+              {youtubeVideoTitle && (
+                <div style={{ marginBottom: "1rem", padding: "0.6rem 0.85rem", background: "rgba(255, 255, 255, 0.04)", borderRadius: "8px", border: "1px solid var(--border)", fontSize: "0.88rem" }}>
+                  <div style={{ fontSize: "0.75rem", textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--muted-foreground)", marginBottom: "0.25rem", fontWeight: 600 }}>Video Found</div>
+                  <div style={{ fontWeight: 500, color: "var(--foreground)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{youtubeVideoTitle}</div>
+                </div>
+              )}
+
+              {youtubeAudioTracks.length > 1 && (
+                <div style={{ marginBottom: "1.25rem", padding: "0.85rem", background: "rgba(99, 102, 241, 0.08)", borderRadius: "8px", border: "1px solid rgba(99, 102, 241, 0.3)" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", marginBottom: "0.4rem" }}>
+                    <AudioLines size={16} style={{ color: "var(--primary, #6366f1)" }} />
+                    <label style={{ fontSize: "0.85rem", fontWeight: 600, color: "var(--foreground)" }}>
+                      Multiple Audio Tracks Detected ({youtubeAudioTracks.length})
+                    </label>
+                  </div>
+                  <p style={{ margin: "0 0 0.5rem 0", fontSize: "0.8rem", color: "var(--muted-foreground)" }}>
+                    Select which audio language to download with the video:
+                  </p>
+                  <select
+                    value={selectedAudioFormatId || ""}
+                    onChange={(e) => setSelectedAudioFormatId(e.target.value)}
+                    disabled={youtubeStatus === "downloading"}
+                    style={{
+                      width: "100%",
+                      padding: "0.65rem 0.75rem",
+                      borderRadius: "6px",
+                      border: "1px solid var(--border)",
+                      background: "var(--background)",
+                      color: "var(--foreground)",
+                      fontSize: "0.9rem",
+                      cursor: "pointer",
+                      fontWeight: 500,
+                    }}
+                  >
+                    {youtubeAudioTracks.map((track) => (
+                      <option key={track.formatId} value={track.formatId}>
+                        {track.isOriginal ? `⭐ ${track.languageName} (Original - Recommended)` : `${track.languageName}`}
+                        {track.bitrateKbps ? ` [~${Math.round(track.bitrateKbps)} kbps]` : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <div style={{ fontSize: "0.75rem", color: "var(--muted-foreground)", marginTop: "0.4rem" }}>
+                    ⭐ Original audio track is pre-selected by default to avoid translated dubs.
+                  </div>
+                </div>
+              )}
 
               {youtubeError && (
                 <div style={{ background: "rgba(239, 68, 68, 0.1)", border: "1px solid #ef4444", padding: "0.75rem 1rem", borderRadius: "8px", marginBottom: "1rem", color: "#f87171", fontSize: "0.85rem", maxHeight: "150px", overflowY: "auto" }}>
@@ -2887,14 +3543,27 @@ function App() {
               <div className="style-modal-actions" style={{ marginTop: "1rem" }}>
                 <button 
                   className="btn-cancel" 
-                  onClick={() => { setYoutubeModalOpen(false); setYoutubeUrl(""); setYoutubeStatus("idle"); setYoutubeWarningLicense(null); setYoutubeError(null); }}
+                  onClick={() => {
+                    setYoutubeModalOpen(false);
+                    setYoutubeUrl("");
+                    setYoutubeStatus("idle");
+                    setYoutubeWarningLicense(null);
+                    setYoutubeError(null);
+                    setYoutubeAudioTracks([]);
+                    setSelectedAudioFormatId(null);
+                    setYoutubeVideoTitle(null);
+                  }}
                   disabled={youtubeStatus === "checking" || youtubeStatus === "downloading"}
                 >
                   Cancel
                 </button>
                 {youtubeStatus === "warning" ? (
-                  <button className="btn-confirm" onClick={executeYoutubeDownload}>
+                  <button className="btn-confirm" onClick={() => executeYoutubeDownload()}>
                     Yes, I understand the risks
+                  </button>
+                ) : youtubeStatus === "ready" ? (
+                  <button className="btn-confirm" onClick={() => executeYoutubeDownload()} style={{ minWidth: "120px" }}>
+                    Download Video
                   </button>
                 ) : youtubeStatus === "downloading" ? null : (
                   <button 
@@ -2920,8 +3589,8 @@ function App() {
 interface SettingsPanelProps {
   transcriptionEngine: "deepgram" | "local";
   setTranscriptionEngine: (engine: "deepgram" | "local") => void;
-  llmEngine: "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq";
-  setLlmEngine: (engine: "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq") => void;
+  llmEngine: "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq" | "nvidia";
+  setLlmEngine: (engine: "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq" | "nvidia") => void;
   deepgramKey: string;
   setDeepgramKey: (key: string) => void;
   anthropicKey: string;
@@ -2940,6 +3609,10 @@ interface SettingsPanelProps {
   setOpenrouterModel: (m: string) => void;
   groqKey: string;
   setGroqKey: (key: string) => void;
+  nvidiaKey: string;
+  setNvidiaKey: (key: string) => void;
+  nvidiaModel: string;
+  setNvidiaModel: (m: string) => void;
   localLlmModel: string;
   setLocalLlmModel: (m: string) => void;
   pullModelDirectly: (model: string) => Promise<void>;
@@ -2973,6 +3646,10 @@ function SettingsPanel({
   setOpenrouterModel,
   groqKey,
   setGroqKey,
+  nvidiaKey,
+  setNvidiaKey,
+  nvidiaModel,
+  setNvidiaModel,
   localLlmModel,
   setLocalLlmModel,
   pullModelDirectly,
@@ -2999,6 +3676,7 @@ function SettingsPanel({
             value={llmEngine}
             onChange={(event) => setLlmEngine(event.target.value as any)}
           >
+            <option value="nvidia">NVIDIA NIM (Gemma 4 31B IT)</option>
             <option value="local">Ollama (Offline Local)</option>
             <option value="claude">Claude (Cloud)</option>
             <option value="deepseek">DeepSeek (Cloud)</option>
@@ -3106,6 +3784,28 @@ function SettingsPanel({
               type="password"
             />
           </label>
+        )}
+        {llmEngine === "nvidia" && (
+          <>
+            <label>
+              <span>NVIDIA API Key</span>
+              <input
+                value={nvidiaKey}
+                onChange={(event) => setNvidiaKey(event.target.value)}
+                placeholder={environment?.hasNvidiaKey ? "Loaded from env" : "Optional (NVIDIA API Key)"}
+                type="password"
+              />
+            </label>
+            <label>
+              <span>NVIDIA Model</span>
+              <input
+                value={nvidiaModel}
+                onChange={(event) => setNvidiaModel(event.target.value)}
+                placeholder="Optional (e.g. google/gemma-4-31b-it)"
+                type="text"
+              />
+            </label>
+          </>
         )}
 
         {llmEngine === "local" && (

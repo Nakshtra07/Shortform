@@ -31,6 +31,10 @@ pub struct MediaProbe {
     pub audio_codec: Option<String>,
 }
 
+pub fn default_presentation_mode() -> Option<String> {
+    Some("autoshorts".to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
@@ -44,6 +48,10 @@ pub struct Project {
     pub framing_mode: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default = "default_presentation_mode")]
+    pub presentation_mode: Option<String>,
+    #[serde(default)]
+    pub presentation_config: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1511,5 +1519,50 @@ mod tests {
         assert!(s_dis.contains("\"status\":\"disabled\""));
         assert!(s_dis.contains("\"outputProduced\":null"));
         assert!(s_dis.contains("\"outputConsumed\":null"));
+    }
+
+    #[test]
+    fn test_project_presentation_mode_defaults_and_serde() {
+        // Legacy JSON without presentationMode or presentationConfig
+        let legacy_json = r#"{
+            "id": "proj_123",
+            "name": "Test",
+            "sourcePath": "/tmp/video.mp4",
+            "sourceDuration": 120.5,
+            "status": "ready",
+            "transcriptionMode": "local",
+            "captionStyle": "viral_bold",
+            "framingMode": "adaptive",
+            "createdAt": "2026-10-12T00:00:00Z",
+            "updatedAt": "2026-10-12T00:00:00Z"
+        }"#;
+
+        let proj: Project = serde_json::from_str(legacy_json).expect("deserialize legacy project");
+        assert_eq!(proj.presentation_mode, Some("autoshorts".to_string()));
+        assert_eq!(proj.presentation_config, None);
+
+        // JSON with explicit autoclip mode and presentationConfig
+        let autoclip_json = r#"{
+            "id": "proj_456",
+            "sourcePath": "/tmp/video.mp4",
+            "status": "ready",
+            "transcriptionMode": "local",
+            "createdAt": "2026-10-12T00:00:00Z",
+            "updatedAt": "2026-10-12T00:00:00Z",
+            "presentationMode": "autoclip",
+            "presentationConfig": "{\"platform_strategy\":\"douyin\",\"subtitle_style\":\"accent\"}"
+        }"#;
+
+        let proj2: Project = serde_json::from_str(autoclip_json).expect("deserialize autoclip project");
+        assert_eq!(proj2.presentation_mode, Some("autoclip".to_string()));
+        assert_eq!(
+            proj2.presentation_config,
+            Some("{\"platform_strategy\":\"douyin\",\"subtitle_style\":\"accent\"}".to_string())
+        );
+
+        // Round-trip serialization
+        let serialized = serde_json::to_string(&proj2).expect("serialize");
+        assert!(serialized.contains("\"presentationMode\":\"autoclip\""));
+        assert!(serialized.contains("\"presentationConfig\":"));
     }
 }

@@ -9,6 +9,7 @@ pub mod db;
 // entry points the Tauri commands use, rather than reimplementing them.
 pub mod llm;
 pub mod media;
+pub mod model_manager;
 pub mod models;
 pub mod pacing;
 pub mod panns_reactions;
@@ -44,9 +45,154 @@ pub fn t7_prosody_enabled() -> bool {
     }
 }
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+static GLOBAL_SCENE_INTEL_REGISTRY: OnceLock<
+    Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>>,
+> = OnceLock::new();
+static GLOBAL_APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+fn emit_scene_intel_status(
+    app: Option<&tauri::AppHandle>,
+    registry: Option<&Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>>>,
+    status: scene_intelligence::SceneIntelStatus,
+) {
+    if let Some(reg) = registry {
+        let mut map = match reg.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.insert(status.project_id.clone(), status.clone());
+    }
+    if let Some(app_handle) = app {
+        let _ = app_handle.emit("scene-intel-status", &status);
+    }
+}
+
+fn check_and_mark_scene_intel_running(
+    registry: Option<&Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>>>,
+    project_id: &str,
+) -> bool {
+    if let Some(reg) = registry {
+        let mut map = match reg.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(current) = map.get(project_id) {
+            if current.status == "running" {
+                return false;
+            }
+        }
+        map.insert(
+            project_id.to_string(),
+            scene_intelligence::SceneIntelStatus {
+                project_id: project_id.to_string(),
+                status: "running".to_string(),
+                progress: 0,
+                scene_count: 0,
+            },
+        );
+    }
+    true
+}
+
+fn trigger_scene_intel_prewarm(
+    app: Option<&tauri::AppHandle>,
+    registry: Option<&Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>>>,
+    project_id: String,
+    source_path: String,
+) {
+    if !scene_intelligence::scene_intelligence_enabled() {
+        return;
+    }
+    let app_clone = app.cloned().or_else(|| GLOBAL_APP_HANDLE.get().cloned());
+    let registry_clone = registry.cloned().or_else(|| GLOBAL_SCENE_INTEL_REGISTRY.get().cloned());
+    let source_path_clone = source_path;
+    let project_id_clone = project_id;
+
+    if !check_and_mark_scene_intel_running(registry_clone.as_ref(), &project_id_clone) {
+        println!(
+            "[SceneIntel] Pre-warming already running for project {}, skipping duplicate spawn",
+            project_id_clone
+        );
+        return;
+    }
+
+    if let Some(app_handle) = app_clone.as_ref() {
+        let _ = app_handle.emit(
+            "scene-intel-status",
+            &scene_intelligence::SceneIntelStatus {
+                project_id: project_id_clone.clone(),
+                status: "running".to_string(),
+                progress: 0,
+                scene_count: 0,
+            },
+        );
+    }
+
+    tokio::task::spawn_blocking(move || {
+        match scene_intelligence::SceneIntelligenceEngine::new(None) {
+            Ok(scene_engine) => {
+                println!(
+                    "[SceneIntel] Background pre-warming initiated for {}",
+                    source_path_clone
+                );
+                let app_progress = app_clone.clone();
+                let registry_progress = registry_clone.clone();
+                let pid_progress = project_id_clone.clone();
+                let doc = scene_engine.process_source_with_progress(&source_path_clone, move |pct| {
+                    emit_scene_intel_status(
+                        app_progress.as_ref(),
+                        registry_progress.as_ref(),
+                        scene_intelligence::SceneIntelStatus {
+                            project_id: pid_progress.clone(),
+                            status: "running".to_string(),
+                            progress: pct,
+                            scene_count: 0,
+                        },
+                    );
+                });
+                println!(
+                    "[SceneIntel] Background pre-warming COMPLETE: {} scenes cached (fallback={})",
+                    doc.scenes.len(),
+                    doc.fallback
+                );
+                emit_scene_intel_status(
+                    app_clone.as_ref(),
+                    registry_clone.as_ref(),
+                    scene_intelligence::SceneIntelStatus {
+                        project_id: project_id_clone,
+                        status: if doc.fallback {
+                            "error".to_string()
+                        } else {
+                            "completed".to_string()
+                        },
+                        progress: 100,
+                        scene_count: doc.scenes.len(),
+                    },
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[SceneIntel] Background pre-warming engine init failed (non-fatal): {}",
+                    e
+                );
+                emit_scene_intel_status(
+                    app_clone.as_ref(),
+                    registry_clone.as_ref(),
+                    scene_intelligence::SceneIntelStatus {
+                        project_id: project_id_clone,
+                        status: "error".to_string(),
+                        progress: 0,
+                        scene_count: 0,
+                    },
+                );
+            }
+        }
+    });
+}
 
 use anyhow::{anyhow, Context, Result};
 use tauri::{Emitter, Manager};
@@ -183,6 +329,7 @@ struct AppState {
     db: Database,
     data_dir: PathBuf,
     render_tracker: InFlightRenderTracker,
+    scene_intel_registry: Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>>,
 }
 
 #[tauri::command]
@@ -190,11 +337,14 @@ async fn environment_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<EnvironmentStatus, String> {
     let llm_provider = std::env::var("LLM_PROVIDER")
-        .unwrap_or_else(|_| "deepseek".to_string())
+        .unwrap_or_else(|_| "nvidia".to_string())
         .to_lowercase();
 
-    let has_local_whisper_model =
-        transcription::whisper_cli_exists() || transcription::whisper_python_exists();
+    let has_local_whisper_model = tokio::task::spawn_blocking(|| {
+        transcription::whisper_cli_exists() || transcription::whisper_python_exists()
+    })
+    .await
+    .unwrap_or(false);
 
     let has_ollama = reqwest::Client::new()
         .get("http://localhost:11434")
@@ -493,13 +643,17 @@ fn create_project_from_path(
     transcription_mode: String,
     caption_style: String,
     framing_mode: String,
+    presentation_mode: Option<String>,
+    presentation_config: Option<String>,
 ) -> Result<Project, String> {
-    create_project_from_path_impl(
+    create_project_from_path_with_presentation_impl(
         &state.db,
         &path,
         &transcription_mode,
         &caption_style,
         &framing_mode,
+        presentation_mode.as_deref(),
+        presentation_config.as_deref(),
     )
 }
 
@@ -512,15 +666,37 @@ pub fn create_project_from_path_impl(
     caption_style: &str,
     framing_mode: &str,
 ) -> Result<Project, String> {
+    create_project_from_path_with_presentation_impl(
+        db,
+        path,
+        transcription_mode,
+        caption_style,
+        framing_mode,
+        None,
+        None,
+    )
+}
+
+pub fn create_project_from_path_with_presentation_impl(
+    db: &Database,
+    path: &str,
+    transcription_mode: &str,
+    caption_style: &str,
+    framing_mode: &str,
+    presentation_mode: Option<&str>,
+    presentation_config: Option<&str>,
+) -> Result<Project, String> {
     validate_media_extension(path).map_err(to_command_error)?;
     let probe = media::probe_media(path).ok();
 
-    db.create_project(
+    db.create_project_with_presentation(
         path,
         transcription_mode,
         caption_style,
         framing_mode,
         probe.and_then(|probe| probe.duration_sec),
+        presentation_mode,
+        presentation_config,
     )
     .map_err(to_command_error)
 }
@@ -574,17 +750,20 @@ fn extract_project_audio(
 
 #[tauri::command]
 async fn transcribe_project(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     project_id: String,
     provider: String,
     api_key: Option<String>,
 ) -> Result<Transcript, String> {
-    transcribe_project_impl(
+    transcribe_project_impl_internal(
         state.db.clone(),
         state.data_dir.clone(),
         project_id,
         provider,
         api_key,
+        Some(state.scene_intel_registry.clone()),
+        Some(app),
     )
     .await
 }
@@ -598,6 +777,27 @@ pub async fn transcribe_project_impl(
     project_id: String,
     provider: String,
     api_key: Option<String>,
+) -> Result<Transcript, String> {
+    transcribe_project_impl_internal(
+        db,
+        data_dir,
+        project_id,
+        provider,
+        api_key,
+        None,
+        None,
+    )
+    .await
+}
+
+pub async fn transcribe_project_impl_internal(
+    db: Database,
+    data_dir: PathBuf,
+    project_id: String,
+    provider: String,
+    api_key: Option<String>,
+    scene_intel_registry: Option<Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>>>,
+    app: Option<tauri::AppHandle>,
 ) -> Result<Transcript, String> {
     let project = db.get_project(&project_id).map_err(to_command_error)?;
     db.update_project_status(&project_id, "transcribing", None)
@@ -621,8 +821,11 @@ pub async fn transcribe_project_impl(
                 .map_err(to_command_error)?
         }
         "local" => {
-            let has_whisper =
-                transcription::whisper_cli_exists() || transcription::whisper_python_exists();
+            let has_whisper = tokio::task::spawn_blocking(|| {
+                transcription::whisper_cli_exists() || transcription::whisper_python_exists()
+            })
+            .await
+            .unwrap_or(false);
             if !has_whisper {
                 return Err("Whisper is not installed. Please install it (e.g., via Homebrew 'brew install whisper-cli' or via Python 'pip3 install openai-whisper').".to_string());
             }
@@ -656,6 +859,17 @@ pub async fn transcribe_project_impl(
         .map_err(to_command_error)?;
     db.update_project_status(&project_id, "analyzing", Some(transcript.duration))
         .map_err(to_command_error)?;
+
+    // ── Phase 3: Background Scene Intelligence Pre-Warming ──────────────
+    // Immediately initiate scene intelligence detection in the background
+    // right after transcription finishes so the cache is warm when user renders.
+    trigger_scene_intel_prewarm(
+        app.as_ref(),
+        scene_intel_registry.as_ref(),
+        project_id.clone(),
+        project.source_path.clone(),
+    );
+
     Ok(saved)
 }
 
@@ -840,46 +1054,6 @@ pub async fn generate_candidates_impl(
         );
     }
 
-    // If params are provided, override env vars for this call only:
-    // Set AUTOSHORTS_DISCOVERY_MODE from discovery_mode
-    // Set AUTOSHORTS_REZE_PROVIDER from reze_provider
-    let prev_discovery_mode = std::env::var("AUTOSHORTS_DISCOVERY_MODE").ok();
-    let prev_reze_provider = std::env::var("AUTOSHORTS_REZE_PROVIDER").ok();
-
-    if let Some(ref dm) = discovery_mode {
-        let trimmed = dm.trim();
-        if !trimmed.is_empty() {
-            std::env::set_var("AUTOSHORTS_DISCOVERY_MODE", trimmed);
-        }
-    }
-    if let Some(ref rp) = reze_provider {
-        let trimmed = rp.trim();
-        if !trimmed.is_empty() {
-            std::env::set_var("AUTOSHORTS_REZE_PROVIDER", trimmed);
-        }
-    }
-
-    struct CallEnvGuard {
-        prev_discovery_mode: Option<String>,
-        prev_reze_provider: Option<String>,
-    }
-    impl Drop for CallEnvGuard {
-        fn drop(&mut self) {
-            match &self.prev_discovery_mode {
-                Some(v) => std::env::set_var("AUTOSHORTS_DISCOVERY_MODE", v),
-                None => std::env::remove_var("AUTOSHORTS_DISCOVERY_MODE"),
-            }
-            match &self.prev_reze_provider {
-                Some(v) => std::env::set_var("AUTOSHORTS_REZE_PROVIDER", v),
-                None => std::env::remove_var("AUTOSHORTS_REZE_PROVIDER"),
-            }
-        }
-    }
-    let _call_env_guard = CallEnvGuard {
-        prev_discovery_mode,
-        prev_reze_provider,
-    };
-
     let effective_provider = reze_provider.as_deref().or(provider.as_deref());
     let (discovery_mode, is_nvidia_reze, nvidia_key_opt) = resolve_reze_3_way_gate(
         discovery_mode.as_deref(),
@@ -902,13 +1076,18 @@ pub async fn generate_candidates_impl(
             Some(base_model),
         )
     } else {
-        // Timestamp generation uses configured/default provider (strictly reverts to DeepSeek if not explicitly another local/cloud provider)
+        // Timestamp generation uses configured/default provider
         let prov = provider
-            .filter(|p| !p.trim().is_empty() && p != "openrouter")
-            .or_else(|| std::env::var("LLM_PROVIDER").ok().filter(|p| p != "openrouter"))
-            .unwrap_or_else(|| "deepseek".to_string())
+            .filter(|p| !p.trim().is_empty())
+            .or_else(|| std::env::var("LLM_PROVIDER").ok())
+            .unwrap_or_else(|| "gemini".to_string())
             .to_lowercase();
         let k = match prov.as_str() {
+            "openrouter" => api_key
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .ok_or_else(|| {
+                    "Set OPENROUTER_API_KEY or supply OpenRouter API Key to generate candidates.".to_string()
+                })?,
             "claude" => api_key
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
                 .ok_or_else(|| {
@@ -929,6 +1108,11 @@ pub async fn generate_candidates_impl(
                 .ok_or_else(|| {
                     "Set GROQ_API_KEY or supply Groq API Key to generate candidates.".to_string()
                 })?,
+            "nvidia" | "nvidia_nim" | "stepfun" => api_key
+                .or_else(|| std::env::var("NVIDIA_API_KEY").ok())
+                .ok_or_else(|| {
+                    "Set NVIDIA_API_KEY or supply NVIDIA API Key to generate candidates.".to_string()
+                })?,
             "local" | "ollama" => String::new(),
             _ => api_key
                 .filter(|k| !k.trim().is_empty())
@@ -938,12 +1122,46 @@ pub async fn generate_candidates_impl(
                         .to_string()
                 })?,
         };
-        let m = if prov == "deepseek"
+        let m = if prov == "openrouter" {
+            Some(
+                model_name
+                    .filter(|m| !m.trim().is_empty())
+                    .or_else(|| std::env::var("OPENROUTER_MODEL").ok().filter(|m| !m.trim().is_empty()))
+                    .unwrap_or_else(|| "thinkingmachines/inkling-small".to_string()),
+            )
+        } else if (prov == "nvidia" || prov == "nvidia_nim" || prov == "stepfun")
+            && (model_name.is_none()
+                || model_name.as_deref().unwrap_or("").trim().is_empty()
+                || model_name.as_deref().unwrap_or("").starts_with("google/gemini")
+                || model_name.as_deref().unwrap_or("").starts_with("gemini")
+                || model_name.as_deref().unwrap_or("").starts_with("deepseek")
+                || model_name.as_deref().unwrap_or("").starts_with("stepfun"))
+        {
+            Some(
+                std::env::var("NVIDIA_MODEL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty() && !s.trim().starts_with("stepfun"))
+                    .unwrap_or_else(|| "google/gemma-4-31b-it".to_string()),
+            )
+        } else if prov == "deepseek"
             && (model_name.is_none()
                 || model_name.as_deref().unwrap_or("").trim().is_empty()
                 || model_name.as_deref().unwrap_or("").starts_with("google/"))
         {
             Some("deepseek-chat".to_string())
+        } else if prov == "gemini"
+            && (model_name.is_none()
+                || model_name.as_deref().unwrap_or("").trim().is_empty()
+                || model_name.as_deref().unwrap_or("").starts_with("google/gemma")
+                || model_name.as_deref().unwrap_or("").starts_with("openai/")
+                || model_name.as_deref().unwrap_or("").starts_with("thinkingmachines/"))
+        {
+            Some(
+                std::env::var("GEMINI_MODEL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "gemini-3.1-flash-lite".to_string()),
+            )
         } else {
             model_name
         };
@@ -1063,10 +1281,13 @@ pub async fn generate_candidates_impl(
         draft.start = snapped_start;
 
         if payoff_aligned {
-            // Once payoff alignment establishes payoff_end, that endpoint MUST REMAIN AUTHORITATIVE.
-            // Hook Intelligence 2.0 must NOT interrupt, override, shorten, rewrite, re-anchor,
-            // or otherwise change the payoff-driven endpoint.
-            draft.end = draft.payoff_end.unwrap();
+            // Once payoff alignment establishes payoff_end, that endpoint remains authoritative,
+            // but respects forward continuation extensions if the payoff ended on a dangling token,
+            // while guarding against uncontrolled drift beyond max_payoff_ceiling (135.0s).
+            draft.end = snapped_end;
+            if draft.payoff_end.map_or(false, |pe| pe > snapped_end) {
+                draft.payoff_end = Some(snapped_end);
+            }
         } else {
             let validated_end = match validate_and_enforce_final_endpoint(
                 &normalized.words,
@@ -1850,14 +2071,15 @@ pub fn snap_to_semantic_boundaries_with_hook_anchor(
     hook_anchor: Option<f64>,
     is_question_hook: bool,
 ) -> (f64, f64) {
+    let min_guideline = 12.0;
+    let max_guideline = 120.0;
+    let max_payoff_ceiling = 135.0;
+
     if words.is_empty() {
         let s = raw_start.max(0.0).min(video_duration);
-        let e = raw_end.max(s + 1.0).min(video_duration);
+        let e = raw_end.min(s + max_guideline).max(s + 1.0).min(video_duration);
         return (s, e);
     }
-
-    let min_guideline = 12.0;
-    let max_guideline = 75.0;
 
     // 1. Snap start timestamp with strict sentence boundary protection
     let mut chosen_start = raw_start.max(0.0);
@@ -1950,10 +2172,82 @@ pub fn snap_to_semantic_boundaries_with_hook_anchor(
 
     if has_payoff {
         let p_end = closure.and_then(|c| c.payoff_end).unwrap();
-        // Once payoff alignment establishes payoff_end, that endpoint remains strictly authoritative.
-        // Hook Intelligence 2.0 must NOT interrupt, override, shorten, rewrite, re-anchor,
-        // or otherwise change the payoff-driven endpoint.
-        chosen_end = p_end.min(video_duration);
+        let payoff_duration = p_end - chosen_start;
+        if payoff_duration > max_payoff_ceiling {
+            // Uncontrolled drift safeguard: payoff endpoint is excessively distant (> 135s),
+            // which would balloon a short-form candidate into multi-minute content or the next window.
+            // Enforce max_guideline ceiling (120s) by finding the best available sentence terminator.
+            if let Some(w) = words
+                .iter()
+                .filter(|w| {
+                    w.end >= chosen_start + 35.0
+                        && w.end <= chosen_start + max_guideline
+                        && crate::transcription::ends_with_sentence_terminator(&w.text)
+                        && !is_continuation_word(&w.text)
+                })
+                .max_by(|a, b| a.end.total_cmp(&b.end))
+            {
+                chosen_end = w.end;
+            } else if let Some(w) = words
+                .iter()
+                .filter(|w| w.end >= chosen_start + min_guideline && w.end <= chosen_start + max_guideline)
+                .max_by(|a, b| a.end.total_cmp(&b.end))
+            {
+                chosen_end = w.end;
+            } else {
+                chosen_end = (chosen_start + max_guideline).min(video_duration);
+            }
+        } else {
+            // Once payoff alignment establishes payoff_end, that endpoint remains strictly authoritative.
+            // Hook Intelligence 2.0 must NOT interrupt, override, shorten, rewrite, re-anchor,
+            // or otherwise change the payoff-driven endpoint.
+            chosen_end = p_end.min(video_duration);
+
+            // Safeguard: If the payoff word at p_end is an unresolved continuation word ("because", "and", "so", etc.)
+            // or has not reached a sentence terminator, extend forward to the actual sentence terminator within
+            // max_payoff_ceiling (135s) so thoughts and quotes never cut off mid-sentence.
+            let end_match = words
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| {
+                    (w.start <= chosen_end && chosen_end <= w.end)
+                        || (w.end - chosen_end).abs() < 0.80
+                        || (w.start - chosen_end).abs() < 0.80
+                })
+                .min_by(|(_, a), (_, b)| {
+                    let dist_a = if a.start <= chosen_end && chosen_end <= a.end {
+                        0.0
+                    } else {
+                        (a.end - chosen_end).abs().min((a.start - chosen_end).abs())
+                    };
+                    let dist_b = if b.start <= chosen_end && chosen_end <= b.end {
+                        0.0
+                    } else {
+                        (b.end - chosen_end).abs().min((b.start - chosen_end).abs())
+                    };
+                    dist_a.total_cmp(&dist_b)
+                });
+            if let Some((end_idx, current_word)) = end_match {
+                if is_continuation_word(&current_word.text)
+                    || !crate::transcription::ends_with_sentence_terminator(&current_word.text)
+                {
+                    let search_ceiling = (chosen_start + max_payoff_ceiling).min(video_duration);
+                    for next_w in &words[end_idx + 1..] {
+                        if next_w.end > search_ceiling {
+                            break;
+                        }
+                        if crate::transcription::ends_with_sentence_terminator(&next_w.text)
+                            && !is_continuation_word(&next_w.text)
+                        {
+                            chosen_end = next_w.end;
+                            break;
+                        }
+                    }
+                } else if chosen_end < current_word.end {
+                    chosen_end = current_word.end;
+                }
+            }
+        }
     } else {
         // Evaluate R4 deterministic closure extension triggers
         let mut must_extend = false;
@@ -1992,7 +2286,9 @@ pub fn snap_to_semantic_boundaries_with_hook_anchor(
             // Reject stopping at or before raw_end. Force forward search for the next valid sentence terminator.
             let mut search_max = (chosen_start + max_guideline).min(video_duration);
             if let Some(p_end) = closure.and_then(|c| c.payoff_end) {
-                search_max = search_max.max(p_end + 0.5).min(video_duration);
+                search_max = search_max
+                    .max((p_end + 0.5).min(chosen_start + max_payoff_ceiling))
+                    .min(video_duration);
             }
 
             // Find candidate words strictly ending after raw_end and at or after target_min_end (with 0.1s margin)
@@ -2044,7 +2340,7 @@ pub fn snap_to_semantic_boundaries_with_hook_anchor(
                 if let Some(w) = fallback_terminator {
                     chosen_end = w.end;
                 } else {
-                    // If extension is required but no valid terminator within max_guideline (75.0s): accept best available sentence terminator within bounds
+                    // If extension is required but no valid terminator within max_guideline (120.0s): accept best available sentence terminator within bounds
                     let best_in_bounds = words
                         .iter()
                         .filter(|w| w.end >= chosen_start + min_guideline && w.end <= search_max)
@@ -2154,9 +2450,29 @@ pub fn snap_to_semantic_boundaries_with_hook_anchor(
             }
         }
 
-        // 3. Look-Ahead Check: If the word at chosen_end is a continuation word, extend forward
-        if let Some(end_idx) = words.iter().position(|w| (w.end - chosen_end).abs() < 0.2) {
-            let current_word = &words[end_idx];
+        // 3. Look-Ahead Check: If the word at chosen_end is a continuation word or mid-sentence, extend forward
+        let end_match = words
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| {
+                (w.start <= chosen_end && chosen_end <= w.end)
+                    || (w.end - chosen_end).abs() < 0.80
+                    || (w.start - chosen_end).abs() < 0.80
+            })
+            .min_by(|(_, a), (_, b)| {
+                let dist_a = if a.start <= chosen_end && chosen_end <= a.end {
+                    0.0
+                } else {
+                    (a.end - chosen_end).abs().min((a.start - chosen_end).abs())
+                };
+                let dist_b = if b.start <= chosen_end && chosen_end <= b.end {
+                    0.0
+                } else {
+                    (b.end - chosen_end).abs().min((b.start - chosen_end).abs())
+                };
+                dist_a.total_cmp(&dist_b)
+            });
+        if let Some((end_idx, current_word)) = end_match {
             if is_continuation_word(&current_word.text)
                 || !crate::transcription::ends_with_sentence_terminator(&current_word.text)
             {
@@ -2172,6 +2488,8 @@ pub fn snap_to_semantic_boundaries_with_hook_anchor(
                         break;
                     }
                 }
+            } else if chosen_end < current_word.end {
+                chosen_end = current_word.end;
             }
         }
 
@@ -2209,6 +2527,15 @@ pub fn snap_to_semantic_boundaries_with_hook_anchor(
                 .max_by(|a, b| a.end.total_cmp(&b.end))
             {
                 chosen_end = w.end;
+            } else if let Some(w) = words
+                .iter()
+                .filter(|w| w.end >= chosen_start + min_guideline && w.end <= chosen_start + max_guideline)
+                .max_by(|a, b| a.end.total_cmp(&b.end))
+            {
+                // Unbroken monologue with zero sentence terminators: clamp to latest word within 120s
+                chosen_end = w.end;
+            } else {
+                chosen_end = (chosen_start + max_guideline).min(video_duration);
             }
         }
     }
@@ -2222,7 +2549,7 @@ pub fn snap_to_semantic_boundaries_with_hook_anchor(
 /// Snap the LLM's suggested clip_start and clip_end to natural semantic boundaries in the transcript:
 /// - `start`: snaps to the exact start of a word around that timestamp, preferring the start of a sentence.
 /// - `end`: looks ahead past raw_end to find true semantic closure, enforcing deterministic closure rules when `closure` signals are present.
-/// - Dynamic duration: allows full narrative completeness up to 75.0s.
+/// - Dynamic duration: allows full narrative completeness up to 120.0s.
 pub fn snap_to_semantic_boundaries(
     words: &[TranscriptWord],
     raw_start: f64,
@@ -2270,6 +2597,17 @@ fn set_selected_rank_range(
 }
 
 #[tauri::command]
+fn toggle_candidate_selection(
+    state: tauri::State<'_, AppState>,
+    candidate_id: String,
+) -> Result<Vec<Candidate>, String> {
+    state
+        .db
+        .toggle_candidate_selection(&candidate_id)
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
 async fn render_flat_clip_for_candidate(
     state: tauri::State<'_, AppState>,
     candidate_id: String,
@@ -2313,6 +2651,64 @@ pub async fn render_flat_clip_for_candidate_impl(
         let output_path = documents_project_dir(&project)?
             .join("clips")
             .join(format!("clip-{:02}_flat.mp4", candidate.rank));
+
+        let mode = project.presentation_mode.as_deref().unwrap_or("autoshorts");
+        if mode == "autoclip" {
+            if let Some(parent) = output_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            let mut transcript_words: Option<Vec<TranscriptWord>> = None;
+            if let Ok(Some(transcript_record)) = db.latest_transcript(&project.id) {
+                if let Ok(normalized) = serde_json::from_str::<NormalizedTranscript>(&transcript_record.raw_json) {
+                    transcript_words = Some(normalized.words);
+                }
+            }
+
+            match media::render_autoclip_clip(
+                &project.id,
+                &project.source_path,
+                &output_path,
+                &candidate,
+                transcript_words.as_deref(),
+                project.presentation_config.as_deref(),
+                Some(&data_dir),
+            ) {
+                Ok(rendered_path) => {
+                    let path_string = rendered_path.to_string_lossy().to_string();
+                    let applied_features = serde_json::json!({
+                        "presentation_mode": "autoclip",
+                        "presentation_config": project.presentation_config,
+                        "engine": "autoclip_studio",
+                    });
+                    let applied_features_json = applied_features.to_string();
+                    db.update_clip_for_candidate(
+                        &candidate_id,
+                        "done",
+                        Some(&path_string),
+                        None,
+                        Some("AutoClip Studio presentation render succeeded"),
+                        Some(applied_features_json.as_str()),
+                    )
+                    .map_err(to_command_error)?;
+                    return Ok(path_string);
+                }
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    println!("[AutoClip Render Error] Mode 2 render failed: {}", err_msg);
+                    db.update_clip_for_candidate(
+                        &candidate_id,
+                        "error",
+                        None,
+                        None,
+                        Some(&err_msg),
+                        None,
+                    )
+                    .map_err(to_command_error)?;
+                    return Err(format!("AutoClip Studio render failed: {}", err_msg));
+                }
+            }
+        }
 
         let mut _srt_path = None;
         let mut ass_path = None;
@@ -3065,6 +3461,8 @@ fn update_project_style(
     project_id: String,
     caption_style: Option<String>,
     framing_mode: Option<String>,
+    presentation_mode: Option<String>,
+    presentation_config: Option<String>,
 ) -> Result<(), String> {
     state
         .db
@@ -3072,6 +3470,8 @@ fn update_project_style(
             &project_id,
             caption_style.as_deref(),
             framing_mode.as_deref(),
+            presentation_mode.as_deref(),
+            presentation_config.as_deref(),
         )
         .map_err(to_command_error)
 }
@@ -3095,6 +3495,93 @@ fn restore_clip_output_path(
         .map_err(to_command_error)
 }
 
+#[tauri::command]
+async fn trigger_scene_intelligence(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<scene_intelligence::SceneIntelStatus, String> {
+    let project = state.db.get_project(&project_id).map_err(to_command_error)?;
+    trigger_scene_intel_prewarm(
+        Some(&app),
+        Some(&state.scene_intel_registry),
+        project_id.clone(),
+        project.source_path.clone(),
+    );
+    Ok(scene_intelligence::SceneIntelStatus {
+        project_id,
+        status: "running".to_string(),
+        progress: 0,
+        scene_count: 0,
+    })
+}
+
+#[tauri::command]
+async fn get_scene_intelligence_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<scene_intelligence::SceneIntelStatus, String> {
+    if let Ok(reg) = state.scene_intel_registry.lock() {
+        if let Some(status) = reg.get(&project_id) {
+            return Ok(status.clone());
+        }
+    }
+
+    let project = state.db.get_project(&project_id).map_err(to_command_error)?;
+
+    if let Ok(scene_engine) = scene_intelligence::SceneIntelligenceEngine::new(None) {
+        if let Some(doc) = scene_engine.get_cached_scenes(&project.source_path) {
+            let status = scene_intelligence::SceneIntelStatus {
+                project_id: project_id.clone(),
+                status: if doc.fallback {
+                    "error".to_string()
+                } else {
+                    "completed".to_string()
+                },
+                progress: 100,
+                scene_count: doc.scenes.len(),
+            };
+            if let Ok(mut reg) = state.scene_intel_registry.lock() {
+                reg.insert(project_id.clone(), status.clone());
+            }
+            return Ok(status);
+        }
+    }
+
+    // Auto-prewarm if project has transcripts but has no cached scene boundaries yet
+    let has_transcript = state.db.latest_transcript(&project_id).ok().flatten().is_some();
+    if has_transcript && scene_intelligence::scene_intelligence_enabled() {
+        trigger_scene_intel_prewarm(
+            Some(&app),
+            Some(&state.scene_intel_registry),
+            project_id.clone(),
+            project.source_path.clone(),
+        );
+        return Ok(scene_intelligence::SceneIntelStatus {
+            project_id,
+            status: "running".to_string(),
+            progress: 0,
+            scene_count: 0,
+        });
+    }
+
+    Ok(scene_intelligence::SceneIntelStatus {
+        project_id,
+        status: "idle".to_string(),
+        progress: 0,
+        scene_count: 0,
+    })
+}
+
+#[tauri::command]
+async fn ensure_yolo_model(app: tauri::AppHandle) -> Result<String, String> {
+    model_manager::ensure_yolo_weights(Some(&app))
+        .await
+        .map(|p| p.to_string_lossy().to_string())
+        .map_err(|e| e.to_string())
+}
+
 pub fn run() {
     let _ = dotenvy::dotenv();
     let _ = dotenvy::from_filename("../.env");
@@ -3111,10 +3598,14 @@ pub fn run() {
                 .context("creating models directory")?;
             let db = Database::open(&data_dir.join("autoshorts.sqlite"))?;
             let render_tracker = InFlightRenderTracker::new();
+            let scene_intel_registry = Arc::new(Mutex::new(HashMap::new()));
+            let _ = GLOBAL_SCENE_INTEL_REGISTRY.set(scene_intel_registry.clone());
+            let _ = GLOBAL_APP_HANDLE.set(app.handle().clone());
             app.manage(AppState {
                 db,
                 data_dir,
                 render_tracker,
+                scene_intel_registry,
             });
             Ok(())
         })
@@ -3132,13 +3623,18 @@ pub fn run() {
             generate_candidates,
             set_selected_clip_count,
             set_selected_rank_range,
+            toggle_candidate_selection,
             render_flat_clip_for_candidate,
             delete_project,
             rename_project,
             update_project_style,
             restore_clip_output_path,
             check_youtube_copyright,
-            download_youtube_video
+            probe_youtube_media,
+            download_youtube_video,
+            get_scene_intelligence_status,
+            trigger_scene_intelligence,
+            ensure_yolo_model
         ])
         .run(tauri::generate_context!())
         .expect("error while running AutoShorts");
@@ -3158,17 +3654,32 @@ async fn check_youtube_copyright(
 }
 
 #[tauri::command]
+async fn probe_youtube_media(
+    url: String,
+    browser: Option<String>,
+    cookies_path: Option<String>,
+) -> Result<youtube::YoutubeProbeResult, String> {
+    tokio::task::spawn_blocking(move || {
+        youtube::probe_media(&url, browser.as_deref(), cookies_path.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn download_youtube_video(
     url: String,
+    audio_format_id: Option<String>,
     browser: Option<String>,
     cookies_path: Option<String>,
 ) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
         let downloads_dir = dirs::download_dir()
             .ok_or_else(|| "Could not locate Downloads folder on your system.".to_string())?;
-        let path = youtube::download_video(
+        let path = youtube::download_video_with_audio_track(
             &url,
             &downloads_dir,
+            audio_format_id.as_deref(),
             browser.as_deref(),
             cookies_path.as_deref(),
         )?;
@@ -3874,6 +4385,102 @@ pub fn build_drawtext_filters(
 mod tests {
     use super::*;
     use crate::models::{CandidateDraft, ClosureSignals, TranscriptWord};
+
+    #[test]
+    fn test_scene_intel_registry_update_and_query() {
+        let registry: Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let status = scene_intelligence::SceneIntelStatus {
+            project_id: "proj_123".to_string(),
+            status: "running".to_string(),
+            progress: 45,
+            scene_count: 0,
+        };
+
+        emit_scene_intel_status(None, Some(&registry), status);
+
+        let locked = registry.lock().unwrap();
+        let retrieved = locked.get("proj_123").unwrap();
+        assert_eq!(retrieved.status, "running");
+        assert_eq!(retrieved.progress, 45);
+        assert_eq!(retrieved.scene_count, 0);
+    }
+
+    #[test]
+    fn test_emit_scene_intel_status_recovers_from_poisoned_registry() {
+        let registry: Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let reg_clone = Arc::clone(&registry);
+        let _ = std::thread::spawn(move || {
+            let _lock = reg_clone.lock().unwrap();
+            panic!("Intentional panic to poison mutex");
+        })
+        .join();
+
+        assert!(registry.is_poisoned(), "Precondition: registry mutex must be poisoned");
+
+        let status = scene_intelligence::SceneIntelStatus {
+            project_id: "proj_poison_test".to_string(),
+            status: "completed".to_string(),
+            progress: 100,
+            scene_count: 5,
+        };
+
+        emit_scene_intel_status(None, Some(&registry), status);
+
+        let locked = match registry.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let retrieved = locked.get("proj_poison_test").expect("status must be present in poisoned registry");
+        assert_eq!(retrieved.status, "completed");
+        assert_eq!(retrieved.progress, 100);
+        assert_eq!(retrieved.scene_count, 5);
+    }
+
+    #[test]
+    fn test_scene_intel_registry_deduplication_state() {
+        let registry: Arc<Mutex<HashMap<String, scene_intelligence::SceneIntelStatus>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Initial prewarm check: succeeds and marks as running
+        let first_allowed = check_and_mark_scene_intel_running(Some(&registry), "proj_dedup");
+        assert!(first_allowed, "First prewarm trigger must be allowed");
+
+        // Verify status is registered as running with progress 0
+        {
+            let map = registry.lock().unwrap();
+            let status = map.get("proj_dedup").unwrap();
+            assert_eq!(status.status, "running");
+            assert_eq!(status.progress, 0);
+        }
+
+        // Simulate progress update to 50%
+        emit_scene_intel_status(
+            None,
+            Some(&registry),
+            scene_intelligence::SceneIntelStatus {
+                project_id: "proj_dedup".to_string(),
+                status: "running".to_string(),
+                progress: 50,
+                scene_count: 0,
+            },
+        );
+
+        // Second prewarm check while running: rejected by deduplication
+        let duplicate_allowed = check_and_mark_scene_intel_running(Some(&registry), "proj_dedup");
+        assert!(!duplicate_allowed, "Duplicate prewarm trigger must be rejected while running");
+
+        // Progress must NOT be overwritten back to 0
+        {
+            let map = registry.lock().unwrap();
+            let status = map.get("proj_dedup").unwrap();
+            assert_eq!(status.status, "running");
+            assert_eq!(status.progress, 50, "In-progress scan must not be reset to 0");
+        }
+    }
 
     fn make_word(text: &str, start: f64, end: f64) -> TranscriptWord {
         TranscriptWord {
@@ -4893,6 +5500,320 @@ mod tests {
             end, 88.0,
             "Payoff determines endpoint without duration rejection"
         );
+    }
+
+    #[test]
+    fn test_snap_to_semantic_boundaries_extended_storytelling_preserves_up_to_120s() {
+        let words = vec![
+            make_word("This", 0.0, 0.5),
+            make_word("is", 0.5, 0.8),
+            make_word("a", 0.8, 1.0),
+            make_word("long", 1.0, 1.5),
+            make_word("story.", 1.5, 2.0),
+            make_word("Middle", 50.0, 50.5),
+            make_word("development.", 50.5, 55.0),
+            make_word("Turning", 80.0, 80.5),
+            make_word("point.", 80.5, 85.0),
+            make_word("Resolution", 108.0, 109.0),
+            make_word("reached.", 109.0, 110.0),
+            make_word("Beyond", 128.0, 129.0),
+            make_word("ceiling.", 129.0, 130.0),
+        ];
+
+        // 1. Candidate with 85s duration: must NOT be truncated to 75s
+        let (start1, end1) = snap_to_semantic_boundaries(&words, 0.0, 85.0, 150.0, None);
+        assert_eq!(start1, 0.0);
+        assert_eq!(end1, 85.0, "85s storytelling candidate must not be truncated to 75s");
+
+        // 2. Candidate with 110s duration: must NOT be truncated to 75s
+        let (start2, end2) = snap_to_semantic_boundaries(&words, 0.0, 110.0, 150.0, None);
+        assert_eq!(start2, 0.0);
+        assert_eq!(end2, 110.0, "110s storytelling candidate must be preserved up to 120s guideline");
+
+        // 3. Candidate with 130s duration: exceeds 120s max_guideline, so it clamps to the last terminator <= 120s (110.0)
+        let (start3, end3) = snap_to_semantic_boundaries(&words, 0.0, 130.0, 150.0, None);
+        assert_eq!(start3, 0.0);
+        assert_eq!(end3, 110.0, "Candidate exceeding 120s guideline clamps to best terminator <= 120s");
+    }
+
+    #[test]
+    fn test_snap_to_semantic_boundaries_payoff_mid_sentence_extends_to_terminator() {
+        let words = vec![
+            make_word("This", 0.0, 0.5),
+            make_word("is", 0.5, 0.8),
+            make_word("a", 0.8, 1.0),
+            make_word("story", 1.0, 1.5),
+            make_word("about", 1.5, 2.0),
+            make_word("perseverance.", 2.0, 3.0),
+            make_word("The", 50.0, 50.5),
+            make_word("payoff", 50.5, 51.5),
+            make_word("was", 51.5, 52.0),
+            make_word("really", 52.0, 52.5),
+            make_word("worth", 52.5, 53.0),
+            make_word("every", 53.0, 53.8),
+            make_word("second.", 53.8, 54.5),
+        ];
+
+        // Payoff aligned on "worth" (53.0s), which is not a continuation word but has no sentence terminator.
+        // The safeguard must extend forward to "second." (54.5s) so the thought never cuts off mid-sentence.
+        let closure = ClosureSignals {
+            payoff_end: Some(53.0),
+            payoff_completion: Some(true),
+            ..Default::default()
+        };
+
+        let (start, end) = snap_to_semantic_boundaries_with_hook_anchor(
+            &words,
+            0.0,
+            50.0,
+            100.0,
+            Some(&closure),
+            None,
+            false,
+        );
+        assert_eq!(start, 0.0);
+        assert_eq!(
+            end, 54.5,
+            "Payoff ending mid-sentence must extend forward to sentence terminator 'second.'"
+        );
+    }
+
+    #[test]
+    fn test_snap_to_semantic_boundaries_unbroken_monologue_exceeding_120s_clamps() {
+        // Monologue with zero sentence terminators spanning 140s
+        let mut words = Vec::new();
+        for sec in 0..140 {
+            words.push(make_word("word", sec as f64, (sec as f64) + 0.8));
+        }
+
+        // Candidate requests 0.0 -> 140.0s: exceeds 120s max_guideline with zero punctuation
+        let (start, end) = snap_to_semantic_boundaries_with_hook_anchor(
+            &words,
+            0.0,
+            140.0,
+            200.0,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(start, 0.0);
+        assert!(
+            end <= 120.0,
+            "Unbroken monologue exceeding 120s must clamp to <= 120.0s, got end={}",
+            end
+        );
+        assert_eq!(end, 119.8); // 119 + 0.8 = 119.8
+    }
+
+    #[test]
+    fn test_snap_to_semantic_boundaries_empty_words_bounded_by_max_guideline() {
+        let (start, end) = snap_to_semantic_boundaries_with_hook_anchor(
+            &[],
+            10.0,
+            160.0,
+            200.0,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(start, 10.0);
+        assert_eq!(end, 130.0, "Empty transcript candidate must be bounded by 120s max_guideline (10.0 + 120.0 = 130.0)");
+    }
+
+    #[test]
+    fn test_snap_to_semantic_boundaries_mid_word_continuation_lookahead_extends() {
+        // Word "perseverance" spans 50.0 to 51.0 (1.0s duration).
+        // Candidate ends at 50.3s (mid-word).
+        // Since "perseverance" lacks sentence termination, lookahead extends to "crucial." at 53.0s.
+        let words = vec![
+            make_word("Our", 0.0, 0.5),
+            make_word("journey.", 0.5, 1.0),
+            make_word("perseverance", 50.0, 51.0),
+            make_word("is", 51.0, 51.8),
+            make_word("crucial.", 51.8, 53.0),
+        ];
+
+        let (start, end) = snap_to_semantic_boundaries_with_hook_anchor(
+            &words,
+            0.0,
+            50.3,
+            100.0,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(start, 0.0);
+        assert_eq!(
+            end, 53.0,
+            "Mid-word termination without sentence ending must extend to the true sentence terminator"
+        );
+    }
+
+    #[test]
+    fn test_snap_to_semantic_boundaries_extended_storytelling_with_hook_anchor_and_payoff() {
+        // Candidate spanning ~80s with verified hook anchor at 15.0s and authoritative payoff at 95.0s.
+        // Preceding sentence ends at 14.2s. Hook must not drift backward.
+        // Payoff sentence ends at 95.0s. Payoff must be preserved.
+        let words = vec![
+            make_word("Previous", 13.0, 13.5),
+            make_word("topic.", 13.5, 14.2),
+            make_word("This", 15.0, 15.4),
+            make_word("was", 15.4, 15.7),
+            make_word("the", 15.7, 16.0),
+            make_word("turning", 16.0, 16.5),
+            make_word("point.", 16.5, 17.0),
+            make_word("Narrative", 50.0, 51.0),
+            make_word("development.", 51.0, 52.0),
+            make_word("The", 90.0, 90.5),
+            make_word("lesson", 90.5, 91.5),
+            make_word("is", 91.5, 92.0),
+            make_word("always", 92.0, 93.0),
+            make_word("clear.", 93.0, 95.0),
+        ];
+
+        let closure = ClosureSignals {
+            payoff_end: Some(95.0),
+            payoff_completion: Some(true),
+            story_completeness: Some(true),
+            endpoint_state: Some(crate::models::EndpointState::StoryComplete),
+            ..Default::default()
+        };
+
+        let (start, end) = snap_to_semantic_boundaries_with_hook_anchor(
+            &words,
+            15.0,
+            95.0,
+            150.0,
+            Some(&closure),
+            Some(15.0),
+            false,
+        );
+
+        assert!(start >= 14.2, "Start must not drift backward before previous sentence ending (14.2s)");
+        assert_eq!(start, 14.85, "Hook anchor at 15.0s snaps to lead-in bound (14.85s)");
+        assert_eq!(end, 95.0, "Payoff ending at 95.0s must be preserved for extended storytelling candidate");
+        assert!((end - start - 80.15).abs() < 1e-4, "Full 80s storytelling narrative arc must be preserved");
+    }
+
+    #[test]
+    fn test_snap_to_semantic_boundaries_extended_storytelling_question_hook_with_payoff() {
+        // Host question starts at 10.0s, Guest answer hook at 18.0s, Payoff at 90.0s.
+        let words = vec![
+            make_word("What", 10.0, 10.5),
+            make_word("happened", 10.5, 11.2),
+            make_word("then?", 11.2, 12.0),
+            make_word("I", 18.0, 18.3),
+            make_word("left", 18.3, 18.8),
+            make_word("everything.", 18.8, 19.5),
+            make_word("Story", 50.0, 51.0),
+            make_word("arc.", 51.0, 52.0),
+            make_word("Final", 88.0, 88.8),
+            make_word("resolution.", 88.8, 90.0),
+        ];
+
+        let closure = ClosureSignals {
+            payoff_end: Some(90.0),
+            payoff_completion: Some(true),
+            story_completeness: Some(true),
+            endpoint_state: Some(crate::models::EndpointState::StoryComplete),
+            ..Default::default()
+        };
+
+        let (start, end) = snap_to_semantic_boundaries_with_hook_anchor(
+            &words,
+            10.0,
+            90.0,
+            120.0,
+            Some(&closure),
+            Some(18.0),
+            true, // is_question_hook
+        );
+
+        assert_eq!(start, 10.0, "Question hook setup must preserve Host question start at 10.0s");
+        assert_eq!(end, 90.0, "Extended storytelling payoff must reach 90.0s resolution");
+        assert_eq!(end - start, 80.0, "Duration must be exactly 80.0s covering Question -> Story -> Payoff");
+    }
+
+    #[test]
+    fn test_snap_to_semantic_boundaries_payoff_uncontrolled_drift_clamps_to_120s() {
+        // Words in story arc up to 110.0s
+        let words = vec![
+            make_word("The", 10.0, 10.5),
+            make_word("story", 10.5, 11.2),
+            make_word("begins.", 11.2, 12.0),
+            make_word("Development", 50.0, 51.0),
+            make_word("continues.", 51.0, 52.0),
+            make_word("Turning", 108.0, 109.0),
+            make_word("point.", 109.0, 110.0),
+            // Distant words 300 seconds away (drift into future scene/window)
+            make_word("Distant", 298.0, 299.0),
+            make_word("drift.", 299.0, 300.0),
+        ];
+
+        // Payoff aligned to 300.0s (290s duration from start at 10.0s, > 135s ceiling)
+        let closure = ClosureSignals {
+            payoff_end: Some(300.0),
+            payoff_completion: Some(true),
+            story_completeness: Some(true),
+            endpoint_state: Some(crate::models::EndpointState::PayoffComplete),
+            ..Default::default()
+        };
+
+        let (start, end) = snap_to_semantic_boundaries_with_hook_anchor(
+            &words,
+            10.0,
+            110.0,
+            500.0,
+            Some(&closure),
+            Some(10.0),
+            false,
+        );
+
+        assert_eq!(start, 10.0);
+        // Must clamp to best terminator within 120s max_guideline (110.0s), NOT 300.0s
+        assert_eq!(end, 110.0, "Uncontrolled payoff drift to 300.0s must clamp to <= 120s terminator");
+        assert!(end - start <= 120.0, "Duration must be bounded by 120.0s");
+    }
+
+    #[test]
+    fn test_snap_to_semantic_boundaries_extended_storytelling_payoff_continuation_word_extends_to_terminator() {
+        // Extended storytelling candidate: 0.0s -> 121.0s where word at 121.0s is "because" (continuation word)
+        // followed by sentence terminator at 123.0s ("history.")
+        let words = vec![
+            make_word("It", 0.0, 0.5),
+            make_word("started", 0.5, 1.0),
+            make_word("early.", 1.0, 1.5),
+            make_word("The", 118.0, 119.0),
+            make_word("struggle", 119.0, 120.0),
+            make_word("was", 120.0, 120.5),
+            make_word("real", 120.5, 121.0),
+            make_word("because", 121.0, 121.8), // continuation word at payoff_end
+            make_word("it", 121.8, 122.2),
+            make_word("changed", 122.2, 122.6),
+            make_word("history.", 122.6, 123.0), // true sentence terminator
+        ];
+
+        let closure = ClosureSignals {
+            payoff_end: Some(121.8), // lands on "because"
+            payoff_completion: Some(true),
+            story_completeness: Some(true),
+            endpoint_state: Some(crate::models::EndpointState::PayoffComplete),
+            ..Default::default()
+        };
+
+        let (start, end) = snap_to_semantic_boundaries_with_hook_anchor(
+            &words,
+            0.0,
+            120.0,
+            200.0,
+            Some(&closure),
+            Some(0.0),
+            false,
+        );
+
+        assert_eq!(start, 0.0);
+        // Payoff on continuation word at 121.8s must extend forward to 123.0s within max_payoff_ceiling (135.0s)
+        assert_eq!(end, 123.0, "Payoff on continuation word must extend to true sentence terminator within 135s ceiling");
     }
 
     #[test]

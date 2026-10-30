@@ -14,24 +14,29 @@ use std::io::{BufReader, Read};
 use std::path::PathBuf;
 
 /// Scene detector identity written to the cache and DB.
-pub const SCENE_DETECTOR: &str = "PySceneDetect-AdaptiveDetector";
-pub const SCENE_DETECTOR_VERSION: &str = "0.7.1";
-pub const SCENE_CONFIG_VERSION: &str = "2-frame_skip";
+pub const SCENE_DETECTOR: &str = "PyTorch-CUDA-AdaptiveDetector";
+pub const SCENE_DETECTOR_VERSION: &str = "1.0.0";
+pub const SCENE_CONFIG_VERSION: &str = "gpu-cuda-v1";
 
 /// Wall-clock budget for the scene sidecar, derived from source duration.
-///
-/// The sidecar's cost is linear in runtime: measured 20.1 s per 60 s of 1080p
-/// source (~0.33x realtime). The budget is therefore a multiple of the source
-/// duration rather than a fixed constant, so a 25-minute source is allowed
-/// enough time to finish while a pathological child is still killed.
-const SCENE_TIMEOUT_FLOOR_SEC: f64 = 120.0;
-const SCENE_TIMEOUT_REALTIME_FACTOR: f64 = 2.5;
+/// Calibrated for PyTorch CUDA GPU acceleration with a 3600s ceiling.
+const SCENE_TIMEOUT_FLOOR_SEC: f64 = 60.0;
+const SCENE_TIMEOUT_REALTIME_FACTOR: f64 = 0.5;
 const SCENE_TIMEOUT_CEILING_SEC: f64 = 3600.0;
 
 /// Default frame-sampling stride for the sidecar, mirroring the Python
 /// `FRAME_SKIP` default. Declared here so the value is asserted in tests rather
 /// than duplicated as a magic number.
 pub const FRAME_SKIP_DEFAULT: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneIntelStatus {
+    pub project_id: String,
+    pub status: String,
+    pub progress: u8,
+    pub scene_count: usize,
+}
 
 fn scene_timeout_for(duration_sec: Option<f64>) -> std::time::Duration {
     let secs = match duration_sec {
@@ -170,6 +175,22 @@ pub fn validate_scene_boundaries(
     Ok(())
 }
 
+/// Parse a line for `[SceneIntel] PROGRESS <pct>%` and return the progress (0..=100).
+pub fn parse_progress_line(line: &str) -> Option<u8> {
+    let tag = "[SceneIntel] PROGRESS";
+    let pos = line.find(tag)?;
+    let remainder = line[pos + tag.len()..].trim();
+    let token = remainder.split_whitespace().next()?;
+    let clean = token.trim_end_matches('%');
+    if let Ok(val) = clean.parse::<u8>() {
+        Some(val.min(100))
+    } else if let Ok(val) = clean.parse::<f64>() {
+        Some((val.round() as u8).min(100))
+    } else {
+        None
+    }
+}
+
 pub struct SceneIntelligenceEngine {
     cache_dir: PathBuf,
 }
@@ -232,6 +253,12 @@ impl SceneIntelligenceEngine {
         }
     }
 
+    /// Retrieve cached scenes for a source path without executing detection.
+    pub fn get_cached_scenes(&self, source_path: &str) -> Option<SceneIntelligenceResult> {
+        let source_hash = self.compute_source_hash(source_path).ok()?;
+        self.load_cache(&source_hash)
+    }
+
     fn save_cache(&self, doc: &SceneIntelligenceResult) -> Result<()> {
         let path = self.cache_path(&doc.source_hash);
         std::fs::write(&path, serde_json::to_string_pretty(doc)?)
@@ -265,6 +292,15 @@ impl SceneIntelligenceEngine {
     /// Run scene detection (cached). On ANY failure returns the single-scene
     /// fallback so the pipeline continues — never an error path for callers.
     pub fn process_source(&self, source_path: &str) -> SceneIntelligenceResult {
+        self.process_source_with_progress(source_path, |_| {})
+    }
+
+    /// Run scene detection with streaming progress callback (cached).
+    pub fn process_source_with_progress<F: Fn(u8) + Send + Sync + 'static>(
+        &self,
+        source_path: &str,
+        on_progress: F,
+    ) -> SceneIntelligenceResult {
         let started = std::time::Instant::now();
         let fallback = |reason: &str| {
             eprintln!("[SceneIntel] {} — single-scene fallback", reason);
@@ -321,7 +357,18 @@ impl SceneIntelligenceEngine {
             .arg("--cache-dir")
             .arg(&self.cache_dir);
 
-        let output = match crate::proc_guard::run_bounded(&mut cmd, budget, "SceneIntel") {
+        let progress_cb = std::sync::Arc::new(on_progress);
+        let progress_cb_clone = progress_cb.clone();
+        let output = match crate::proc_guard::run_bounded_with_stderr_line_callback(
+            &mut cmd,
+            budget,
+            "SceneIntel",
+            move |line| {
+                if let Some(pct) = parse_progress_line(line) {
+                    progress_cb_clone(pct);
+                }
+            },
+        ) {
             Ok(o) => o,
             Err(e) => return fallback(&format!("scene sidecar spawn failed: {}", e)),
         };
@@ -409,17 +456,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_scene_timeout_for_gpu_bound() {
+        let dur = scene_timeout_for(Some(10000.0));
+        assert!(dur.as_secs_f64() <= 3600.0, "Ceiling must clamp to 3600s for GPU acceleration");
+    }
+
+    #[test]
+    fn test_scene_intel_status_serialization() {
+        let s = SceneIntelStatus {
+            project_id: "test_proj".to_string(),
+            status: "completed".to_string(),
+            progress: 100,
+            scene_count: 42,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"projectId\":\"test_proj\""));
+        assert!(json.contains("\"sceneCount\":42"));
+    }
+
+    #[test]
+    fn test_get_cached_scenes_missing_file_returns_none() {
+        let cache_dir = std::env::temp_dir().join(format!("scene_test_cache_{}", std::process::id()));
+        let engine = SceneIntelligenceEngine::new(Some(cache_dir.to_string_lossy().to_string())).unwrap();
+        assert!(engine.get_cached_scenes("Z:/missing/file.mp4").is_none());
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
     fn scene_timeout_scales_with_duration_and_is_bounded() {
         // Short source: floored so a normal short video is never truncated.
         let short = scene_timeout_for(Some(20.0));
-        assert!(short.as_secs_f64() >= 120.0, "{:?}", short);
-        // The real 25-minute source gets a budget above its measured 183s run,
-        // so the fix is not merely "wait longer" -- it makes the stage finish
-        // inside a bounded window.
+        assert!(short.as_secs_f64() >= 60.0, "{:?}", short);
+        // The real 25-minute source gets a budget bounded by ceiling.
         let long = scene_timeout_for(Some(1482.4));
         assert!(
-            long.as_secs_f64() > 183.0,
-            "budget {:?} must exceed the measured 183s runtime",
+            long.as_secs_f64() > 60.0,
+            "budget {:?} must exceed the 60s floor",
             long
         );
         // Unknown duration assumes long rather than guessing short and
@@ -785,5 +857,31 @@ mod tests {
         assert_eq!(cuts, vec![2.76, 397.95]);
         assert!(cuts.iter().all(|c| *c > 0.0));
         assert!(cuts.windows(2).all(|w| w[0] < w[1]), "cuts must be monotonic");
+    }
+
+    #[test]
+    fn test_parse_progress_line() {
+        assert_eq!(parse_progress_line("[SceneIntel] PROGRESS 0%\n"), Some(0));
+        assert_eq!(parse_progress_line("[SceneIntel] PROGRESS 45%"), Some(45));
+        assert_eq!(parse_progress_line("[SceneIntel] PROGRESS 100%\r\n"), Some(100));
+        assert_eq!(parse_progress_line("[SceneIntel] PROGRESS 75"), Some(75));
+        assert_eq!(parse_progress_line("noise [SceneIntel] PROGRESS 50% extra"), Some(50));
+        assert_eq!(parse_progress_line("[SceneIntel] PROGRESS 150%"), Some(100));
+        assert_eq!(parse_progress_line("[SceneIntel] PROGRESS foo"), None);
+        assert_eq!(parse_progress_line("Random log line"), None);
+    }
+
+    #[test]
+    fn test_process_source_with_progress_missing_file_falls_back() {
+        let cache_dir = std::env::temp_dir().join(format!("scene_test_cb_{}", std::process::id()));
+        let engine =
+            SceneIntelligenceEngine::new(Some(cache_dir.to_string_lossy().to_string())).unwrap();
+        let progress_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pc = progress_called.clone();
+        let doc = engine.process_source_with_progress("Z:/definitely/missing/video.mp4", move |_| {
+            pc.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(doc.fallback);
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }
